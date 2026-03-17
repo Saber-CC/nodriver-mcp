@@ -10,8 +10,9 @@ MCP_SERVER_NAME = "nodriver"
 CLIENT_ALIASES: dict[str, str] = {
     "vscode": "VS Code",
     "vs-code": "VS Code",
-    "claude-desktop": "Claude",
-    "claude-app": "Claude",
+    "claude": "Claude Desktop",
+    "claude-desktop": "Claude Desktop",
+    "claude-app": "Claude Desktop",
     "claude-code": "Claude Code",
     "roo": "Roo Code",
     "roocode": "Roo Code",
@@ -50,7 +51,7 @@ def _home(*parts: str) -> str:
 def get_global_configs() -> dict[str, tuple[str, str]]:
     if sys.platform == "darwin":
         return {
-            "Claude": (
+            "Claude Desktop": (
                 _home("Library", "Application Support", "Claude"),
                 "claude_desktop_config.json",
             ),
@@ -83,7 +84,7 @@ def get_global_configs() -> dict[str, tuple[str, str]]:
     elif sys.platform == "win32":
         appdata = os.getenv("APPDATA", "")
         return {
-            "Claude": (
+            "Claude Desktop": (
                 os.path.join(appdata, "Claude"),
                 "claude_desktop_config.json",
             ),
