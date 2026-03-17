@@ -87,6 +87,21 @@ _console_messages: list[dict] = []
 _network_requests: list[dict] = []
 _tracing_active = False
 
+# Stable uid state for take_snapshot (mirrors chrome-devtools-mcp)
+_snapshot_id: int = 0
+_unique_id_to_mcp_id: dict[str, str] = {}  # "frameId_backendNodeId" -> stable uid
+
+# Boolean property mapping (same as chrome-devtools-mcp SnapshotFormatter)
+_BOOL_PROPERTY_MAP: dict[str, str] = {
+    "disabled": "disableable",
+    "expanded": "expandable",
+    "focused": "focusable",
+    "selected": "selectable",
+}
+
+# Properties already rendered in the main line or internal-only
+_EXCLUDED_PROPERTIES: set[str] = {"role", "name", "children", "elementHandle"}
+
 # ---------------------------------------------------------------------------
 # Tools (alphabetical order, matching chrome-devtools-mcp convention)
 # ---------------------------------------------------------------------------
@@ -819,6 +834,7 @@ async def take_snapshot(verbose: bool = False) -> str:
     Args:
         verbose: Whether to include all elements (including ignored/hidden ones). Default is false.
     """
+    global _snapshot_id
     tab = await _active_tab()
     import nodriver.cdp.accessibility as cdp_a11y
 
@@ -843,12 +859,34 @@ async def take_snapshot(verbose: bool = False) -> str:
         if node.node_id not in nodes_with_parent:
             root_ids.append(node.node_id)
 
-    # Assign stable short uids
-    uid_counter = 0
+    # --- Stable uid assignment (mirrors chrome-devtools-mcp) ---
+    _snapshot_id += 1
+    id_counter = 0
     uid_map: dict[str, str] = {}
+    seen_unique_ids: set[str] = set()
+
     for node in nodes:
-        uid_map[node.node_id] = str(uid_counter)
-        uid_counter += 1
+        frame_id = str(node.frame_id) if node.frame_id else ""
+        backend_id = str(node.backend_dom_node_id) if node.backend_dom_node_id else ""
+        unique_id = f"{frame_id}_{backend_id}"
+
+        if unique_id != "_" and unique_id in _unique_id_to_mcp_id:
+            # Reuse previously assigned uid for the same DOM node
+            uid_map[node.node_id] = _unique_id_to_mcp_id[unique_id]
+        else:
+            new_uid = f"{_snapshot_id}_{id_counter}"
+            id_counter += 1
+            uid_map[node.node_id] = new_uid
+            if unique_id != "_":
+                _unique_id_to_mcp_id[unique_id] = new_uid
+
+        if unique_id != "_":
+            seen_unique_ids.add(unique_id)
+
+    # Clean up stale mappings for nodes that no longer exist
+    stale_keys = [k for k in _unique_id_to_mcp_id if k not in seen_unique_ids]
+    for k in stale_keys:
+        del _unique_id_to_mcp_id[k]
 
     def _format_node(node_id: str, depth: int) -> str:
         node = node_map.get(node_id)
@@ -858,10 +896,10 @@ async def take_snapshot(verbose: bool = False) -> str:
         # Skip ignored nodes in non-verbose mode
         if not verbose and node.ignored:
             # Still recurse into children
-            parts = []
+            child_parts = []
             for cid in children_map.get(node_id, []):
-                parts.append(_format_node(cid, depth))
-            return "".join(parts)
+                child_parts.append(_format_node(cid, depth))
+            return "".join(child_parts)
 
         role = ""
         if node.role and node.role.value:
@@ -875,19 +913,31 @@ async def take_snapshot(verbose: bool = False) -> str:
         if node.value and node.value.value:
             value = str(node.value.value)
 
-        # Collect interesting properties
-        props = []
+        # option special handling (same as chrome-devtools-mcp)
+        if role == "option" and name and not value:
+            value = name
+
+        # --- Collect properties (auto-discover, not whitelist) ---
+        props: list[str] = []
         if node.properties:
             for prop in node.properties:
                 pname = prop.name.value if hasattr(prop.name, "value") else str(prop.name)
                 pval = prop.value.value if prop.value and prop.value.value is not None else None
-                if pname in ("url",):
+
+                if pname in _EXCLUDED_PROPERTIES:
+                    continue
+
+                # Boolean property mapping (disabled -> also emit disableable)
+                mapped = _BOOL_PROPERTY_MAP.get(pname)
+                if mapped and (pval is True or pval == "true"):
+                    props.append(mapped)
+
+                # Emit the property itself
+                if pval is True or pval == "true":
+                    props.append(pname)
+                elif isinstance(pval, str) and pval:
                     props.append(f'{pname}="{pval}"')
-                elif pname in ("focused", "disabled", "expanded", "selected",
-                               "checked", "pressed", "required", "modal"):
-                    if pval is True or pval == "true":
-                        props.append(pname)
-                elif pname in ("level",) and pval is not None:
+                elif isinstance(pval, (int, float)):
                     props.append(f'{pname}={pval}')
 
         uid = uid_map.get(node_id, "?")
