@@ -102,6 +102,26 @@ _BOOL_PROPERTY_MAP: dict[str, str] = {
 # Properties already rendered in the main line or internal-only
 _EXCLUDED_PROPERTIES: set[str] = {"role", "name", "children", "elementHandle"}
 
+# Properties Puppeteer doesn't expose — suppress to match chrome-devtools-mcp output
+_SUPPRESS_PROPERTIES: set[str] = {
+    "focusable", "editable", "settable", "busy", "live", "relevant", "atomic",
+    "hidden", "controls", "describedby", "details", "errormessage", "flowto",
+    "labelledby", "owns", "activedescendant",
+}
+
+# Roles to skip entirely (node AND all descendants) — Chrome internals
+_SKIP_ROLES: set[str] = {"InlineTextBox", "ListMarker"}
+
+# Roles to collapse (skip node, promote children) — container noise
+_COLLAPSE_ROLES: set[str] = {
+    "generic", "list", "listitem", "paragraph", "strong", "emphasis", "code",
+    "group", "Section", "blockquote", "figure", "mark", "subscript",
+    "superscript", "insertion", "deletion", "DescriptionList",
+    "DescriptionListTerm", "DescriptionListDetail", "time", "Abbr", "Ruby",
+    "RubyAnnotation", "term", "definition", "feed", "log", "marquee",
+    "timer", "directory", "tooltip",
+}
+
 # ---------------------------------------------------------------------------
 # Tools (alphabetical order, matching chrome-devtools-mcp convention)
 # ---------------------------------------------------------------------------
@@ -893,17 +913,32 @@ async def take_snapshot(verbose: bool = False) -> str:
         if node is None:
             return ""
 
-        # Skip ignored nodes in non-verbose mode
+        role = ""
+        if node.role and node.role.value:
+            role = str(node.role.value)
+
+        # Skip ignored nodes in non-verbose mode (promote children)
         if not verbose and node.ignored:
-            # Still recurse into children
             child_parts = []
             for cid in children_map.get(node_id, []):
                 child_parts.append(_format_node(cid, depth))
             return "".join(child_parts)
 
-        role = ""
-        if node.role and node.role.value:
-            role = str(node.role.value)
+        # Skip roles entirely (node + descendants) — Chrome internals
+        if not verbose and role in _SKIP_ROLES:
+            return ""
+
+        # Collapse container roles (skip node, promote children at same depth)
+        if not verbose and role in _COLLAPSE_ROLES:
+            name = ""
+            if node.name and node.name.value:
+                name = str(node.name.value)
+            # Keep the node if it has a meaningful name (e.g. aria-label)
+            if not name:
+                child_parts = []
+                for cid in children_map.get(node_id, []):
+                    child_parts.append(_format_node(cid, depth))
+                return "".join(child_parts)
 
         name = ""
         if node.name and node.name.value:
@@ -917,14 +952,18 @@ async def take_snapshot(verbose: bool = False) -> str:
         if role == "option" and name and not value:
             value = name
 
-        # --- Collect properties (auto-discover, not whitelist) ---
+        # --- Collect properties (matching Puppeteer's exposed set) ---
         props: list[str] = []
         if node.properties:
             for prop in node.properties:
                 pname = prop.name.value if hasattr(prop.name, "value") else str(prop.name)
                 pval = prop.value.value if prop.value and prop.value.value is not None else None
 
-                if pname in _EXCLUDED_PROPERTIES:
+                if pname in _EXCLUDED_PROPERTIES or pname in _SUPPRESS_PROPERTIES:
+                    continue
+
+                # Skip false boolean values (e.g. invalid="false")
+                if pval is False or pval == "false":
                     continue
 
                 # Boolean property mapping (disabled -> also emit disableable)
@@ -935,10 +974,8 @@ async def take_snapshot(verbose: bool = False) -> str:
                 # Emit the property itself
                 if pval is True or pval == "true":
                     props.append(pname)
-                elif isinstance(pval, str) and pval:
+                elif isinstance(pval, (str, int, float)) and pval != "":
                     props.append(f'{pname}="{pval}"')
-                elif isinstance(pval, (int, float)):
-                    props.append(f'{pname}={pval}')
 
         uid = uid_map.get(node_id, "?")
         indent = "  " * depth
