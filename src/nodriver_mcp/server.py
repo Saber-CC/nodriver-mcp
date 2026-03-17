@@ -27,7 +27,13 @@ logger = logging.getLogger("nodriver-mcp")
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
     "nodriver-mcp",
-    instructions="Undetected Chrome browser automation via nodriver. Drop-in replacement for chrome-devtools-mcp that avoids CDP fingerprint detection.",
+    instructions=(
+        "Undetected Chrome browser automation via nodriver. "
+        "Drop-in replacement for chrome-devtools-mcp that avoids CDP fingerprint detection. "
+        "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
+        "take_snapshot returns searchable HTML text and is much faster and smaller. "
+        "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression."
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -774,9 +780,11 @@ async def take_memory_snapshot(file_path: str) -> str:
 
 @mcp.tool()
 async def take_screenshot(full_page: bool = False, format: str = "jpeg") -> str:
-    """Take a screenshot of the page or element. Only use when you specifically
-    need a visual image (layout checks, visual regression, etc.). For reading
-    page content prefer take_snapshot instead.
+    """Take a screenshot of the page or element.
+
+    WARNING: Do NOT use this tool to read page content. Use take_snapshot instead
+    which returns searchable HTML text. Only use take_screenshot when you
+    specifically need a visual image (layout checks, visual regression, etc.).
 
     Args:
         full_page: If True, capture the entire page (not just viewport).
@@ -800,7 +808,8 @@ async def take_screenshot(full_page: bool = False, format: str = "jpeg") -> str:
 async def take_snapshot() -> str:
     """Get the current page's DOM snapshot (HTML source). Prefer taking a
     snapshot over taking a screenshot. Returns the full HTML text which is
-    searchable, parseable and much smaller than an image.
+    searchable, parseable and much smaller than an image. Use this tool
+    instead of take_screenshot whenever you need to read or analyze page content.
     """
     tab = await _active_tab()
     content = await tab.get_content()
