@@ -22,19 +22,6 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("nodriver-mcp")
 
-# ---------------------------------------------------------------------------
-# MCP Server
-# ---------------------------------------------------------------------------
-mcp = FastMCP(
-    "nodriver-mcp",
-    instructions=(
-        "Undetected Chrome browser automation via nodriver. "
-        "Drop-in replacement for chrome-devtools-mcp that avoids CDP fingerprint detection. "
-        "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
-        "take_snapshot returns searchable HTML text and is much faster and smaller. "
-        "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression."
-    ),
-)
 
 # ---------------------------------------------------------------------------
 # Global browser state
@@ -44,7 +31,7 @@ _browser_lock = asyncio.Lock()
 
 
 async def _get_browser() -> uc.Browser:
-    """Lazily start the browser on first tool call."""
+    """Start the browser on first tool call (lazy init, protected by mutex)."""
     global _browser
     async with _browser_lock:
         if _browser is None or _browser.stopped:
@@ -66,6 +53,23 @@ async def _get_browser() -> uc.Browser:
 
             logger.info("Browser started (headless=%s)", headless)
     return _browser
+
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+mcp = FastMCP(
+    "nodriver-mcp",
+    instructions=(
+        "Undetected Chrome browser automation via nodriver. "
+        "Drop-in replacement for chrome-devtools-mcp that avoids CDP fingerprint detection. "
+        "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
+        "take_snapshot returns searchable HTML text and is much faster and smaller. "
+        "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression. "
+        "NOTE: The browser is launched lazily on the first tool call. "
+        "The first invocation may take a few extra seconds for Chrome to start — this is normal, just wait for it."
+    ),
+)
 
 
 async def _active_tab() -> uc.Tab:
@@ -805,17 +809,118 @@ async def take_screenshot(full_page: bool = False, format: str = "jpeg") -> str:
 
 
 @mcp.tool()
-async def take_snapshot() -> str:
-    """Get the current page's DOM snapshot (HTML source). Prefer taking a
-    snapshot over taking a screenshot. Returns the full HTML text which is
-    searchable, parseable and much smaller than an image. Use this tool
-    instead of take_screenshot whenever you need to read or analyze page content.
+async def take_snapshot(verbose: bool = False) -> str:
+    """Get the current page's DOM snapshot based on the accessibility tree.
+    The snapshot lists page elements along with a unique identifier (uid).
+    Always use the latest snapshot. Prefer taking a snapshot over taking a
+    screenshot. Returns searchable, structured text that is much smaller
+    than an image or raw HTML.
+
+    Args:
+        verbose: Whether to include all elements (including ignored/hidden ones). Default is false.
     """
     tab = await _active_tab()
-    content = await tab.get_content()
-    if len(content) > 100_000:
-        content = content[:100_000] + "\n<!-- truncated -->"
-    return json.dumps({"status": "ok", "html_length": len(content), "html": content})
+    import nodriver.cdp.accessibility as cdp_a11y
+
+    nodes = await tab.send(cdp_a11y.get_full_ax_tree())
+
+    # Build a lookup: node_id -> AXNode
+    node_map: dict[str, Any] = {}
+    for node in nodes:
+        node_map[node.node_id] = node
+
+    # Build tree structure
+    children_map: dict[str, list[str]] = {}
+    root_ids: list[str] = []
+    nodes_with_parent: set[str] = set()
+    for node in nodes:
+        if node.child_ids:
+            children_map[node.node_id] = list(node.child_ids)
+            for cid in node.child_ids:
+                nodes_with_parent.add(cid)
+
+    for node in nodes:
+        if node.node_id not in nodes_with_parent:
+            root_ids.append(node.node_id)
+
+    # Assign stable short uids
+    uid_counter = 0
+    uid_map: dict[str, str] = {}
+    for node in nodes:
+        uid_map[node.node_id] = str(uid_counter)
+        uid_counter += 1
+
+    def _format_node(node_id: str, depth: int) -> str:
+        node = node_map.get(node_id)
+        if node is None:
+            return ""
+
+        # Skip ignored nodes in non-verbose mode
+        if not verbose and node.ignored:
+            # Still recurse into children
+            parts = []
+            for cid in children_map.get(node_id, []):
+                parts.append(_format_node(cid, depth))
+            return "".join(parts)
+
+        role = ""
+        if node.role and node.role.value:
+            role = str(node.role.value)
+
+        name = ""
+        if node.name and node.name.value:
+            name = str(node.name.value)
+
+        value = ""
+        if node.value and node.value.value:
+            value = str(node.value.value)
+
+        # Collect interesting properties
+        props = []
+        if node.properties:
+            for prop in node.properties:
+                pname = prop.name.value if hasattr(prop.name, "value") else str(prop.name)
+                pval = prop.value.value if prop.value and prop.value.value is not None else None
+                if pname in ("url",):
+                    props.append(f'{pname}="{pval}"')
+                elif pname in ("focused", "disabled", "expanded", "selected",
+                               "checked", "pressed", "required", "modal"):
+                    if pval is True or pval == "true":
+                        props.append(pname)
+                elif pname in ("level",) and pval is not None:
+                    props.append(f'{pname}={pval}')
+
+        uid = uid_map.get(node_id, "?")
+        indent = "  " * depth
+        parts = [f"uid={uid}"]
+        if role and role != "none":
+            parts.append(role)
+        elif role == "none" and verbose:
+            parts.append("ignored")
+        if name:
+            parts.append(f'"{name}"')
+        if value and value != name:
+            parts.append(f'value="{value}"')
+        parts.extend(props)
+
+        line = f"{indent}{' '.join(parts)}\n"
+
+        child_lines = []
+        for cid in children_map.get(node_id, []):
+            child_lines.append(_format_node(cid, depth + 1))
+
+        return line + "".join(child_lines)
+
+    output_parts = []
+    for rid in root_ids:
+        output_parts.append(_format_node(rid, 0))
+    snapshot_text = "".join(output_parts)
+
+    # Truncate if extremely large
+    if len(snapshot_text) > 200_000:
+        snapshot_text = snapshot_text[:200_000] + "\n... (truncated)"
+
+    return json.dumps({"status": "ok", "length": len(snapshot_text), "snapshot": snapshot_text})
 
 
 @mcp.tool()
