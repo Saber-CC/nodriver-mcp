@@ -246,6 +246,19 @@ def list_available_clients():
     print("  nodriver-mcp uninstall cursor            # Uninstall from client")
 
 
+def _is_installed(name: str, config_dir: str, config_file: str, special: dict, is_project: bool) -> bool:
+    """Check if nodriver MCP server is already installed for a given client."""
+    config_path = os.path.join(config_dir, config_file)
+    is_toml = config_file.endswith(".toml")
+    if not os.path.exists(config_path):
+        return False
+    config = _read_config(config_path, is_toml=is_toml)
+    if config is None:
+        return False
+    servers = _get_servers_view(config, name, is_toml, special)
+    return MCP_SERVER_NAME in servers
+
+
 def run_install_command(*, uninstall: bool, targets_str: str, project: bool):
     if targets_str:
         targets = [t.strip() for t in targets_str.split(",") if t.strip()]
@@ -258,9 +271,16 @@ def run_install_command(*, uninstall: bool, targets_str: str, project: bool):
         return
 
     configs = get_global_configs() if not project else get_project_configs(os.getcwd())
-    items = [(name, False) for name in configs.keys()]
+    special = PROJECT_SPECIAL_JSON_STRUCTURES if project else GLOBAL_SPECIAL_JSON_STRUCTURES
+    items = []
+    for name, (config_dir, config_file) in configs.items():
+        installed = _is_installed(name, config_dir, config_file, special, project)
+        if uninstall:
+            items.append((name, installed))
+        else:
+            items.append((name, False))
     action = "uninstall from" if uninstall else "install to"
-    selected = interactive_select(items, f"Select MCP clients to {action}:")
+    selected = interactive_select(items, f"Select MCP clients to {action}:", show_status=uninstall)
     if selected is None:
         print("Cancelled.")
         return
