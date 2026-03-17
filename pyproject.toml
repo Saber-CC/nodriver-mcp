@@ -1,0 +1,38 @@
+[project]
+name = "nodriver-mcp"
+version = "0.1.0"
+description = "Undetected Chrome automation MCP server powered by nodriver"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Saber-CC" },
+]
+keywords = ["mcp", "nodriver", "chrome", "automation", "undetected", "anti-bot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.26.0",
+    "nodriver>=0.48.1",
+    "pillow>=12.1.1",
+]
+
+[project.optional-dependencies]
+toml = ["tomli-w>=1.0.0"]
+
+[project.urls]
+Repository = "https://github.com/Saber-CC/nodriver-mcp"
+Issues = "https://github.com/Saber-CC/nodriver-mcp/issues"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+nodriver-mcp = "nodriver_mcp.cli:main"
