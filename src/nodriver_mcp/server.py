@@ -52,6 +52,9 @@ async def _get_browser() -> uc.Browser:
                 logger.info("Proxy configured: %s", proxy)
 
             logger.info("Browser started (headless=%s)", headless)
+
+            # Auto-enable console and network collection on the first tab
+            await _auto_enable_collection(_browser.main_tab)
     return _browser
 
 
@@ -85,11 +88,15 @@ async def _active_tab() -> uc.Tab:
 # ---------------------------------------------------------------------------
 _console_messages: list[dict] = []
 _network_requests: list[dict] = []
+_preserved_console_messages: list[list[dict]] = []  # last 3 navigations
+_preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
+_collection_enabled_tabs: set[int] = set()  # track which tabs have collection enabled
 
 # Stable uid state for take_snapshot (mirrors chrome-devtools-mcp)
 _snapshot_id: int = 0
 _unique_id_to_mcp_id: dict[str, str] = {}  # "frameId_backendNodeId" -> stable uid
+_uid_to_backend_node_id: dict[str, int] = {}  # mcp uid -> backend_dom_node_id (for element resolution)
 
 # Boolean property mapping (same as chrome-devtools-mcp SnapshotFormatter)
 _BOOL_PROPERTY_MAP: dict[str, str] = {
@@ -122,8 +129,126 @@ _COLLAPSE_ROLES: set[str] = {
     "timer", "directory", "tooltip",
 }
 
+# Modifier keys for press_key combo support
+_MODIFIER_KEYS = {"Control", "Shift", "Alt", "Meta"}
+
+
+def _preserve_on_navigation() -> None:
+    """Rotate current console/network messages into preserved history (last 3 navigations)."""
+    if _console_messages:
+        _preserved_console_messages.append(list(_console_messages))
+        if len(_preserved_console_messages) > 3:
+            _preserved_console_messages.pop(0)
+        _console_messages.clear()
+    if _network_requests:
+        _preserved_network_requests.append(list(_network_requests))
+        if len(_preserved_network_requests) > 3:
+            _preserved_network_requests.pop(0)
+        _network_requests.clear()
+
+
 # ---------------------------------------------------------------------------
-# Tools (alphabetical order, matching chrome-devtools-mcp convention)
+# Auto-collection for console / network (mirrors chrome-devtools-mcp)
+# ---------------------------------------------------------------------------
+async def _auto_enable_collection(tab: uc.Tab) -> None:
+    """Auto-enable console and network event collection on a tab."""
+    tab_id = id(tab)
+    if tab_id in _collection_enabled_tabs:
+        return
+    _collection_enabled_tabs.add(tab_id)
+
+    import nodriver.cdp.runtime as cdp_runtime
+    import nodriver.cdp.network as cdp_net
+
+    async def _on_console(event: cdp_runtime.ConsoleAPICalled):
+        msg = {
+            "type": event.type_.value,
+            "text": " ".join(str(a.value or a.description or "") for a in event.args),
+            "timestamp": str(event.timestamp),
+        }
+        _console_messages.append(msg)
+        if len(_console_messages) > 1000:
+            _console_messages.pop(0)
+
+    async def _on_request(event: cdp_net.RequestWillBeSent):
+        _network_requests.append({
+            "id": str(event.request_id),
+            "url": event.request.url,
+            "method": event.request.method,
+            "timestamp": str(event.timestamp),
+            "type": str(event.type_.value) if event.type_ else "unknown",
+        })
+        if len(_network_requests) > 1000:
+            _network_requests.pop(0)
+
+    try:
+        await tab.send(cdp_runtime.enable())
+        tab.add_handler(cdp_runtime.ConsoleAPICalled, _on_console)
+        await tab.send(cdp_net.enable())
+        tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# UID resolution: uid -> DOM element operations
+# ---------------------------------------------------------------------------
+async def _resolve_uid(tab: uc.Tab, uid: str) -> Any:
+    """Resolve a snapshot uid to a CDP remote object for element manipulation.
+
+    Returns the remote_object_id that can be used with CDP commands.
+    """
+    import nodriver.cdp.dom as cdp_dom
+
+    backend_node_id = _uid_to_backend_node_id.get(uid)
+    if backend_node_id is None:
+        raise ValueError(f"Unknown uid '{uid}'. Take a new snapshot first.")
+
+    result = await tab.send(cdp_dom.resolve_node(
+        backend_node_id=cdp_dom.BackendNodeId(backend_node_id)
+    ))
+    if result is None:
+        raise ValueError(f"Could not resolve uid '{uid}' to a DOM node.")
+    return result
+
+
+async def _get_box_model(tab: uc.Tab, uid: str) -> tuple[float, float]:
+    """Get the center coordinates of an element by uid."""
+    import nodriver.cdp.dom as cdp_dom
+
+    backend_node_id = _uid_to_backend_node_id.get(uid)
+    if backend_node_id is None:
+        raise ValueError(f"Unknown uid '{uid}'. Take a new snapshot first.")
+
+    model = await tab.send(cdp_dom.get_box_model(
+        backend_node_id=cdp_dom.BackendNodeId(backend_node_id)
+    ))
+    # content quad: [x1,y1, x2,y2, x3,y3, x4,y4]
+    quad = model.content
+    cx = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+    cy = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+    return cx, cy
+
+
+async def _maybe_snapshot(include_snapshot: bool) -> str:
+    """Optionally append a snapshot to the response."""
+    if include_snapshot:
+        snapshot = await take_snapshot()
+        return "\n\n" + snapshot
+    return ""
+
+
+async def _format_pages() -> str:
+    """Format the pages list for appending to navigation responses."""
+    browser = await _get_browser()
+    lines = ["\nOpen pages:"]
+    for i, tab in enumerate(browser.tabs):
+        lines.append(f"  [{i}] {tab.target.url} — {tab.target.title}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tools (aligned with chrome-devtools-mcp interface)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -131,7 +256,7 @@ async def bypass_insecure_warning() -> str:
     """Click through the browser's insecure connection warning page."""
     tab = await _active_tab()
     await tab.bypass_insecure_connection_warning()
-    return json.dumps({"status": "ok"})
+    return "Bypassed insecure connection warning."
 
 
 @mcp.tool()
@@ -144,85 +269,93 @@ async def cf_verify() -> str:
     tab = await _active_tab()
     try:
         await tab.verify_cf()
-        return json.dumps({"status": "ok", "message": "CF verification attempted"})
+        return "Cloudflare verification attempted."
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f"Error: {e}"
 
 
 @mcp.tool()
-async def click(selector: str = "", text: str = "", timeout: int = 10) -> str:
-    """Click an element found by CSS selector or text.
+async def click(uid: str, dbl_click: bool = False, include_snapshot: bool = False) -> str:
+    """Click on the provided element.
 
     Args:
-        selector: CSS selector of the element to click.
-        text: Visible text of the element to click.
-        timeout: Max seconds to wait for the element.
+        uid: The uid of an element on the page from the page content snapshot.
+        dbl_click: Set to true for double clicks. Default is false.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
     try:
-        if selector:
-            elem = await tab.select(selector, timeout=timeout)
-        elif text:
-            elem = await tab.find(text, best_match=True, timeout=timeout)
-        else:
-            return json.dumps({"error": "Provide either selector or text"})
-        await elem.mouse_click()
+        cx, cy = await _get_box_model(tab, uid)
+        await tab.mouse_click(cx, cy)
+        if dbl_click:
+            await tab.mouse_click(cx, cy)
         await tab
-        return json.dumps({"status": "clicked", "tag": elem.tag_name})
+        result = f"Clicked uid={uid}"
+        result += await _maybe_snapshot(include_snapshot)
+        return result
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f"Error clicking uid={uid}: {e}"
 
 
 @mcp.tool()
-async def click_at(x: int, y: int, dbl_click: bool = False) -> str:
+async def click_at(x: int, y: int, dbl_click: bool = False, include_snapshot: bool = False) -> str:
     """Click at specific coordinates on the page.
 
     Args:
         x: The x coordinate.
         y: The y coordinate.
         dbl_click: Set to true for double clicks.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
+    await tab.mouse_click(x, y)
     if dbl_click:
         await tab.mouse_click(x, y)
-        await tab.mouse_click(x, y)
-    else:
-        await tab.mouse_click(x, y)
-    return json.dumps({"status": "clicked", "x": x, "y": y})
+    result = f"Clicked at ({x}, {y})"
+    result += await _maybe_snapshot(include_snapshot)
+    return result
 
 
 @mcp.tool()
-async def close_page() -> str:
-    """Close the current active tab."""
-    tab = await _active_tab()
-    await tab.close()
-    return json.dumps({"status": "ok", "message": "Tab closed"})
-
-
-@mcp.tool()
-async def drag(source_selector: str, target_selector: str, timeout: int = 10) -> str:
-    """Drag from one element to another.
+async def close_page(page_id: int = -1) -> str:
+    """Closes the page by its index. The last open page cannot be closed.
 
     Args:
-        source_selector: CSS selector of the drag source.
-        target_selector: CSS selector of the drop target.
-        timeout: Max seconds to wait.
+        page_id: The ID of the page to close. Default -1 closes current active page.
+    """
+    browser = await _get_browser()
+    if len(browser.tabs) <= 1:
+        return "Error: Cannot close the last open page."
+    if page_id == -1:
+        tab = await _active_tab()
+    else:
+        if page_id < 0 or page_id >= len(browser.tabs):
+            return f"Error: Invalid page_id {page_id}, have {len(browser.tabs)} tabs."
+        tab = browser.tabs[page_id]
+    await tab.close()
+    pages = await _format_pages()
+    return f"Page closed.{pages}"
+
+
+@mcp.tool()
+async def drag(from_uid: str, to_uid: str, include_snapshot: bool = False) -> str:
+    """Drag an element onto another element.
+
+    Args:
+        from_uid: The uid of the element to drag.
+        to_uid: The uid of the element to drop into.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
     try:
-        src = await tab.select(source_selector, timeout=timeout)
-        dst = await tab.select(target_selector, timeout=timeout)
-        src_rect = await src.get_position()
-        dst_rect = await dst.get_position()
-        if src_rect and dst_rect:
-            await tab.mouse_drag(
-                (src_rect.x + src_rect.width / 2, src_rect.y + src_rect.height / 2),
-                (dst_rect.x + dst_rect.width / 2, dst_rect.y + dst_rect.height / 2),
-            )
-            return json.dumps({"status": "dragged"})
-        return json.dumps({"error": "Could not determine element positions"})
+        src_x, src_y = await _get_box_model(tab, from_uid)
+        dst_x, dst_y = await _get_box_model(tab, to_uid)
+        await tab.mouse_drag((src_x, src_y), (dst_x, dst_y))
+        result = f"Dragged uid={from_uid} to uid={to_uid}"
+        result += await _maybe_snapshot(include_snapshot)
+        return result
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f"Error dragging: {e}"
 
 
 @mcp.tool()
@@ -234,15 +367,15 @@ async def emulate(
     color_scheme: str = "",
     viewport: str = "",
 ) -> str:
-    """Emulate various device/network conditions on the selected page.
+    """Emulates various features on the selected page.
 
     Args:
-        network_conditions: Network throttle preset, e.g. "Slow 3G", "Fast 3G", "Offline". Empty to disable.
-        cpu_throttling_rate: CPU slowdown factor (1-20). 0 or 1 to disable.
-        geolocation: Geolocation as "latitude,longitude", e.g. "37.7749,-122.4194". Empty to clear.
+        network_conditions: Throttle network. Options: "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G". Omit to disable.
+        cpu_throttling_rate: CPU slowdown factor (1-20). Omit or set to 1 to disable.
+        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to clear.
         user_agent: User agent string. Empty to clear.
         color_scheme: "dark", "light", or "auto". Empty to skip.
-        viewport: Viewport as "widthxheight", e.g. "375x812". Empty to skip.
+        viewport: Viewport as "widthxheightxdpr[,mobile][,touch][,landscape]" (e.g. "375x812x3,mobile,touch"). Empty to skip.
     """
     tab = await _active_tab()
     results = []
@@ -253,6 +386,8 @@ async def emulate(
             "offline": {"offline": True, "latency": 0, "download": 0, "upload": 0},
             "slow 3g": {"offline": False, "latency": 2000, "download": 50000, "upload": 50000},
             "fast 3g": {"offline": False, "latency": 563, "download": 180000, "upload": 84375},
+            "slow 4g": {"offline": False, "latency": 150, "download": 400000, "upload": 150000},
+            "fast 4g": {"offline": False, "latency": 50, "download": 1500000, "upload": 750000},
         }
         p = presets.get(network_conditions.lower(), presets.get("fast 3g"))
         await tab.send(cdp_net.emulate_network_conditions(
@@ -279,6 +414,8 @@ async def emulate(
         import nodriver.cdp.network as cdp_net
         await tab.send(cdp_net.set_user_agent_override(user_agent=user_agent))
         results.append("user_agent set")
+    elif user_agent == "":
+        pass  # empty means no change
 
     if color_scheme and color_scheme != "auto":
         import nodriver.cdp.emulation as cdp_emu
@@ -286,163 +423,158 @@ async def emulate(
             features=[cdp_emu.MediaFeature(name="prefers-color-scheme", value=color_scheme)]
         ))
         results.append(f"color_scheme={color_scheme}")
+    elif color_scheme == "auto":
+        import nodriver.cdp.emulation as cdp_emu
+        await tab.send(cdp_emu.set_emulated_media(features=[]))
+        results.append("color_scheme=auto (reset)")
 
     if viewport:
         import nodriver.cdp.emulation as cdp_emu
-        parts = viewport.lower().split("x")
-        w, h = int(parts[0]), int(parts[1])
-        mobile = len(parts) > 2 and "mobile" in parts[2:]
+        # Parse "widthxheightxdpr,mobile,touch,landscape" format
+        parts = viewport.split(",")
+        dims = parts[0].split("x")
+        w, h = int(dims[0]), int(dims[1])
+        dpr = float(dims[2]) if len(dims) > 2 else 1.0
+        flags = [f.strip().lower() for f in parts[1:]]
+        mobile = "mobile" in flags
         await tab.send(cdp_emu.set_device_metrics_override(
-            width=w, height=h, device_scale_factor=1.0, mobile=mobile,
+            width=w, height=h, device_scale_factor=dpr, mobile=mobile,
         ))
         results.append(f"viewport={viewport}")
 
-    return json.dumps({"status": "ok", "applied": results})
+    return "Emulation applied: " + ", ".join(results) if results else "No emulation changes applied."
 
 
 @mcp.tool()
-async def emulate_device(
-    width: int = 375,
-    height: int = 812,
-    device_scale_factor: float = 3.0,
-    mobile: bool = True,
-    user_agent: str = "",
-) -> str:
-    """Emulate a mobile device or custom viewport.
+async def evaluate_script(function: str, args: list[str] | None = None) -> str:
+    """Evaluate a JavaScript function inside the currently selected page.
 
     Args:
-        width: Viewport width in pixels.
-        height: Viewport height in pixels.
-        device_scale_factor: Device scale factor (e.g. 2.0 for retina).
-        mobile: Whether to emulate a mobile device.
-        user_agent: Custom user agent string (optional).
-    """
-    tab = await _active_tab()
-    import nodriver.cdp.emulation as cdp_emu
-
-    await tab.send(cdp_emu.set_device_metrics_override(
-        width=width,
-        height=height,
-        device_scale_factor=device_scale_factor,
-        mobile=mobile,
-    ))
-    if user_agent:
-        import nodriver.cdp.network as cdp_net
-        await tab.send(cdp_net.set_user_agent_override(user_agent=user_agent))
-
-    return json.dumps({"status": "ok", "viewport": f"{width}x{height}", "mobile": mobile})
-
-
-@mcp.tool()
-async def enable_console_collection() -> str:
-    """Start collecting console messages from the current page."""
-    tab = await _active_tab()
-    import nodriver.cdp.runtime as cdp_runtime
-
-    async def _on_console(event: cdp_runtime.ConsoleAPICalled):
-        msg = {
-            "type": event.type_.value,
-            "text": " ".join(str(a.value or a.description or "") for a in event.args),
-            "timestamp": str(event.timestamp),
-        }
-        _console_messages.append(msg)
-        if len(_console_messages) > 200:
-            _console_messages.pop(0)
-
-    await tab.send(cdp_runtime.enable())
-    tab.add_handler(cdp_runtime.ConsoleAPICalled, _on_console)
-    return json.dumps({"status": "ok", "message": "Console collection enabled"})
-
-
-@mcp.tool()
-async def enable_network_collection() -> str:
-    """Start collecting network requests from the current page."""
-    tab = await _active_tab()
-    import nodriver.cdp.network as cdp_net
-
-    async def _on_request(event: cdp_net.RequestWillBeSent):
-        _network_requests.append({
-            "id": str(event.request_id),
-            "url": event.request.url,
-            "method": event.request.method,
-            "timestamp": str(event.timestamp),
-            "type": str(event.type_.value) if event.type_ else "unknown",
-        })
-        if len(_network_requests) > 500:
-            _network_requests.pop(0)
-
-    await tab.send(cdp_net.enable())
-    tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
-    return json.dumps({"status": "ok", "message": "Network collection enabled"})
-
-
-@mcp.tool()
-async def evaluate_script(expression: str, await_promise: bool = False) -> str:
-    """Execute JavaScript in the current page and return the result.
-
-    Args:
-        expression: JavaScript expression to evaluate.
-        await_promise: If True, await the result if it's a Promise.
+        function: A JavaScript function declaration to be executed.
+            Example: "() => { return document.title }" or "(el) => { return el.innerText; }"
+        args: An optional list of element uids from the snapshot to pass as arguments to the function.
     """
     tab = await _active_tab()
     try:
-        result = await tab.evaluate(expression, await_promise=await_promise)
-        return json.dumps({"status": "ok", "result": str(result)})
+        if args:
+            # Resolve uids to remote objects and call function with them
+            import nodriver.cdp.runtime as cdp_runtime
+            import nodriver.cdp.dom as cdp_dom
+
+            arg_objects = []
+            for uid in args:
+                remote_obj = await _resolve_uid(tab, uid)
+                arg_objects.append(cdp_runtime.CallArgument(object_id=remote_obj.object_id))
+
+            # Evaluate the function with resolved element arguments
+            result = await tab.send(cdp_runtime.call_function_on(
+                function_declaration=function,
+                arguments=arg_objects,
+                return_by_value=True,
+            ))
+            value = result.value if result else None
+            return f"```json\n{json.dumps(value, default=str)}\n```"
+        else:
+            # Simple evaluation without element args — wrap in function call if needed
+            result = await tab.evaluate(function, await_promise=True)
+            return f"```json\n{json.dumps(result, default=str)}\n```"
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f"Error: {e}"
 
 
 @mcp.tool()
-async def fill(selector: str, value: str, timeout: int = 10) -> str:
-    """Fill an input field with the given value (clears existing content first).
+async def fill(uid: str, value: str, include_snapshot: bool = False) -> str:
+    """Type text into an input, text area or select an option from a <select> element.
 
     Args:
-        selector: CSS selector of the input element.
-        value: The text value to fill in.
-        timeout: Max seconds to wait for the element.
+        uid: The uid of an element on the page from the page content snapshot.
+        value: The value to fill in.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
     try:
-        elem = await tab.select(selector, timeout=timeout)
-        await elem.clear_input()
-        await elem.send_keys(value)
+        import nodriver.cdp.dom as cdp_dom
+        import nodriver.cdp.runtime as cdp_runtime
+
+        remote_obj = await _resolve_uid(tab, uid)
+
+        # Check element tag to handle select vs input
+        tag_result = await tab.send(cdp_runtime.call_function_on(
+            function_declaration="function() { return this.tagName.toLowerCase(); }",
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        ))
+        tag = tag_result.value if tag_result else ""
+
+        if tag == "select":
+            # For select elements, set the value via JavaScript
+            await tab.send(cdp_runtime.call_function_on(
+                function_declaration="""function(val) {
+                    this.value = val;
+                    this.dispatchEvent(new Event('change', {bubbles: true}));
+                }""",
+                object_id=remote_obj.object_id,
+                arguments=[cdp_runtime.CallArgument(value=value)],
+                return_by_value=True,
+            ))
+        else:
+            # For input/textarea, focus, clear, and type
+            await tab.send(cdp_runtime.call_function_on(
+                function_declaration="""function() {
+                    this.focus();
+                    this.value = '';
+                    this.dispatchEvent(new Event('input', {bubbles: true}));
+                }""",
+                object_id=remote_obj.object_id,
+                return_by_value=True,
+            ))
+            # Type the value character by character
+            import nodriver.cdp.input_ as cdp_input
+            for char in value:
+                await tab.send(cdp_input.dispatch_key_event(type_="keyDown", text=char))
+                await tab.send(cdp_input.dispatch_key_event(type_="keyUp", text=char))
         await tab
-        return json.dumps({"status": "filled", "selector": selector})
+        result = f"Filled uid={uid} with \"{value}\""
+        result += await _maybe_snapshot(include_snapshot)
+        return result
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f"Error filling uid={uid}: {e}"
 
 
 @mcp.tool()
-async def fill_form(fields: dict[str, str]) -> str:
-    """Fill multiple form fields at once.
+async def fill_form(elements: list[dict], include_snapshot: bool = False) -> str:
+    """Fill out multiple form elements at once.
 
     Args:
-        fields: A dict mapping CSS selectors to values, e.g. {"#email": "test@example.com", "#password": "secret"}.
+        elements: Elements from snapshot to fill out. Each has "uid" and "value" keys.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
-    tab = await _active_tab()
     results = []
-    for sel, val in fields.items():
+    for elem_spec in elements:
+        uid = elem_spec.get("uid", "")
+        value = elem_spec.get("value", "")
         try:
-            elem = await tab.select(sel, timeout=5)
-            await elem.clear_input()
-            await elem.send_keys(val)
-            results.append({"selector": sel, "status": "ok"})
+            # Reuse fill logic for each element
+            await fill(uid, value, include_snapshot=False)
+            results.append(f"  uid={uid}: filled")
         except Exception as e:
-            results.append({"selector": sel, "status": "error", "message": str(e)})
-    await tab
-    return json.dumps(results)
+            results.append(f"  uid={uid}: error — {e}")
+    result = "Form fill results:\n" + "\n".join(results)
+    result += await _maybe_snapshot(include_snapshot)
+    return result
 
 
 @mcp.tool()
-async def get_console_messages() -> str:
-    """Get recent console messages from the page.
+async def get_console_message(msgid: int) -> str:
+    """Gets a console message by its ID.
 
-    Note: Console message collection must be enabled first by calling enable_console_collection.
+    Args:
+        msgid: The message ID (0-based index) from list_console_messages.
     """
-    return json.dumps({
-        "status": "ok",
-        "messages": list(_console_messages[-50:]),
-    })
+    if msgid < 0 or msgid >= len(_console_messages):
+        return f"Error: Invalid msgid {msgid}. Have {len(_console_messages)} messages."
+    msg = _console_messages[msgid]
+    return f"[{msg['type']}] {msg['text']} (timestamp: {msg['timestamp']})"
 
 
 @mcp.tool()
@@ -458,17 +590,10 @@ async def get_cookies(url: str = "") -> str:
         cookies = await tab.send(cdp_net.get_cookies(urls=[url]))
     else:
         cookies = await tab.send(cdp_net.get_cookies())
-    result = []
+    lines = [f"Cookies ({len(cookies)}):"]
     for c in cookies:
-        result.append({
-            "name": c.name,
-            "value": c.value,
-            "domain": c.domain,
-            "path": c.path,
-            "secure": c.secure,
-            "http_only": c.http_only,
-        })
-    return json.dumps({"count": len(result), "cookies": result})
+        lines.append(f"  {c.name}={c.value} (domain={c.domain}, path={c.path}, secure={c.secure})")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -476,31 +601,65 @@ async def get_local_storage() -> str:
     """Get all localStorage items from the current page."""
     tab = await _active_tab()
     data = await tab.get_local_storage()
-    return json.dumps({"status": "ok", "data": data})
+    lines = ["localStorage items:"]
+    for k, v in (data or {}).items():
+        lines.append(f"  {k}: {str(v)[:200]}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
-async def get_network_request(request_id: str) -> str:
-    """Get details of a specific network request by its ID.
+async def get_network_request(reqid: int | None = None, request_file_path: str = "", response_file_path: str = "") -> str:
+    """Gets a network request by an optional reqid.
 
     Args:
-        request_id: The request ID from list_network_requests.
+        reqid: The index of the network request from list_network_requests. If omitted, returns the latest request.
+        request_file_path: Optional path to save the request body to.
+        response_file_path: Optional path to save the response body to.
     """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
+
+    if reqid is None:
+        if not _network_requests:
+            return "No network requests collected."
+        req = _network_requests[-1]
+    else:
+        if reqid < 0 or reqid >= len(_network_requests):
+            return f"Error: Invalid reqid {reqid}. Have {len(_network_requests)} requests."
+        req = _network_requests[reqid]
+
+    lines = [f"Request #{reqid if reqid is not None else 'latest'}:"]
+    lines.append(f"  URL: {req['url']}")
+    lines.append(f"  Method: {req['method']}")
+    lines.append(f"  Type: {req['type']}")
+
     try:
-        body = await tab.send(cdp_net.get_response_body(cdp_net.RequestId(request_id)))
-        return json.dumps({"status": "ok", "body": body[0][:50000], "base64_encoded": body[1]})
+        body_result = await tab.send(cdp_net.get_response_body(cdp_net.RequestId(req['id'])))
+        body_content = body_result[0]
+        is_base64 = body_result[1]
+
+        if response_file_path:
+            if is_base64:
+                with open(response_file_path, "wb") as f:
+                    f.write(base64.b64decode(body_content))
+            else:
+                with open(response_file_path, "w") as f:
+                    f.write(body_content)
+            lines.append(f"  Response body saved to: {response_file_path}")
+        else:
+            lines.append(f"  Response body ({len(body_content)} chars): {body_content[:5000]}")
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        lines.append(f"  Response body: Error — {e}")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
 async def handle_dialog(action: str = "accept", prompt_text: str = "") -> str:
-    """Handle a browser dialog (alert, confirm, prompt).
+    """If a browser dialog was opened, use this command to handle it.
 
     Args:
-        action: "accept" or "dismiss".
+        action: Whether to "accept" or "dismiss" the dialog.
         prompt_text: Optional text to enter into a prompt dialog.
     """
     tab = await _active_tab()
@@ -509,71 +668,118 @@ async def handle_dialog(action: str = "accept", prompt_text: str = "") -> str:
         await tab.send(cdp_page.handle_java_script_dialog(accept=True, prompt_text=prompt_text))
     else:
         await tab.send(cdp_page.handle_java_script_dialog(accept=False))
-    return json.dumps({"status": "ok", "action": action})
+    return f"Dialog {action}ed."
 
 
 @mcp.tool()
-async def hover(selector: str = "", text: str = "", timeout: int = 10) -> str:
-    """Hover over an element.
+async def hover(uid: str, include_snapshot: bool = False) -> str:
+    """Hover over the provided element.
 
     Args:
-        selector: CSS selector of the element.
-        text: Visible text of the element.
-        timeout: Max seconds to wait.
+        uid: The uid of an element on the page from the page content snapshot.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
     try:
-        if selector:
-            elem = await tab.select(selector, timeout=timeout)
-        elif text:
-            elem = await tab.find(text, best_match=True, timeout=timeout)
-        else:
-            return json.dumps({"error": "Provide either selector or text"})
-        await elem.mouse_move()
-        return json.dumps({"status": "hovered", "tag": elem.tag_name})
+        cx, cy = await _get_box_model(tab, uid)
+        await tab.mouse_move(cx, cy)
+        result = f"Hovered over uid={uid}"
+        result += await _maybe_snapshot(include_snapshot)
+        return result
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return f"Error hovering uid={uid}: {e}"
 
 
 @mcp.tool()
-async def list_network_requests(url_filter: str = "") -> str:
-    """List collected network requests, optionally filtered by URL substring.
+async def list_console_messages(
+    page_size: int | None = None,
+    page_idx: int = 0,
+    types: list[str] | None = None,
+    include_preserved_messages: bool = False,
+) -> str:
+    """List all console messages for the currently selected page since the last navigation.
 
     Args:
-        url_filter: Only return requests whose URL contains this string.
+        page_size: Maximum number of messages to return. When omitted, returns all.
+        page_idx: Page number (0-based) for pagination. Default is 0.
+        types: Filter to specific message types (e.g. ["error", "warn"]). Omit for all.
+        include_preserved_messages: Set to true to return the preserved messages over the last 3 navigations. Default is false.
     """
-    filtered = _network_requests
+    if include_preserved_messages:
+        all_msgs = []
+        for batch in _preserved_console_messages:
+            all_msgs.extend(batch)
+        all_msgs.extend(_console_messages)
+        filtered = all_msgs
+    else:
+        filtered = list(_console_messages)
+
+    if types:
+        filtered = [m for m in filtered if m["type"] in types]
+
+    total = len(filtered)
+    if page_size:
+        start = page_idx * page_size
+        filtered = filtered[start:start + page_size]
+
+    lines = [f"Console messages ({len(filtered)} of {total}):"]
+    for i, msg in enumerate(filtered):
+        idx = (page_idx * page_size + i) if page_size else i
+        lines.append(f"  [{idx}] [{msg['type']}] {msg['text'][:200]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def list_network_requests(
+    page_size: int | None = None,
+    page_idx: int = 0,
+    resource_types: list[str] | None = None,
+    url_filter: str = "",
+    include_preserved_requests: bool = False,
+) -> str:
+    """List all requests for the currently selected page since the last navigation.
+
+    Args:
+        page_size: Maximum number of requests to return. When omitted, returns all.
+        page_idx: Page number (0-based) for pagination. Default is 0.
+        resource_types: Filter by resource types (e.g. ["xhr", "fetch"]). Omit for all.
+        url_filter: Only return requests whose URL contains this string.
+        include_preserved_requests: Set to true to return the preserved requests over the last 3 navigations. Default is false.
+    """
+    if include_preserved_requests:
+        all_reqs = []
+        for batch in _preserved_network_requests:
+            all_reqs.extend(batch)
+        all_reqs.extend(_network_requests)
+        filtered = all_reqs
+    else:
+        filtered = list(_network_requests)
+
+    if resource_types:
+        filtered = [r for r in filtered if r["type"].lower() in [t.lower() for t in resource_types]]
     if url_filter:
-        filtered = [r for r in _network_requests if url_filter in r["url"]]
-    return json.dumps({"count": len(filtered), "requests": filtered[-100:]})
+        filtered = [r for r in filtered if url_filter in r["url"]]
+
+    total = len(filtered)
+    if page_size:
+        start = page_idx * page_size
+        filtered = filtered[start:start + page_size]
+
+    lines = [f"Network requests ({len(filtered)} of {total}):"]
+    for i, req in enumerate(filtered):
+        idx = (page_idx * page_size + i) if page_size else i
+        lines.append(f"  [{idx}] {req['method']} {req['url'][:150]} ({req['type']})")
+    return "\n".join(lines)
 
 
 @mcp.tool()
 async def list_pages() -> str:
-    """List all open tabs/pages with their URLs and titles."""
+    """Get a list of pages open in the browser."""
     browser = await _get_browser()
-    pages = []
+    lines = ["Open pages:"]
     for i, tab in enumerate(browser.tabs):
-        pages.append({
-            "index": i,
-            "url": tab.target.url,
-            "title": tab.target.title,
-        })
-    return json.dumps(pages)
-
-
-@mcp.tool()
-async def navigate(url: str, new_tab: bool = False) -> str:
-    """Navigate to a URL. Optionally open in a new tab.
-
-    Args:
-        url: The URL to navigate to.
-        new_tab: If True, open the URL in a new tab.
-    """
-    browser = await _get_browser()
-    tab = await browser.get(url, new_tab=new_tab)
-    await tab
-    return json.dumps({"status": "ok", "url": tab.target.url, "title": tab.target.title})
+        lines.append(f"  [{i}] {tab.target.url} — {tab.target.title}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -581,18 +787,33 @@ async def navigate_page(
     type: str = "url",
     url: str = "",
     ignore_cache: bool = False,
+    handle_before_unload: str = "accept",
+    init_script: str = "",
+    timeout: int = 0,
 ) -> str:
-    """Navigate the page by URL, back/forward in history, or reload.
+    """Go to a URL, or back, forward, or reload.
 
     Args:
         type: One of "url", "back", "forward", "reload".
         url: Target URL (only for type=url).
         ignore_cache: Whether to ignore cache on reload.
+        handle_before_unload: Whether to auto accept or decline beforeunload dialogs. Default is "accept".
+        init_script: A JavaScript script to be executed on each new document before any other scripts for the next navigation.
+        timeout: Maximum wait time in milliseconds. 0 for default timeout.
     """
     tab = await _active_tab()
+
+    # Preserve current console/network messages before navigation
+    _preserve_on_navigation()
+
+    # Inject init script if provided (runs before page scripts on next navigation)
+    if init_script:
+        import nodriver.cdp.page as cdp_page
+        await tab.send(cdp_page.add_script_to_evaluate_on_new_document(source=init_script))
+
     if type == "url":
         if not url:
-            return json.dumps({"error": "URL is required for type=url"})
+            return "Error: URL is required for type=url."
         await tab.get(url)
         await tab
     elif type == "back":
@@ -605,36 +826,75 @@ async def navigate_page(
         await tab.reload(ignore_cache=ignore_cache)
         await tab
     else:
-        return json.dumps({"error": f"Unknown type: {type}"})
-    return json.dumps({"status": "ok", "url": tab.target.url})
+        return f"Error: Unknown type '{type}'."
+
+    # Auto-enable collection on navigated tab
+    await _auto_enable_collection(tab)
+
+    pages = await _format_pages()
+    return f"Navigated to {tab.target.url}{pages}"
 
 
 @mcp.tool()
-async def new_page(url: str = "about:blank") -> str:
-    """Open a new tab/page and navigate to the given URL.
+async def new_page(url: str = "about:blank", background: bool = False, isolated_context: str = "", timeout: int = 0) -> str:
+    """Open a new tab and load a URL.
 
     Args:
-        url: URL to open in the new tab.
+        url: URL to load in a new page.
+        background: Whether to open without bringing to front. Default is false.
+        isolated_context: If specified, the page is created in an isolated browser context with the given name.
+            Pages in the same browser context share cookies and storage.
+            Pages in different browser contexts are fully isolated.
+        timeout: Maximum wait time in milliseconds. 0 for default.
     """
     browser = await _get_browser()
-    tab = await browser.get(url, new_tab=True)
+
+    if isolated_context:
+        # Create an isolated browser context via CDP
+        import nodriver.cdp.target as cdp_target
+        ctx = await browser.send(cdp_target.create_browser_context(
+            disposition_for_initial_page="newTab",
+        ))
+        target_id = await browser.send(cdp_target.create_target(
+            url=url,
+            browser_context_id=ctx,
+            new_window=False,
+        ))
+        # Wait for the tab to appear
+        await asyncio.sleep(1)
+        tab = browser.tabs[-1]
+    else:
+        tab = await browser.get(url, new_tab=True)
+
     await tab
-    return json.dumps({"status": "ok", "url": tab.target.url, "title": tab.target.title})
+
+    # Auto-enable collection on new tab
+    await _auto_enable_collection(tab)
+
+    if background and len(browser.tabs) >= 2:
+        # Switch back to previous tab
+        prev_tab = browser.tabs[-2]
+        await prev_tab.activate()
+
+    pages = await _format_pages()
+    return f"Opened new page: {tab.target.url}{pages}"
 
 
 @mcp.tool()
-async def performance_start_trace(reload: bool = True) -> str:
-    """Start a performance trace on the selected page.
+async def performance_start_trace(reload: bool = True, auto_stop: bool = True, file_path: str = "") -> str:
+    """Start a performance trace on the selected webpage.
 
     Args:
-        reload: Whether to reload the page after starting the trace.
+        reload: Whether to reload the page after starting the trace. Default true.
+        auto_stop: Whether to auto-stop after recording. Default true.
+        file_path: Optional path to save the raw trace data.
     """
     global _tracing_active
     tab = await _active_tab()
     import nodriver.cdp.tracing as cdp_tracing
 
     if _tracing_active:
-        return json.dumps({"error": "A trace is already running. Stop it first."})
+        return "Error: A trace is already running. Stop it first."
 
     categories = [
         "-*", "blink.console", "blink.user_timing", "devtools.timeline",
@@ -650,24 +910,27 @@ async def performance_start_trace(reload: bool = True) -> str:
 
     if reload:
         await tab.reload()
-        await tab.sleep(5)
 
-    return json.dumps({"status": "tracing", "message": "Trace started. Use performance_stop_trace to stop."})
+    if auto_stop:
+        await tab.sleep(5)
+        return await performance_stop_trace(file_path=file_path)
+
+    return "Trace started. Use performance_stop_trace to stop."
 
 
 @mcp.tool()
 async def performance_stop_trace(file_path: str = "") -> str:
-    """Stop the active performance trace and return summary.
+    """Stop the active performance trace recording on the selected webpage.
 
     Args:
-        file_path: Optional path to save the raw trace JSON.
+        file_path: Optional path to save the raw trace data (e.g. trace.json).
     """
     global _tracing_active
     tab = await _active_tab()
     import nodriver.cdp.tracing as cdp_tracing
 
     if not _tracing_active:
-        return json.dumps({"error": "No trace is running."})
+        return "Error: No trace is running."
 
     trace_chunks = []
 
@@ -693,40 +956,64 @@ async def performance_stop_trace(file_path: str = "") -> str:
     tab.remove_handler(cdp_tracing.DataCollected, on_data)
     tab.remove_handler(cdp_tracing.TracingComplete, on_complete)
 
-    if file_path and trace_chunks:
-        import json as json_mod
-        with open(file_path, "w") as f:
-            json_mod.dump(trace_chunks, f)
-        return json.dumps({"status": "ok", "events": len(trace_chunks), "saved_to": file_path})
+    result = f"Trace stopped. {len(trace_chunks)} events collected."
 
-    return json.dumps({"status": "ok", "events": len(trace_chunks)})
+    if file_path and trace_chunks:
+        with open(file_path, "w") as f:
+            json.dump(trace_chunks, f)
+        result += f" Saved to {file_path}"
+
+    return result
 
 
 @mcp.tool()
-async def press_key(key: str) -> str:
-    """Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown).
+async def press_key(key: str, include_snapshot: bool = False) -> str:
+    """Press a key or key combination.
 
     Args:
-        key: The key name to press.
+        key: A key or combination (e.g. "Enter", "Control+A", "Control+Shift+R").
+            Modifiers: Control, Shift, Alt, Meta.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
-    await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=key))
-    await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=key))
-    return json.dumps({"status": "pressed", "key": key})
+
+    parts = key.split("+")
+    modifiers = []
+    target_key = parts[-1]
+
+    for p in parts[:-1]:
+        if p in _MODIFIER_KEYS:
+            modifiers.append(p)
+
+    # Press modifiers down
+    for mod in modifiers:
+        await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=mod))
+
+    # Press the target key
+    await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=target_key))
+    await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=target_key))
+
+    # Release modifiers in reverse
+    for mod in reversed(modifiers):
+        await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=mod))
+
+    result = f"Pressed {key}"
+    result += await _maybe_snapshot(include_snapshot)
+    return result
 
 
 @mcp.tool()
-async def resize_page(width: int = 1280, height: int = 720) -> str:
-    """Resize the browser window.
+async def resize_page(width: int, height: int) -> str:
+    """Resizes the selected page's window so that the page has specified dimension.
 
     Args:
-        width: Window width in pixels.
-        height: Window height in pixels.
+        width: Page width in pixels.
+        height: Page height in pixels.
     """
     tab = await _active_tab()
     await tab.set_window_size(width=width, height=height)
-    return json.dumps({"status": "ok", "size": f"{width}x{height}"})
+    return f"Resized to {width}x{height}."
 
 
 @mcp.tool()
@@ -742,23 +1029,26 @@ async def scroll_page(direction: str = "down", amount: int = 50) -> str:
         await tab.scroll_down(amount)
     else:
         await tab.scroll_up(amount)
-    return json.dumps({"status": "scrolled", "direction": direction, "amount": amount})
+    return f"Scrolled {direction} {amount}%."
 
 
 @mcp.tool()
-async def select_page(index: int) -> str:
-    """Switch to a tab by its index (from list_pages).
+async def select_page(page_id: int, bring_to_front: bool = True) -> str:
+    """Select a page as a context for future tool calls.
 
     Args:
-        index: The tab index to activate.
+        page_id: The ID of the page to select (from list_pages).
+        bring_to_front: Whether to focus the page and bring it to the top. Default true.
     """
     browser = await _get_browser()
-    if index < 0 or index >= len(browser.tabs):
-        return json.dumps({"error": f"Invalid index {index}, have {len(browser.tabs)} tabs"})
-    tab = browser.tabs[index]
-    await tab.activate()
+    if page_id < 0 or page_id >= len(browser.tabs):
+        return f"Error: Invalid page_id {page_id}, have {len(browser.tabs)} tabs."
+    tab = browser.tabs[page_id]
+    if bring_to_front:
+        await tab.activate()
     await tab
-    return json.dumps({"status": "ok", "url": tab.target.url, "title": tab.target.title})
+    pages = await _format_pages()
+    return f"Selected page [{page_id}]: {tab.target.url}{pages}"
 
 
 @mcp.tool()
@@ -777,7 +1067,7 @@ async def set_cookie(name: str, value: str, domain: str, path: str = "/", secure
     success = await tab.send(cdp_net.set_cookie(
         name=name, value=value, domain=domain, path=path, secure=secure,
     ))
-    return json.dumps({"status": "ok" if success else "failed"})
+    return f"Cookie '{name}' set." if success else f"Failed to set cookie '{name}'."
 
 
 @mcp.tool()
@@ -789,7 +1079,7 @@ async def set_local_storage(items: dict[str, str]) -> str:
     """
     tab = await _active_tab()
     await tab.set_local_storage(items)
-    return json.dumps({"status": "ok"})
+    return f"Set {len(items)} localStorage items."
 
 
 @mcp.tool()
@@ -811,14 +1101,22 @@ async def take_memory_snapshot(file_path: str) -> str:
     await tab.send(cdp_heap.take_heap_snapshot(report_progress=False))
     tab.remove_handler(cdp_heap.AddHeapSnapshotChunk, on_chunk)
 
+    data = "".join(chunks)
     with open(file_path, "w") as f:
-        f.write("".join(chunks))
+        f.write(data)
 
-    return json.dumps({"status": "ok", "file": file_path, "size_mb": round(len("".join(chunks)) / 1024 / 1024, 2)})
+    size_mb = round(len(data) / 1024 / 1024, 2)
+    return f"Heap snapshot saved to {file_path} ({size_mb} MB)."
 
 
 @mcp.tool()
-async def take_screenshot(full_page: bool = False, format: str = "jpeg") -> str:
+async def take_screenshot(
+    full_page: bool = False,
+    format: str = "png",
+    quality: int = 0,
+    uid: str = "",
+    file_path: str = "",
+) -> str:
     """Take a screenshot of the page or element.
 
     WARNING: Do NOT use this tool to read page content. Use take_snapshot instead
@@ -826,33 +1124,64 @@ async def take_screenshot(full_page: bool = False, format: str = "jpeg") -> str:
     specifically need a visual image (layout checks, visual regression, etc.).
 
     Args:
-        full_page: If True, capture the entire page (not just viewport).
-        format: Image format, "jpeg" or "png".
+        full_page: If True, capture the entire page (not just viewport). Incompatible with uid.
+        format: Image format — "png", "jpeg", or "webp". Default is "png".
+        quality: Compression quality for JPEG/WebP (0-100). Ignored for PNG.
+        uid: The uid of an element from snapshot to screenshot. If omitted, takes full page screenshot.
+        file_path: Optional path to save the screenshot. If omitted, returns base64 data.
     """
     tab = await _active_tab()
     import nodriver.cdp.page as cdp_page
 
-    result = await tab.send(cdp_page.capture_screenshot(
-        format_=format,
-        capture_beyond_viewport=full_page,
-    ))
-    return json.dumps({
-        "status": "ok",
-        "format": format,
-        "data_base64": result,
-    })
+    if uid and full_page:
+        return "Error: Cannot use both uid and full_page together."
+
+    clip = None
+    if uid:
+        try:
+            import nodriver.cdp.dom as cdp_dom
+            backend_node_id = _uid_to_backend_node_id.get(uid)
+            if backend_node_id is None:
+                return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+            model = await tab.send(cdp_dom.get_box_model(
+                backend_node_id=cdp_dom.BackendNodeId(backend_node_id)
+            ))
+            quad = model.content
+            x = min(quad[0], quad[2], quad[4], quad[6])
+            y = min(quad[1], quad[3], quad[5], quad[7])
+            w = max(quad[0], quad[2], quad[4], quad[6]) - x
+            h = max(quad[1], quad[3], quad[5], quad[7]) - y
+            clip = cdp_page.Viewport(x=x, y=y, width=w, height=h, scale=1)
+        except Exception as e:
+            return f"Error getting element bounds for uid={uid}: {e}"
+
+    kwargs = {"format_": format, "capture_beyond_viewport": full_page}
+    if quality and format in ("jpeg", "webp"):
+        kwargs["quality"] = quality
+    if clip:
+        kwargs["clip"] = clip
+
+    result = await tab.send(cdp_page.capture_screenshot(**kwargs))
+
+    if file_path:
+        with open(file_path, "wb") as f:
+            f.write(base64.b64decode(result))
+        return f"Screenshot saved to {file_path}."
+    else:
+        return f"data:image/{format};base64,{result}"
 
 
 @mcp.tool()
-async def take_snapshot(verbose: bool = False) -> str:
-    """Get the current page's DOM snapshot based on the accessibility tree.
+async def take_snapshot(verbose: bool = False, file_path: str = "") -> str:
+    """Take a text snapshot of the currently selected page based on the a11y tree.
     The snapshot lists page elements along with a unique identifier (uid).
     Always use the latest snapshot. Prefer taking a snapshot over taking a
-    screenshot. Returns searchable, structured text that is much smaller
-    than an image or raw HTML.
+    screenshot. The snapshot indicates searchable, structured text that is
+    much smaller than an image or raw HTML.
 
     Args:
-        verbose: Whether to include all elements (including ignored/hidden ones). Default is false.
+        verbose: Whether to include all possible information available in the full a11y tree. Default is false.
+        file_path: Optional path to save the snapshot to instead of attaching it to the response.
     """
     global _snapshot_id
     tab = await _active_tab()
@@ -884,6 +1213,7 @@ async def take_snapshot(verbose: bool = False) -> str:
     id_counter = 0
     uid_map: dict[str, str] = {}
     seen_unique_ids: set[str] = set()
+    new_uid_to_backend: dict[str, int] = {}
 
     for node in nodes:
         frame_id = str(node.frame_id) if node.frame_id else ""
@@ -891,7 +1221,6 @@ async def take_snapshot(verbose: bool = False) -> str:
         unique_id = f"{frame_id}_{backend_id}"
 
         if unique_id != "_" and unique_id in _unique_id_to_mcp_id:
-            # Reuse previously assigned uid for the same DOM node
             uid_map[node.node_id] = _unique_id_to_mcp_id[unique_id]
         else:
             new_uid = f"{_snapshot_id}_{id_counter}"
@@ -903,10 +1232,19 @@ async def take_snapshot(verbose: bool = False) -> str:
         if unique_id != "_":
             seen_unique_ids.add(unique_id)
 
-    # Clean up stale mappings for nodes that no longer exist
+        # Record uid -> backend_node_id mapping for element resolution
+        if node.backend_dom_node_id:
+            assigned_uid = uid_map[node.node_id]
+            new_uid_to_backend[assigned_uid] = int(node.backend_dom_node_id)
+
+    # Clean up stale mappings
     stale_keys = [k for k in _unique_id_to_mcp_id if k not in seen_unique_ids]
     for k in stale_keys:
         del _unique_id_to_mcp_id[k]
+
+    # Update global uid -> backend_node_id mapping
+    _uid_to_backend_node_id.clear()
+    _uid_to_backend_node_id.update(new_uid_to_backend)
 
     def _format_node(node_id: str, depth: int) -> str:
         node = node_map.get(node_id)
@@ -933,7 +1271,6 @@ async def take_snapshot(verbose: bool = False) -> str:
             name = ""
             if node.name and node.name.value:
                 name = str(node.name.value)
-            # Keep the node if it has a meaningful name (e.g. aria-label)
             if not name:
                 child_parts = []
                 for cid in children_map.get(node_id, []):
@@ -962,16 +1299,13 @@ async def take_snapshot(verbose: bool = False) -> str:
                 if pname in _EXCLUDED_PROPERTIES or pname in _SUPPRESS_PROPERTIES:
                     continue
 
-                # Skip false boolean values (e.g. invalid="false")
                 if pval is False or pval == "false":
                     continue
 
-                # Boolean property mapping (disabled -> also emit disableable)
                 mapped = _BOOL_PROPERTY_MAP.get(pname)
                 if mapped and (pval is True or pval == "true"):
                     props.append(mapped)
 
-                # Emit the property itself
                 if pval is True or pval == "true":
                     props.append(pname)
                 elif isinstance(pval, (str, int, float)) and pval != "":
@@ -1007,68 +1341,91 @@ async def take_snapshot(verbose: bool = False) -> str:
     if len(snapshot_text) > 200_000:
         snapshot_text = snapshot_text[:200_000] + "\n... (truncated)"
 
-    return json.dumps({"status": "ok", "length": len(snapshot_text), "snapshot": snapshot_text})
+    if file_path:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(snapshot_text)
+        return f"Snapshot saved to {file_path} ({len(snapshot_text)} chars)."
+
+    return snapshot_text
 
 
 @mcp.tool()
-async def type_text(text: str) -> str:
-    """Type text using keyboard input (sends to the currently focused element).
+async def type_text(text: str, submit_key: str = "") -> str:
+    """Type text using keyboard input into a previously focused input.
 
     Args:
         text: The text to type.
+        submit_key: Optional key to press after typing (e.g. "Enter", "Tab", "Escape").
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
     for char in text:
         await tab.send(cdp_input.dispatch_key_event(type_="keyDown", text=char))
         await tab.send(cdp_input.dispatch_key_event(type_="keyUp", text=char))
-    return json.dumps({"status": "typed", "length": len(text)})
+
+    if submit_key:
+        await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=submit_key))
+        await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=submit_key))
+
+    result = f"Typed {len(text)} characters"
+    if submit_key:
+        result += f", then pressed {submit_key}"
+    return result
 
 
 @mcp.tool()
-async def upload_file(selector: str, file_paths: list[str]) -> str:
-    """Upload file(s) through a file input element.
+async def upload_file(uid: str, file_path: str, include_snapshot: bool = False) -> str:
+    """Upload a file through a provided element.
 
     Args:
-        selector: CSS selector of the file input element.
-        file_paths: List of local file paths to upload.
+        uid: The uid of the file input element from the page content snapshot.
+        file_path: The local path of the file to upload.
+        include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
     import nodriver.cdp.dom as cdp_dom
-    elem = await tab.select(selector)
-    node_id = elem.node_id
-    if not node_id:
-        doc = await tab.send(cdp_dom.get_document())
-        result = await tab.send(cdp_dom.query_selector(doc.node_id, selector))
-        node_id = result
-    await tab.send(cdp_dom.set_file_input_files(files=file_paths, node_id=node_id))
-    return json.dumps({"status": "uploaded", "files": file_paths})
+
+    backend_node_id = _uid_to_backend_node_id.get(uid)
+    if backend_node_id is None:
+        return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+
+    await tab.send(cdp_dom.set_file_input_files(
+        files=[file_path],
+        backend_node_id=cdp_dom.BackendNodeId(backend_node_id),
+    ))
+
+    result = f"Uploaded {file_path} to uid={uid}"
+    result += await _maybe_snapshot(include_snapshot)
+    return result
 
 
 @mcp.tool()
-async def wait_for(selector: str = "", text: str = "", timeout: int = 10) -> str:
-    """Wait for an element to appear on the page.
+async def wait_for(text: list[str], timeout: int = 30000) -> str:
+    """Wait for the specified text to appear on the selected page.
 
     Args:
-        selector: CSS selector to wait for.
-        text: Text content to wait for.
-        timeout: Maximum seconds to wait.
+        text: Non-empty list of texts. Resolves when any value appears on the page.
+        timeout: Maximum wait time in milliseconds. Default is 30000.
     """
     tab = await _active_tab()
-    try:
-        if selector:
-            elem = await tab.select(selector, timeout=timeout)
-        elif text:
-            elem = await tab.find(text, timeout=timeout)
-        else:
-            return json.dumps({"error": "Provide either selector or text"})
-        if elem is None:
-            return json.dumps({"status": "not_found", "message": "Element not found"})
-        return json.dumps({"status": "found", "tag": elem.tag_name or "", "text": (elem.text or "")[:200]})
-    except asyncio.TimeoutError:
-        return json.dumps({"status": "timeout", "message": f"Element not found within {timeout}s"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    timeout_s = timeout / 1000
+
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            # Get page text content
+            page_text = await tab.evaluate("document.body ? document.body.innerText : ''")
+            if page_text:
+                for t in text:
+                    if t in page_text:
+                        # Found — return with snapshot
+                        snapshot = await take_snapshot()
+                        return f"Found text \"{t}\" on page.\n\n{snapshot}"
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    return f"Timeout: None of the texts {text} appeared within {timeout}ms."
 
 
 # ---------------------------------------------------------------------------
