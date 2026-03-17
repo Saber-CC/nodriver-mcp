@@ -1025,9 +1025,13 @@ async def wait_for(selector: str = "", text: str = "", timeout: int = 10) -> str
             elem = await tab.find(text, timeout=timeout)
         else:
             return json.dumps({"error": "Provide either selector or text"})
-        return json.dumps({"status": "found", "tag": elem.tag_name, "text": elem.text[:200] if elem.text else ""})
+        if elem is None:
+            return json.dumps({"status": "not_found", "message": "Element not found"})
+        return json.dumps({"status": "found", "tag": elem.tag_name or "", "text": (elem.text or "")[:200]})
     except asyncio.TimeoutError:
         return json.dumps({"status": "timeout", "message": f"Element not found within {timeout}s"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 # ---------------------------------------------------------------------------
