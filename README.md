@@ -20,6 +20,12 @@ cd nodriver-mcp
 pip install .
 ```
 
+## Upgrade
+
+```bash
+pip install --upgrade https://github.com/Saber-CC/nodriver-mcp/archive/refs/heads/main.zip
+```
+
 ## One-command MCP Client Setup
 
 ```bash
