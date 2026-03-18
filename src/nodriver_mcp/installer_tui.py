@@ -104,11 +104,11 @@ def interactive_select(items: list[tuple[str, bool]], title: str, *, show_status
     if read_key is None:
         return None
 
-    selected = [checked for _, checked in items]
+    selected = [False] * len(items)
     cursor = 0
 
-    # Track which items were initially checked (i.e. installed)
-    initially_checked = [checked for _, checked in items]
+    # Track which items have the status flag (i.e. installed)
+    has_status = [checked for _, checked in items]
 
     def render():
         lines = [f"\033[1m{title}\033[0m"]
@@ -117,7 +117,7 @@ def interactive_select(items: list[tuple[str, bool]], title: str, *, show_status
         for i, (name, _) in enumerate(items):
             check = "\033[32m[x]\033[0m" if selected[i] else "[ ]"
             pointer = "\033[36m>\033[0m" if i == cursor else " "
-            badge = " \033[33m(installed)\033[0m" if show_status and initially_checked[i] else ""
+            badge = " \033[33m(installed)\033[0m" if show_status and has_status[i] else ""
             lines.append(f"  {pointer} {check} {name}{badge}")
         return "\n".join(lines)
 
