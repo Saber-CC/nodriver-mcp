@@ -278,11 +278,9 @@ def run_install_command(*, uninstall: bool, targets_str: str, project: bool):
         if uninstall:
             if not installed:
                 continue  # Only show installed clients in uninstall mode
-            items.append((name, False))
-        else:
-            items.append((name, False))
+        items.append((name, installed))
     action = "uninstall from" if uninstall else "install to"
-    selected = interactive_select(items, f"Select MCP clients to {action}:", show_status=uninstall)
+    selected = interactive_select(items, f"Select MCP clients to {action}:", show_status=True)
     if selected is None:
         print("Cancelled.")
         return
