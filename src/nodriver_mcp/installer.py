@@ -276,7 +276,9 @@ def run_install_command(*, uninstall: bool, targets_str: str, project: bool):
     for name, (config_dir, config_file) in configs.items():
         installed = _is_installed(name, config_dir, config_file, special, project)
         if uninstall:
-            items.append((name, installed))
+            if not installed:
+                continue  # Only show installed clients in uninstall mode
+            items.append((name, False))
         else:
             items.append((name, False))
     action = "uninstall from" if uninstall else "install to"
