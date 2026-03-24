@@ -1429,6 +1429,209 @@ async def wait_for(text: list[str], timeout: int = 30000) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Session management helpers
+# ---------------------------------------------------------------------------
+
+_SESSIONS_DIR = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "sessions")
+
+
+def _ensure_sessions_dir() -> str:
+    os.makedirs(_SESSIONS_DIR, exist_ok=True)
+    return _SESSIONS_DIR
+
+
+@mcp.tool()
+async def save_session(name: str) -> str:
+    """Save the current browser session (cookies, localStorage, open URLs) to a file.
+
+    The session is stored as a JSON file under ~/.nodriver-mcp/sessions/.
+    Use load_session to restore it later.
+
+    Args:
+        name: A human-readable name for this session (e.g. "xiaohongshu-logged-in").
+    """
+    tab = await _active_tab()
+    browser = await _get_browser()
+    import nodriver.cdp.network as cdp_net
+
+    # 1. Collect all cookies
+    raw_cookies = await tab.send(cdp_net.get_cookies())
+    cookies = []
+    for c in raw_cookies:
+        cookies.append({
+            "name": c.name,
+            "value": c.value,
+            "domain": c.domain,
+            "path": c.path,
+            "secure": c.secure,
+            "httpOnly": c.http_only,
+            "sameSite": c.same_site.value if c.same_site else None,
+            "expires": c.expires if c.expires else None,
+        })
+
+    # 2. Collect localStorage for the current page
+    local_storage = {}
+    try:
+        ls_data = await tab.get_local_storage()
+        if ls_data:
+            local_storage = {k: v for k, v in ls_data.items()}
+    except Exception:
+        pass
+
+    # 3. Collect open page URLs
+    pages = [t.target.url for t in browser.tabs if t.target and t.target.url]
+
+    # 4. Build session object
+    session = {
+        "name": name,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "current_url": tab.target.url if tab.target else "",
+        "pages": pages,
+        "cookies": cookies,
+        "localStorage": local_storage,
+    }
+
+    # 5. Write to file
+    _ensure_sessions_dir()
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_name}_{ts}.json"
+    filepath = os.path.join(_SESSIONS_DIR, filename)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(session, f, ensure_ascii=False, indent=2)
+
+    return (
+        f"Session '{name}' saved to {filepath}\n"
+        f"  Cookies: {len(cookies)}\n"
+        f"  localStorage items: {len(local_storage)}\n"
+        f"  Open pages: {len(pages)}"
+    )
+
+
+@mcp.tool()
+async def load_session(filename: str, restore_pages: bool = False) -> str:
+    """Load a previously saved session, restoring cookies and localStorage.
+
+    Args:
+        filename: The session filename (from list_sessions) or full path.
+        restore_pages: Whether to also re-open the saved page URLs. Default is false.
+    """
+    # Resolve file path
+    if os.path.isabs(filename):
+        filepath = filename
+    else:
+        filepath = os.path.join(_SESSIONS_DIR, filename)
+
+    if not os.path.exists(filepath):
+        return f"Session file not found: {filepath}"
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        session = json.load(f)
+
+    tab = await _active_tab()
+    browser = await _get_browser()
+    import nodriver.cdp.network as cdp_net
+
+    # 1. Restore cookies
+    cookies_restored = 0
+    for c in session.get("cookies", []):
+        try:
+            kwargs: dict[str, Any] = {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ""),
+                "path": c.get("path", "/"),
+                "secure": c.get("secure", False),
+                "http_only": c.get("httpOnly", False),
+            }
+            if c.get("expires"):
+                kwargs["expires"] = c["expires"]
+            if c.get("sameSite"):
+                from nodriver.cdp.network import CookieSameSite
+                kwargs["same_site"] = CookieSameSite(c["sameSite"])
+            await tab.send(cdp_net.set_cookie(**kwargs))
+            cookies_restored += 1
+        except Exception as e:
+            logger.warning("Failed to restore cookie %s: %s", c.get("name"), e)
+
+    # 2. Restore localStorage — navigate to the saved URL first so the origin matches
+    ls_items = session.get("localStorage", {})
+    ls_restored = 0
+    if ls_items:
+        current_url = session.get("current_url", "")
+        if current_url and current_url != "about:blank":
+            try:
+                await tab.get(current_url)
+                await tab
+            except Exception:
+                pass
+        try:
+            await tab.set_local_storage(ls_items)
+            ls_restored = len(ls_items)
+        except Exception as e:
+            logger.warning("Failed to restore localStorage: %s", e)
+
+    # 3. Optionally restore open pages
+    pages_opened = 0
+    if restore_pages:
+        for url in session.get("pages", []):
+            if url and url != "about:blank" and url != session.get("current_url", ""):
+                try:
+                    await browser.get(url, new_tab=True)
+                    pages_opened += 1
+                except Exception:
+                    pass
+
+    # 4. Reload current page to apply cookies
+    try:
+        await tab.reload()
+        await tab
+    except Exception:
+        pass
+
+    return (
+        f"Session '{session.get('name', '')}' loaded from {filepath}\n"
+        f"  Cookies restored: {cookies_restored}\n"
+        f"  localStorage items restored: {ls_restored}\n"
+        f"  Pages re-opened: {pages_opened}"
+    )
+
+
+@mcp.tool()
+async def list_sessions() -> str:
+    """List all saved browser sessions.
+
+    Returns the available session files with their names and save times.
+    """
+    _ensure_sessions_dir()
+    files = sorted(
+        [f for f in os.listdir(_SESSIONS_DIR) if f.endswith(".json")],
+        reverse=True,
+    )
+
+    if not files:
+        return "No saved sessions found."
+
+    lines = [f"Saved sessions ({len(files)}):"]
+    for f in files:
+        try:
+            filepath = os.path.join(_SESSIONS_DIR, f)
+            with open(filepath, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            name = data.get("name", "unknown")
+            saved_at = data.get("saved_at", "unknown")
+            n_cookies = len(data.get("cookies", []))
+            n_ls = len(data.get("localStorage", {}))
+            lines.append(f"  {f}")
+            lines.append(f"    Name: {name} | Saved: {saved_at} | Cookies: {n_cookies} | localStorage: {n_ls}")
+        except Exception:
+            lines.append(f"  {f} (unable to read)")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
