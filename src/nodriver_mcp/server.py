@@ -169,9 +169,9 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
 
     async def _on_console(event: cdp_runtime.ConsoleAPICalled):
         try:
-            type_val = event.type_.value if hasattr(event.type_, 'value') else str(event.type_)
-        except Exception:
-            type_val = "unknown"
+            type_val = event.type_.value
+        except (AttributeError, Exception):
+            type_val = str(event.type_) if event.type_ else "unknown"
         msg = {
             "type": type_val,
             "text": " ".join(str(a.value or a.description or "") for a in event.args),
@@ -184,8 +184,8 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
     async def _on_request(event: cdp_net.RequestWillBeSent):
         try:
             type_val = str(event.type_.value) if event.type_ and hasattr(event.type_, 'value') else str(event.type_ or "unknown")
-        except Exception:
-            type_val = "unknown"
+        except (AttributeError, Exception):
+            type_val = str(event.type_) if event.type_ else "unknown"
         _network_requests.append({
             "id": str(event.request_id),
             "url": event.request.url,
@@ -490,8 +490,12 @@ async def evaluate_script(function: str, args: list[str] | None = None) -> str:
             value = result.value if result else None
             return f"```json\n{json.dumps(value, default=str)}\n```"
         else:
-            # Simple evaluation without element args — wrap in function call if needed
-            result = await tab.evaluate(function, await_promise=True)
+            # Simple evaluation without element args
+            # If user passed a function declaration, wrap it in a call
+            expr = function.strip()
+            if expr.startswith("(") or expr.startswith("function") or expr.startswith("async"):
+                expr = f"({expr})()"
+            result = await tab.evaluate(expr, await_promise=True)
             return f"```json\n{json.dumps(result, default=str)}\n```"
     except Exception as e:
         return f"Error: {e}"
