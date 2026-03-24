@@ -168,8 +168,12 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
     import nodriver.cdp.network as cdp_net
 
     async def _on_console(event: cdp_runtime.ConsoleAPICalled):
+        try:
+            type_val = event.type_.value if hasattr(event.type_, 'value') else str(event.type_)
+        except Exception:
+            type_val = "unknown"
         msg = {
-            "type": event.type_.value,
+            "type": type_val,
             "text": " ".join(str(a.value or a.description or "") for a in event.args),
             "timestamp": str(event.timestamp),
         }
@@ -178,12 +182,16 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
             _console_messages.pop(0)
 
     async def _on_request(event: cdp_net.RequestWillBeSent):
+        try:
+            type_val = str(event.type_.value) if event.type_ and hasattr(event.type_, 'value') else str(event.type_ or "unknown")
+        except Exception:
+            type_val = "unknown"
         _network_requests.append({
             "id": str(event.request_id),
             "url": event.request.url,
             "method": event.request.method,
             "timestamp": str(event.timestamp),
-            "type": str(event.type_.value) if event.type_ else "unknown",
+            "type": type_val,
         })
         if len(_network_requests) > 1000:
             _network_requests.pop(0)
