@@ -57,12 +57,13 @@ def generate_mcp_config(client_name: str = "Generic") -> dict:
 
     Strategy:
     1. If installed in a uv project (uv.lock exists), use `uv run --directory <project> nodriver-mcp`
-    2. Otherwise, use the Python executable + `-m nodriver_mcp` (works for pip install)
+    2. If uv is available but not in a uv project, use `uv run --with` for isolated execution
+    3. Otherwise, use the Python executable + `-m nodriver_mcp` (works for pip install)
     """
     proj_dir = _find_project_dir()
     uv = _find_uv()
 
-    # Prefer uv run if this is a uv-managed project
+    # Prefer uv run --directory if this is a uv-managed project
     if _is_uv_project() and uv and proj_dir:
         if client_name == "Opencode":
             return {
@@ -77,6 +78,24 @@ def generate_mcp_config(client_name: str = "Generic") -> dict:
         return {
             "command": uv,
             "args": ["run", "--directory", proj_dir, "nodriver-mcp"],
+        }
+
+    # Use uv run --with for isolated execution (no global pollution)
+    if uv:
+        pkg_spec = "nodriver-mcp @ git+https://github.com/Saber-CC/nodriver-mcp.git@main"
+        if client_name == "Opencode":
+            return {
+                "type": "local",
+                "command": [uv, "run", "--with", pkg_spec, "nodriver-mcp"],
+            }
+        if client_name == "Codex":
+            return {
+                "command": uv,
+                "args": ["run", "--with", pkg_spec, "nodriver-mcp"],
+            }
+        return {
+            "command": uv,
+            "args": ["run", "--with", pkg_spec, "nodriver-mcp"],
         }
 
     # Fallback: use python -m nodriver_mcp (works for global pip install)
