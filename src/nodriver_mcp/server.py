@@ -169,32 +169,30 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
 
     async def _on_console(event: cdp_runtime.ConsoleAPICalled):
         try:
-            type_val = event.type_.value
-        except (AttributeError, Exception):
-            type_val = str(event.type_) if event.type_ else "unknown"
-        msg = {
-            "type": type_val,
-            "text": " ".join(str(a.value or a.description or "") for a in event.args),
-            "timestamp": str(event.timestamp),
-        }
-        _console_messages.append(msg)
-        if len(_console_messages) > 1000:
-            _console_messages.pop(0)
+            msg = {
+                "type": str(event.type_),
+                "text": " ".join(str(a.value or a.description or "") for a in event.args),
+                "timestamp": str(event.timestamp),
+            }
+            _console_messages.append(msg)
+            if len(_console_messages) > 1000:
+                _console_messages.pop(0)
+        except Exception:
+            pass
 
     async def _on_request(event: cdp_net.RequestWillBeSent):
         try:
-            type_val = str(event.type_.value) if event.type_ and hasattr(event.type_, 'value') else str(event.type_ or "unknown")
-        except (AttributeError, Exception):
-            type_val = str(event.type_) if event.type_ else "unknown"
-        _network_requests.append({
-            "id": str(event.request_id),
-            "url": event.request.url,
-            "method": event.request.method,
-            "timestamp": str(event.timestamp),
-            "type": type_val,
-        })
-        if len(_network_requests) > 1000:
-            _network_requests.pop(0)
+            _network_requests.append({
+                "id": str(event.request_id),
+                "url": event.request.url,
+                "method": event.request.method,
+                "timestamp": str(event.timestamp),
+                "type": str(event.type_) if event.type_ else "unknown",
+            })
+            if len(_network_requests) > 1000:
+                _network_requests.pop(0)
+        except Exception:
+            pass
 
     try:
         await tab.send(cdp_runtime.enable())
