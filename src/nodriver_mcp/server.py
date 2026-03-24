@@ -167,18 +167,22 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
     import nodriver.cdp.runtime as cdp_runtime
     import nodriver.cdp.network as cdp_net
 
-    async def _on_console(event: cdp_runtime.ConsoleAPICalled):
+    async def _on_console(event):
         try:
             parts = []
-            for a in event.args:
+            args = getattr(event, 'args', None) or []
+            for a in args:
                 try:
-                    parts.append(str(getattr(a, 'value', None) or getattr(a, 'description', None) or a))
+                    if isinstance(a, str):
+                        parts.append(a)
+                    else:
+                        parts.append(str(getattr(a, 'value', None) or getattr(a, 'description', None) or a))
                 except Exception:
                     parts.append(str(a))
             msg = {
-                "type": str(event.type_),
+                "type": str(getattr(event, 'type_', 'log')),
                 "text": " ".join(parts),
-                "timestamp": str(event.timestamp),
+                "timestamp": str(getattr(event, 'timestamp', '')),
             }
             _console_messages.append(msg)
             if len(_console_messages) > 1000:
