@@ -169,9 +169,15 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
 
     async def _on_console(event: cdp_runtime.ConsoleAPICalled):
         try:
+            parts = []
+            for a in event.args:
+                try:
+                    parts.append(str(getattr(a, 'value', None) or getattr(a, 'description', None) or a))
+                except Exception:
+                    parts.append(str(a))
             msg = {
                 "type": str(event.type_),
-                "text": " ".join(str(a.value or a.description or "") for a in event.args),
+                "text": " ".join(parts),
                 "timestamp": str(event.timestamp),
             }
             _console_messages.append(msg)
