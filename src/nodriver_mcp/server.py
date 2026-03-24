@@ -36,13 +36,16 @@ async def _get_browser() -> uc.Browser:
     async with _browser_lock:
         if _browser is None or _browser.stopped:
             headless = os.environ.get("NODRIVER_HEADLESS", "").lower() in ("1", "true", "yes")
-            user_data_dir = os.environ.get("NODRIVER_USER_DATA_DIR", None)
+            user_data_dir = os.environ.get(
+                "NODRIVER_USER_DATA_DIR",
+                os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "chrome-profile"),
+            )
             browser_path = os.environ.get("NODRIVER_BROWSER_PATH", None)
             proxy = os.environ.get("NODRIVER_PROXY", None)
 
-            kwargs: dict[str, Any] = {"headless": headless}
-            if user_data_dir:
-                kwargs["user_data_dir"] = user_data_dir
+            os.makedirs(user_data_dir, exist_ok=True)
+            kwargs: dict[str, Any] = {"headless": headless, "user_data_dir": user_data_dir}
+            logger.info("Using user data dir: %s", user_data_dir)
             if browser_path:
                 kwargs["browser_executable_path"] = browser_path
 
