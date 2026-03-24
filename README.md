@@ -10,20 +10,19 @@ An undetected alternative to [chrome-devtools-mcp](https://github.com/ChromeDevT
 
 ## Installation
 
-```bash
-# Install directly from GitHub
-pip install https://github.com/Saber-CC/nodriver-mcp/archive/refs/heads/main.zip
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended):
 
-# Or clone and install locally
-git clone https://github.com/Saber-CC/nodriver-mcp.git
-cd nodriver-mcp
-pip install .
+```bash
+# Install as an isolated tool (won't affect your global Python environment)
+uv tool install "nodriver-mcp @ git+https://github.com/Saber-CC/nodriver-mcp.git@main"
 ```
+
+> ⚠️ Avoid using `pip install` — it will install a patched version of nodriver into your global Python environment, potentially overwriting the original nodriver package.
 
 ## Upgrade
 
 ```bash
-pip install --upgrade https://github.com/Saber-CC/nodriver-mcp/archive/refs/heads/main.zip
+uv tool upgrade nodriver-mcp
 ```
 
 ## One-command MCP Client Setup
@@ -93,7 +92,7 @@ Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini 
 | WebDriver fingerprint | ✗ Exposed | ✓ None |
 | navigator.webdriver | ✗ true | ✓ undefined |
 | Cloudflare bypass | ✗ | ✓ Built-in cf_verify |
-| Install method | npx | pip install |
+| Install method | npx | uv tool install |
 | Language | TypeScript / Node.js | Python |
 | Core tool coverage | 29 tools | 38 tools |
 
