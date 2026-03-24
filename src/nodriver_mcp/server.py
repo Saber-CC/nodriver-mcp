@@ -46,10 +46,14 @@ async def _get_browser() -> uc.Browser:
             if browser_path:
                 kwargs["browser_executable_path"] = browser_path
 
-            _browser = await uc.start(**kwargs)
-
+            browser_args = []
             if proxy:
+                browser_args.append(f"--proxy-server={proxy}")
                 logger.info("Proxy configured: %s", proxy)
+            if browser_args:
+                kwargs["browser_args"] = browser_args
+
+            _browser = await uc.start(**kwargs)
 
             logger.info("Browser started (headless=%s)", headless)
 
