@@ -17,7 +17,7 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommen
 uv tool install "nodriver-mcp @ git+https://github.com/Saber-CC/nodriver-mcp.git@main"
 ```
 
-> ⚠️ Avoid using `pip install` — it will install a patched version of nodriver into your global Python environment, potentially overwriting the original nodriver package.
+> ⚠️ Avoid using `pip install` — this project depends on a [patched fork of nodriver](https://github.com/Saber-CC/nodriver/commit/ec323db) that fixes Chrome 146 compatibility (`sameParty` removed from Cookie, `privateNetworkRequestPolicy` renamed to `localNetworkAccessRequestPolicy`). Using `pip install` will overwrite the original nodriver in your global Python environment. `uv tool install` keeps it isolated.
 
 ## Upgrade
 
