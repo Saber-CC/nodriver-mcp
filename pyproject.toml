@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.26.0",
-    "nodriver>=0.48.1",
+    "nodriver @ git+https://github.com/Saber-CC/nodriver.git@main",
     "pillow>=12.1.1",
 ]
 
