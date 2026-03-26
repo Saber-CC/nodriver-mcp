@@ -313,16 +313,12 @@ dependencies = [
 
 [[package]]
 name = "nodriver-mcp"
-version = "1.1.1"
+version = "1.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
     { name = "nodriver" },
     { name = "pillow" },
-]
-
-[package.optional-dependencies]
-toml = [
     { name = "tomli-w" },
 ]
 
@@ -331,9 +327,8 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.26.0" },
     { name = "nodriver", git = "https://github.com/Saber-CC/nodriver.git?rev=main" },
     { name = "pillow", specifier = ">=12.1.1" },
-    { name = "tomli-w", marker = "extra == 'toml'", specifier = ">=1.0.0" },
+    { name = "tomli-w", specifier = ">=1.0.0" },
 ]
-provides-extras = ["toml"]
 
 [[package]]
 name = "pillow"
