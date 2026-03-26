@@ -58,9 +58,10 @@ Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini 
 | `NODRIVER_BROWSER_PATH` | Chrome executable path | Auto-detected |
 | `NODRIVER_PROXY` | Proxy server address | None |
 
-## Tools (38)
+## Tools (39)
 
 Console and network collection are enabled automatically on each tab, so there is no separate `enable_*_collection` step.
+For mobile-only sites, open `about:blank`, apply `emulate_device` or `emulate(...)`, then call `navigate_page` so the first request already carries mobile signals.
 
 ### Input Automation (10)
 `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog`
@@ -74,8 +75,8 @@ Console and network collection are enabled automatically on each tab, so there i
 ### Network Monitoring (2)
 `list_network_requests` · `get_network_request`
 
-### Device Emulation (2)
-`emulate` · `resize_page`
+### Device Emulation (3)
+`emulate` · `emulate_device` · `resize_page`
 
 ### Performance (3)
 `performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot`

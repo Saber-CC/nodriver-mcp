@@ -99,6 +99,63 @@ _tracing_active = False
 _collection_enabled_tabs: set[int] = set()  # track which tabs have collection enabled
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 
+_DEVICE_PRESETS: dict[str, dict[str, Any]] = {
+    "pixel_7": {
+        "aliases": ["pixel7", "android", "android_phone"],
+        "viewport": "412x915x2.625,mobile,touch",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+        ),
+        "platform": "Android",
+        "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "metadata": {
+            "platform": "Android",
+            "platform_version": "14",
+            "architecture": "arm",
+            "model": "Pixel 7",
+            "mobile": True,
+            "form_factors": ["Mobile"],
+        },
+    },
+    "pixel_7_landscape": {
+        "aliases": ["pixel7_landscape", "android_landscape"],
+        "viewport": "915x412x2.625,mobile,touch,landscape",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+        ),
+        "platform": "Android",
+        "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "metadata": {
+            "platform": "Android",
+            "platform_version": "14",
+            "architecture": "arm",
+            "model": "Pixel 7",
+            "mobile": True,
+            "form_factors": ["Mobile"],
+        },
+    },
+    "ipad_air": {
+        "aliases": ["ipadair", "tablet", "ipad"],
+        "viewport": "820x1180x2,mobile,touch",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 14; Pixel Tablet) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+        ),
+        "platform": "Android",
+        "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "metadata": {
+            "platform": "Android",
+            "platform_version": "14",
+            "architecture": "arm",
+            "model": "Pixel Tablet",
+            "mobile": False,
+            "form_factors": ["Tablet"],
+        },
+    },
+}
+
 # Stable uid state for take_snapshot (mirrors chrome-devtools-mcp)
 _snapshot_id: int = 0
 _unique_id_to_mcp_id: dict[str, str] = {}  # "frameId_backendNodeId" -> stable uid
@@ -292,6 +349,145 @@ async def _wait_for_target(browser: uc.Browser, target_id: Any, timeout_ms: int)
     raise TimeoutError(f"New page did not appear within {int(timeout_s * 1000)}ms")
 
 
+def _resolve_device_preset(device: str) -> dict[str, Any] | None:
+    """Resolve a device preset by canonical name or alias."""
+    normalized = device.strip().lower().replace("-", "_").replace(" ", "_")
+    for name, preset in _DEVICE_PRESETS.items():
+        aliases = {name, *preset.get("aliases", [])}
+        if normalized in aliases:
+            return preset
+    return None
+
+
+def _build_user_agent_metadata(metadata: dict[str, Any]) -> Any:
+    """Build CDP user-agent metadata from a plain dict."""
+    import nodriver.cdp.emulation as cdp_emu
+
+    return cdp_emu.UserAgentMetadata(
+        platform=metadata["platform"],
+        platform_version=metadata["platform_version"],
+        architecture=metadata["architecture"],
+        model=metadata["model"],
+        mobile=metadata["mobile"],
+        form_factors=metadata.get("form_factors"),
+    )
+
+
+async def _apply_emulation(
+    tab: uc.Tab,
+    *,
+    network_conditions: str = "",
+    cpu_throttling_rate: float = 0,
+    geolocation: str = "",
+    user_agent: str = "",
+    user_agent_platform: str = "",
+    user_agent_metadata: Any = None,
+    accept_language: str = "",
+    color_scheme: str = "",
+    viewport: str = "",
+) -> list[str]:
+    """Apply emulation settings and return a human-readable summary."""
+    results = []
+
+    if network_conditions:
+        import nodriver.cdp.network as cdp_net
+
+        presets = {
+            "offline": {"offline": True, "latency": 0, "download": 0, "upload": 0},
+            "slow 3g": {"offline": False, "latency": 2000, "download": 50000, "upload": 50000},
+            "fast 3g": {"offline": False, "latency": 563, "download": 180000, "upload": 84375},
+            "slow 4g": {"offline": False, "latency": 150, "download": 400000, "upload": 150000},
+            "fast 4g": {"offline": False, "latency": 50, "download": 1500000, "upload": 750000},
+        }
+        p = presets.get(network_conditions.lower(), presets.get("fast 3g"))
+        await tab.send(cdp_net.emulate_network_conditions(
+            offline=p["offline"],
+            latency=p["latency"],
+            download_throughput=p["download"],
+            upload_throughput=p["upload"],
+        ))
+        results.append(f"network={network_conditions}")
+
+    if cpu_throttling_rate and cpu_throttling_rate > 1:
+        import nodriver.cdp.emulation as cdp_emu
+
+        await tab.send(cdp_emu.set_cpu_throttling_rate(rate=cpu_throttling_rate))
+        results.append(f"cpu_throttle={cpu_throttling_rate}x")
+
+    if geolocation:
+        import nodriver.cdp.emulation as cdp_emu
+
+        parts = geolocation.split(",")
+        lat, lng = float(parts[0]), float(parts[1])
+        await tab.send(cdp_emu.set_geolocation_override(latitude=lat, longitude=lng, accuracy=1.0))
+        results.append(f"geolocation={lat},{lng}")
+
+    if user_agent:
+        import nodriver.cdp.network as cdp_net
+
+        kwargs: dict[str, Any] = {"user_agent": user_agent}
+        if accept_language:
+            kwargs["accept_language"] = accept_language
+        if user_agent_platform:
+            kwargs["platform"] = user_agent_platform
+        if user_agent_metadata is not None:
+            kwargs["user_agent_metadata"] = user_agent_metadata
+        await tab.send(cdp_net.set_user_agent_override(**kwargs))
+        results.append("user_agent set")
+        if user_agent_metadata is not None:
+            results.append("ua_client_hints set")
+
+    if color_scheme and color_scheme != "auto":
+        import nodriver.cdp.emulation as cdp_emu
+
+        await tab.send(cdp_emu.set_emulated_media(
+            features=[cdp_emu.MediaFeature(name="prefers-color-scheme", value=color_scheme)]
+        ))
+        results.append(f"color_scheme={color_scheme}")
+    elif color_scheme == "auto":
+        import nodriver.cdp.emulation as cdp_emu
+
+        await tab.send(cdp_emu.set_emulated_media(features=[]))
+        results.append("color_scheme=auto (reset)")
+
+    if viewport:
+        import nodriver.cdp.emulation as cdp_emu
+
+        parts = viewport.split(",")
+        dims = parts[0].split("x")
+        w, h = int(dims[0]), int(dims[1])
+        dpr = float(dims[2]) if len(dims) > 2 else 1.0
+        flags = {f.strip().lower() for f in parts[1:] if f.strip()}
+        mobile = "mobile" in flags
+        touch = "touch" in flags
+        landscape = "landscape" in flags
+        orientation = cdp_emu.ScreenOrientation(
+            type_="landscapePrimary" if landscape else "portraitPrimary",
+            angle=90 if landscape else 0,
+        )
+        await tab.send(cdp_emu.set_device_metrics_override(
+            width=w,
+            height=h,
+            device_scale_factor=dpr,
+            mobile=mobile,
+            screen_width=w,
+            screen_height=h,
+            screen_orientation=orientation,
+        ))
+        await tab.send(cdp_emu.set_touch_emulation_enabled(
+            enabled=touch,
+            max_touch_points=5 if touch else None,
+        ))
+        await tab.send(cdp_emu.set_emit_touch_events_for_mouse(
+            enabled=touch,
+            configuration="mobile" if mobile else "desktop",
+        ))
+        results.append(f"viewport={viewport}")
+        results.append(f"touch={'on' if touch else 'off'}")
+
+    return results
+
+
 async def _format_pages() -> str:
     """Format the pages list for appending to navigation responses."""
     browser = await _get_browser()
@@ -432,71 +628,57 @@ async def emulate(
         viewport: Viewport as "widthxheightxdpr[,mobile][,touch][,landscape]" (e.g. "375x812x3,mobile,touch"). Empty to skip.
     """
     tab = await _active_tab()
-    results = []
-
-    if network_conditions:
-        import nodriver.cdp.network as cdp_net
-        presets = {
-            "offline": {"offline": True, "latency": 0, "download": 0, "upload": 0},
-            "slow 3g": {"offline": False, "latency": 2000, "download": 50000, "upload": 50000},
-            "fast 3g": {"offline": False, "latency": 563, "download": 180000, "upload": 84375},
-            "slow 4g": {"offline": False, "latency": 150, "download": 400000, "upload": 150000},
-            "fast 4g": {"offline": False, "latency": 50, "download": 1500000, "upload": 750000},
-        }
-        p = presets.get(network_conditions.lower(), presets.get("fast 3g"))
-        await tab.send(cdp_net.emulate_network_conditions(
-            offline=p["offline"],
-            latency=p["latency"],
-            download_throughput=p["download"],
-            upload_throughput=p["upload"],
-        ))
-        results.append(f"network={network_conditions}")
-
-    if cpu_throttling_rate and cpu_throttling_rate > 1:
-        import nodriver.cdp.emulation as cdp_emu
-        await tab.send(cdp_emu.set_cpu_throttling_rate(rate=cpu_throttling_rate))
-        results.append(f"cpu_throttle={cpu_throttling_rate}x")
-
-    if geolocation:
-        import nodriver.cdp.emulation as cdp_emu
-        parts = geolocation.split(",")
-        lat, lng = float(parts[0]), float(parts[1])
-        await tab.send(cdp_emu.set_geolocation_override(latitude=lat, longitude=lng, accuracy=1.0))
-        results.append(f"geolocation={lat},{lng}")
-
-    if user_agent:
-        import nodriver.cdp.network as cdp_net
-        await tab.send(cdp_net.set_user_agent_override(user_agent=user_agent))
-        results.append("user_agent set")
-    elif user_agent == "":
-        pass  # empty means no change
-
-    if color_scheme and color_scheme != "auto":
-        import nodriver.cdp.emulation as cdp_emu
-        await tab.send(cdp_emu.set_emulated_media(
-            features=[cdp_emu.MediaFeature(name="prefers-color-scheme", value=color_scheme)]
-        ))
-        results.append(f"color_scheme={color_scheme}")
-    elif color_scheme == "auto":
-        import nodriver.cdp.emulation as cdp_emu
-        await tab.send(cdp_emu.set_emulated_media(features=[]))
-        results.append("color_scheme=auto (reset)")
-
-    if viewport:
-        import nodriver.cdp.emulation as cdp_emu
-        # Parse "widthxheightxdpr,mobile,touch,landscape" format
-        parts = viewport.split(",")
-        dims = parts[0].split("x")
-        w, h = int(dims[0]), int(dims[1])
-        dpr = float(dims[2]) if len(dims) > 2 else 1.0
-        flags = [f.strip().lower() for f in parts[1:]]
-        mobile = "mobile" in flags
-        await tab.send(cdp_emu.set_device_metrics_override(
-            width=w, height=h, device_scale_factor=dpr, mobile=mobile,
-        ))
-        results.append(f"viewport={viewport}")
+    results = await _apply_emulation(
+        tab,
+        network_conditions=network_conditions,
+        cpu_throttling_rate=cpu_throttling_rate,
+        geolocation=geolocation,
+        user_agent=user_agent,
+        color_scheme=color_scheme,
+        viewport=viewport,
+    )
 
     return "Emulation applied: " + ", ".join(results) if results else "No emulation changes applied."
+
+
+@mcp.tool()
+async def emulate_device(
+    device: str,
+    color_scheme: str = "",
+    network_conditions: str = "",
+    cpu_throttling_rate: float = 0,
+    geolocation: str = "",
+) -> str:
+    """Apply a named mobile/tablet device preset to the current page.
+
+    Args:
+        device: Device preset name or alias. Supported presets: pixel_7, pixel_7_landscape, ipad_air.
+        color_scheme: "dark", "light", or "auto". Empty to skip.
+        network_conditions: Throttle network. Options: "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G".
+        cpu_throttling_rate: CPU slowdown factor (1-20). Omit or set to 1 to disable.
+        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to clear.
+    """
+    preset = _resolve_device_preset(device)
+    if preset is None:
+        supported = ", ".join(sorted(_DEVICE_PRESETS))
+        return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
+
+    tab = await _active_tab()
+    metadata = _build_user_agent_metadata(preset["metadata"])
+    results = await _apply_emulation(
+        tab,
+        network_conditions=network_conditions,
+        cpu_throttling_rate=cpu_throttling_rate,
+        geolocation=geolocation,
+        user_agent=preset["user_agent"],
+        user_agent_platform=preset["platform"],
+        user_agent_metadata=metadata,
+        accept_language=preset.get("accept_language", ""),
+        color_scheme=color_scheme,
+        viewport=preset["viewport"],
+    )
+    results.insert(0, f"device={device}")
+    return "Emulation applied: " + ", ".join(results)
 
 
 @mcp.tool()
