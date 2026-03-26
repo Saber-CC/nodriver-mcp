@@ -58,9 +58,10 @@ Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini 
 | `NODRIVER_BROWSER_PATH` | Chrome executable path | Auto-detected |
 | `NODRIVER_PROXY` | Proxy server address | None |
 
-## Tools (40)
+## Tools (42)
 
-Console and network collection are enabled automatically on each tab, so there is no separate `enable_*_collection` step.
+Network collection is enabled automatically on each tab.
+Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` and `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_page(...)` so the first real request already carries mobile signals. The manual `about:blank -> emulate_device/emulate -> navigate_page` flow still works when you want finer control.
 
 ### Input Automation (10)
@@ -69,8 +70,8 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 ### Navigation (7)
 `navigate_page` · `new_page` · `close_page` · `list_pages` · `select_page` · `wait_for` · `scroll_page`
 
-### Screenshots & Debugging (5)
-`take_screenshot` · `take_snapshot` · `evaluate_script` · `list_console_messages` · `get_console_message`
+### Screenshots & Debugging (7)
+`take_screenshot` · `take_snapshot` · `evaluate_script` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message`
 
 ### Network Monitoring (2)
 `list_network_requests` · `get_network_request`
