@@ -60,26 +60,31 @@ Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini 
 
 ## Tools (38)
 
+Console and network collection are enabled automatically on each tab, so there is no separate `enable_*_collection` step.
+
 ### Input Automation (10)
 `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog`
 
-### Navigation (8)
-`navigate` · `navigate_page` · `new_page` · `close_page` · `list_pages` · `select_page` · `wait_for` · `scroll_page`
+### Navigation (7)
+`navigate_page` · `new_page` · `close_page` · `list_pages` · `select_page` · `wait_for` · `scroll_page`
 
 ### Screenshots & Debugging (5)
-`take_screenshot` · `take_snapshot` · `evaluate_script` · `enable_console_collection` · `get_console_messages`
+`take_screenshot` · `take_snapshot` · `evaluate_script` · `list_console_messages` · `get_console_message`
 
-### Network Monitoring (3)
-`enable_network_collection` · `list_network_requests` · `get_network_request`
+### Network Monitoring (2)
+`list_network_requests` · `get_network_request`
 
-### Device Emulation (3)
-`emulate` · `emulate_device` · `resize_page`
+### Device Emulation (2)
+`emulate` · `resize_page`
 
 ### Performance (3)
 `performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot`
 
 ### Cookies & Storage (4)
 `get_cookies` · `set_cookie` · `get_local_storage` · `set_local_storage`
+
+### Session Management (3)
+`save_session` · `load_session` · `list_sessions`
 
 ### Anti-Detection Helpers (2)
 `cf_verify` · `bypass_insecure_warning`

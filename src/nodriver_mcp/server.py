@@ -11,9 +11,7 @@ import base64
 import json
 import logging
 import os
-import sys
 import time
-from io import BytesIO
 from typing import Any
 
 import nodriver as uc
@@ -99,6 +97,7 @@ _preserved_console_messages: list[list[dict]] = []  # last 3 navigations
 _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
 _collection_enabled_tabs: set[int] = set()  # track which tabs have collection enabled
+_named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 
 # Stable uid state for take_snapshot (mirrors chrome-devtools-mcp)
 _snapshot_id: int = 0
@@ -259,6 +258,38 @@ async def _maybe_snapshot(include_snapshot: bool) -> str:
         snapshot = await take_snapshot()
         return "\n\n" + snapshot
     return ""
+
+
+def _timeout_seconds(timeout_ms: int) -> float | None:
+    """Convert MCP timeout milliseconds to asyncio seconds."""
+    return timeout_ms / 1000 if timeout_ms and timeout_ms > 0 else None
+
+
+async def _await_with_timeout(awaitable: Any, timeout_ms: int, action: str) -> Any:
+    """Await an operation with an optional MCP-style timeout."""
+    timeout_s = _timeout_seconds(timeout_ms)
+    try:
+        if timeout_s is None:
+            return await awaitable
+        return await asyncio.wait_for(awaitable, timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"{action} timed out after {timeout_ms}ms") from exc
+
+
+async def _wait_for_target(browser: uc.Browser, target_id: Any, timeout_ms: int) -> uc.Tab:
+    """Wait for a newly created target to appear in nodriver's tab inventory."""
+    timeout_s = _timeout_seconds(timeout_ms) or 10.0
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    while loop.time() - start < timeout_s:
+        for tab in browser.tabs:
+            if tab.target_id == target_id:
+                tab._browser = browser
+                return tab
+        await asyncio.sleep(0.1)
+
+    raise TimeoutError(f"New page did not appear within {int(timeout_s * 1000)}ms")
 
 
 async def _format_pages() -> str:
@@ -661,6 +692,18 @@ async def get_network_request(reqid: int | None = None, request_file_path: str =
     lines.append(f"  Type: {req['type']}")
 
     try:
+        request_body = await tab.send(cdp_net.get_request_post_data(cdp_net.RequestId(req["id"])))
+        if request_file_path:
+            with open(request_file_path, "w", encoding="utf-8") as f:
+                f.write(request_body)
+            lines.append(f"  Request body saved to: {request_file_path}")
+        elif request_body:
+            lines.append(f"  Request body ({len(request_body)} chars): {request_body[:5000]}")
+    except Exception as e:
+        if request_file_path:
+            lines.append(f"  Request body: Error — {e}")
+
+    try:
         body_result = await tab.send(cdp_net.get_response_body(cdp_net.RequestId(req['id'])))
         body_content = body_result[0]
         is_base64 = body_result[1]
@@ -830,36 +873,59 @@ async def navigate_page(
     """
     tab = await _active_tab()
 
+    if handle_before_unload not in {"accept", "dismiss"}:
+        return f"Error: Unknown handle_before_unload '{handle_before_unload}'."
+
     # Preserve current console/network messages before navigation
     _preserve_on_navigation()
 
+    import nodriver.cdp.page as cdp_page
+
+    async def _on_javascript_dialog(event: cdp_page.JavascriptDialogOpening):
+        dialog_type = getattr(getattr(event, "type_", None), "value", getattr(event, "type_", None))
+        if str(dialog_type).lower() != "beforeunload":
+            return
+        await tab.send(
+            cdp_page.handle_java_script_dialog(
+                accept=(handle_before_unload == "accept"),
+            )
+        )
+
+    await tab.send(cdp_page.enable())
+    tab.add_handler(cdp_page.JavascriptDialogOpening, _on_javascript_dialog)
+
     # Inject init script if provided (runs before page scripts on next navigation)
     if init_script:
-        import nodriver.cdp.page as cdp_page
         await tab.send(cdp_page.add_script_to_evaluate_on_new_document(source=init_script))
 
-    if type == "url":
-        if not url:
-            return "Error: URL is required for type=url."
-        await tab.get(url)
-        await tab
-    elif type == "back":
-        await tab.back()
-        await tab
-    elif type == "forward":
-        await tab.forward()
-        await tab
-    elif type == "reload":
-        await tab.reload(ignore_cache=ignore_cache)
-        await tab
-    else:
-        return f"Error: Unknown type '{type}'."
+    async def _navigate() -> None:
+        if type == "url":
+            if not url:
+                raise ValueError("URL is required for type=url.")
+            await tab.get(url)
+            await tab
+        elif type == "back":
+            await tab.back()
+            await tab
+        elif type == "forward":
+            await tab.forward()
+            await tab
+        elif type == "reload":
+            await tab.reload(ignore_cache=ignore_cache)
+            await tab
+        else:
+            raise ValueError(f"Unknown type '{type}'.")
 
-    # Auto-enable collection on navigated tab
-    await _auto_enable_collection(tab)
-
-    pages = await _format_pages()
-    return f"Navigated to {tab.target.url}{pages}"
+    try:
+        await _await_with_timeout(_navigate(), timeout, f"Navigation ({type})")
+        # Auto-enable collection on navigated tab
+        await _auto_enable_collection(tab)
+        pages = await _format_pages()
+        return f"Navigated to {tab.target.url}{pages}"
+    except Exception as e:
+        return f"Error: {e}"
+    finally:
+        tab.remove_handler(cdp_page.JavascriptDialogOpening, _on_javascript_dialog)
 
 
 @mcp.tool()
@@ -875,36 +941,51 @@ async def new_page(url: str = "about:blank", background: bool = False, isolated_
         timeout: Maximum wait time in milliseconds. 0 for default.
     """
     browser = await _get_browser()
+    previous_tab = await _active_tab()
 
-    if isolated_context:
-        # Create an isolated browser context via CDP
-        import nodriver.cdp.target as cdp_target
-        ctx = await browser.send(cdp_target.create_browser_context(
-            disposition_for_initial_page="newTab",
-        ))
-        target_id = await browser.send(cdp_target.create_target(
-            url=url,
-            browser_context_id=ctx,
-            new_window=False,
-        ))
-        # Wait for the tab to appear
-        await asyncio.sleep(1)
-        tab = browser.tabs[-1]
-    else:
-        tab = await browser.get(url, new_tab=True)
+    try:
+        if isolated_context:
+            import nodriver.cdp.target as cdp_target
 
-    await tab
+            ctx = _named_browser_contexts.get(isolated_context)
+            if ctx is None:
+                ctx = await _await_with_timeout(
+                    browser.connection.send(
+                        cdp_target.create_browser_context(dispose_on_detach=False)
+                    ),
+                    timeout,
+                    f"Create isolated context '{isolated_context}'",
+                )
+                _named_browser_contexts[isolated_context] = ctx
 
-    # Auto-enable collection on new tab
-    await _auto_enable_collection(tab)
+            target_id = await _await_with_timeout(
+                browser.connection.send(
+                    cdp_target.create_target(
+                        url=url,
+                        browser_context_id=ctx,
+                        background=background,
+                        for_tab=True,
+                    )
+                ),
+                timeout,
+                "Create new page target",
+            )
+            tab = await _wait_for_target(browser, target_id, timeout)
+            await _await_with_timeout(tab, timeout, "Wait for new page")
+        else:
+            tab = await _await_with_timeout(browser.get(url, new_tab=True), timeout, "Open new page")
+            await _await_with_timeout(tab, timeout, "Wait for new page")
 
-    if background and len(browser.tabs) >= 2:
-        # Switch back to previous tab
-        prev_tab = browser.tabs[-2]
-        await prev_tab.activate()
+        # Auto-enable collection on new tab
+        await _auto_enable_collection(tab)
 
-    pages = await _format_pages()
-    return f"Opened new page: {tab.target.url}{pages}"
+        if background and previous_tab != tab:
+            await previous_tab.activate()
+
+        pages = await _format_pages()
+        return f"Opened new page: {tab.target.url}{pages}"
+    except Exception as e:
+        return f"Error opening new page: {e}"
 
 
 @mcp.tool()
