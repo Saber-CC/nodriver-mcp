@@ -124,12 +124,18 @@ def _write_config(path: str, config: dict, *, is_toml: bool):
     if config_dir:
         os.makedirs(config_dir, exist_ok=True)
     suffix = ".toml" if is_toml else ".json"
-    fd, tmp = tempfile.mkstemp(dir=config_dir, prefix=".tmp_", suffix=suffix, text=True)
+    if is_toml and not tomli_w:
+        raise RuntimeError(
+            f"Cannot write TOML config to {path}: 'tomli_w' package is not installed. "
+            "Install it with: pip install tomli_w"
+        )
+    fd, tmp = tempfile.mkstemp(dir=config_dir, prefix=".tmp_", suffix=suffix)
     try:
-        with os.fdopen(fd, "wb" if is_toml else "w", encoding=None if is_toml else "utf-8") as f:
-            if is_toml and tomli_w:
+        if is_toml:
+            with os.fdopen(fd, "wb") as f:
                 f.write(tomli_w.dumps(config).encode())
-            else:
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
