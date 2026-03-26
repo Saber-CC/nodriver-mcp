@@ -18,10 +18,8 @@ dependencies = [
     "mcp>=1.26.0",
     "nodriver @ git+https://github.com/Saber-CC/nodriver.git@main",
     "pillow>=12.1.1",
+    "tomli-w>=1.0.0",
 ]
-
-[project.optional-dependencies]
-toml = ["tomli-w>=1.0.0"]
 
 [project.urls]
 Repository = "https://github.com/Saber-CC/nodriver-mcp"

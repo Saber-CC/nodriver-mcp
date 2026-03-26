@@ -12,10 +12,7 @@ try:
 except ImportError:
     tomllib = None
 
-try:
-    import tomli_w
-except ImportError:
-    tomli_w = None
+import tomli_w
 
 from .installer_data import (
     MCP_SERVER_NAME,
@@ -119,45 +116,6 @@ def _read_config(path: str, *, is_toml: bool) -> dict | None:
         return None
 
 
-def _dump_toml_simple(config: dict) -> str:
-    """Minimal TOML serializer sufficient for MCP server configs.
-
-    Handles the nested-table structure used by Codex config, e.g.:
-        [mcp_servers.nodriver]
-        command = "/path/to/uv"
-        args = ["run", "--directory", "/path", "nodriver-mcp"]
-    """
-    lines: list[str] = []
-
-    def _format_value(v):
-        if isinstance(v, str):
-            return json.dumps(v)  # JSON string encoding is valid TOML
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, int):
-            return str(v)
-        if isinstance(v, float):
-            return str(v)
-        if isinstance(v, list):
-            return "[" + ", ".join(_format_value(i) for i in v) + "]"
-        raise TypeError(f"Unsupported TOML value type: {type(v)}")
-
-    def _write_table(d: dict, prefix: str = ""):
-        # First pass: write simple key-value pairs
-        for k, v in d.items():
-            if not isinstance(v, dict):
-                lines.append(f"{k} = {_format_value(v)}")
-        # Second pass: write sub-tables
-        for k, v in d.items():
-            if isinstance(v, dict):
-                full_key = f"{prefix}.{k}" if prefix else k
-                lines.append(f"\n[{full_key}]")
-                _write_table(v, full_key)
-
-    _write_table(config)
-    return "\n".join(lines) + "\n"
-
-
 def _write_config(path: str, config: dict, *, is_toml: bool):
     config_dir = os.path.dirname(path)
     if config_dir:
@@ -166,9 +124,8 @@ def _write_config(path: str, config: dict, *, is_toml: bool):
     fd, tmp = tempfile.mkstemp(dir=config_dir, prefix=".tmp_", suffix=suffix)
     try:
         if is_toml:
-            toml_str = tomli_w.dumps(config) if tomli_w else _dump_toml_simple(config)
             with os.fdopen(fd, "wb") as f:
-                f.write(toml_str.encode("utf-8"))
+                f.write(tomli_w.dumps(config).encode("utf-8"))
         else:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
