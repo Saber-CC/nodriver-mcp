@@ -353,9 +353,12 @@ def _resolve_device_preset(device: str) -> dict[str, Any] | None:
     """Resolve a device preset by canonical name or alias."""
     normalized = device.strip().lower().replace("-", "_").replace(" ", "_")
     for name, preset in _DEVICE_PRESETS.items():
-        aliases = {name, *preset.get("aliases", [])}
+        aliases = {
+            alias.strip().lower().replace("-", "_").replace(" ", "_")
+            for alias in {name, *preset.get("aliases", [])}
+        }
         if normalized in aliases:
-            return preset
+            return {"name": name, **preset}
     return None
 
 
@@ -378,8 +381,8 @@ async def _apply_emulation(
     *,
     network_conditions: str = "",
     cpu_throttling_rate: float = 0,
-    geolocation: str = "",
-    user_agent: str = "",
+    geolocation: str | None = None,
+    user_agent: str | None = None,
     user_agent_platform: str = "",
     user_agent_metadata: Any = None,
     accept_language: str = "",
@@ -414,28 +417,36 @@ async def _apply_emulation(
         await tab.send(cdp_emu.set_cpu_throttling_rate(rate=cpu_throttling_rate))
         results.append(f"cpu_throttle={cpu_throttling_rate}x")
 
-    if geolocation:
+    if geolocation is not None:
         import nodriver.cdp.emulation as cdp_emu
 
-        parts = geolocation.split(",")
-        lat, lng = float(parts[0]), float(parts[1])
-        await tab.send(cdp_emu.set_geolocation_override(latitude=lat, longitude=lng, accuracy=1.0))
-        results.append(f"geolocation={lat},{lng}")
+        if geolocation:
+            parts = geolocation.split(",")
+            lat, lng = float(parts[0]), float(parts[1])
+            await tab.send(cdp_emu.set_geolocation_override(latitude=lat, longitude=lng, accuracy=1.0))
+            results.append(f"geolocation={lat},{lng}")
+        else:
+            await tab.send(cdp_emu.clear_geolocation_override())
+            results.append("geolocation=reset")
 
-    if user_agent:
+    if user_agent is not None:
         import nodriver.cdp.network as cdp_net
 
-        kwargs: dict[str, Any] = {"user_agent": user_agent}
-        if accept_language:
-            kwargs["accept_language"] = accept_language
-        if user_agent_platform:
-            kwargs["platform"] = user_agent_platform
-        if user_agent_metadata is not None:
-            kwargs["user_agent_metadata"] = user_agent_metadata
-        await tab.send(cdp_net.set_user_agent_override(**kwargs))
-        results.append("user_agent set")
-        if user_agent_metadata is not None:
-            results.append("ua_client_hints set")
+        if user_agent:
+            kwargs: dict[str, Any] = {"user_agent": user_agent}
+            if accept_language:
+                kwargs["accept_language"] = accept_language
+            if user_agent_platform:
+                kwargs["platform"] = user_agent_platform
+            if user_agent_metadata is not None:
+                kwargs["user_agent_metadata"] = user_agent_metadata
+            await tab.send(cdp_net.set_user_agent_override(**kwargs))
+            results.append("user_agent set")
+            if user_agent_metadata is not None:
+                results.append("ua_client_hints set")
+        else:
+            await tab.send(cdp_net.set_user_agent_override(user_agent=""))
+            results.append("user_agent reset")
 
     if color_scheme and color_scheme != "auto":
         import nodriver.cdp.emulation as cdp_emu
@@ -486,6 +497,112 @@ async def _apply_emulation(
         results.append(f"touch={'on' if touch else 'off'}")
 
     return results
+
+
+async def _apply_device_preset(tab: uc.Tab, device: str) -> list[str]:
+    """Apply a named device preset to a tab."""
+    resolved = _resolve_device_preset(device)
+    if resolved is None:
+        supported = ", ".join(sorted(_DEVICE_PRESETS))
+        raise ValueError(f"Unknown device preset '{device}'. Supported presets: {supported}")
+
+    metadata = _build_user_agent_metadata(resolved["metadata"])
+    results = await _apply_emulation(
+        tab,
+        user_agent=resolved["user_agent"],
+        user_agent_platform=resolved["platform"],
+        user_agent_metadata=metadata,
+        accept_language=resolved.get("accept_language", ""),
+        viewport=resolved["viewport"],
+    )
+    results.insert(0, f"device={resolved['name']}")
+    return results
+
+
+async def _reset_emulation(tab: uc.Tab) -> list[str]:
+    """Reset emulation overrides on the current tab back to browser defaults."""
+    import nodriver.cdp.emulation as cdp_emu
+    import nodriver.cdp.network as cdp_net
+
+    results = []
+
+    await tab.send(
+        cdp_net.emulate_network_conditions(
+            offline=False,
+            latency=0,
+            download_throughput=-1,
+            upload_throughput=-1,
+        )
+    )
+    results.append("network=reset")
+
+    await tab.send(cdp_emu.set_cpu_throttling_rate(rate=1))
+    results.append("cpu_throttle=reset")
+
+    await tab.send(cdp_emu.clear_geolocation_override())
+    results.append("geolocation=reset")
+
+    await tab.send(cdp_net.set_user_agent_override(user_agent=""))
+    results.append("user_agent=reset")
+
+    await tab.send(cdp_emu.set_emulated_media(features=[]))
+    results.append("color_scheme=reset")
+
+    await tab.send(cdp_emu.clear_device_metrics_override())
+    results.append("viewport=reset")
+
+    await tab.send(cdp_emu.reset_page_scale_factor())
+    results.append("page_scale=reset")
+
+    await tab.send(cdp_emu.set_touch_emulation_enabled(enabled=False))
+    await tab.send(cdp_emu.set_emit_touch_events_for_mouse(enabled=False))
+    results.append("touch=reset")
+
+    return results
+
+
+async def _open_new_tab(
+    browser: uc.Browser,
+    *,
+    url: str,
+    background: bool,
+    isolated_context: str,
+    timeout: int,
+) -> uc.Tab:
+    """Open a new tab, optionally inside a named isolated browser context."""
+    if isolated_context:
+        import nodriver.cdp.target as cdp_target
+
+        ctx = _named_browser_contexts.get(isolated_context)
+        if ctx is None:
+            ctx = await _await_with_timeout(
+                browser.connection.send(
+                    cdp_target.create_browser_context(dispose_on_detach=False)
+                ),
+                timeout,
+                f"Create isolated context '{isolated_context}'",
+            )
+            _named_browser_contexts[isolated_context] = ctx
+
+        target_id = await _await_with_timeout(
+            browser.connection.send(
+                cdp_target.create_target(
+                    url=url,
+                    browser_context_id=ctx,
+                    background=background,
+                    for_tab=True,
+                )
+            ),
+            timeout,
+            "Create new page target",
+        )
+        tab = await _wait_for_target(browser, target_id, timeout)
+        await _await_with_timeout(tab, timeout, "Wait for new page")
+        return tab
+
+    tab = await _await_with_timeout(browser.get(url, new_tab=True), timeout, "Open new page")
+    await _await_with_timeout(tab, timeout, "Wait for new page")
+    return tab
 
 
 async def _format_pages() -> str:
@@ -612,8 +729,8 @@ async def drag(from_uid: str, to_uid: str, include_snapshot: bool = False) -> st
 async def emulate(
     network_conditions: str = "",
     cpu_throttling_rate: float = 0,
-    geolocation: str = "",
-    user_agent: str = "",
+    geolocation: str | None = None,
+    user_agent: str | None = None,
     color_scheme: str = "",
     viewport: str = "",
 ) -> str:
@@ -622,8 +739,8 @@ async def emulate(
     Args:
         network_conditions: Throttle network. Options: "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G". Omit to disable.
         cpu_throttling_rate: CPU slowdown factor (1-20). Omit or set to 1 to disable.
-        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to clear.
-        user_agent: User agent string. Empty to clear.
+        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to leave unchanged, or set to "" to clear.
+        user_agent: User agent string. Omit to leave unchanged, or set to "" to clear.
         color_scheme: "dark", "light", or "auto". Empty to skip.
         viewport: Viewport as "widthxheightxdpr[,mobile][,touch][,landscape]" (e.g. "375x812x3,mobile,touch"). Empty to skip.
     """
@@ -642,12 +759,20 @@ async def emulate(
 
 
 @mcp.tool()
+async def reset_emulation() -> str:
+    """Reset emulation overrides on the selected page back to browser defaults."""
+    tab = await _active_tab()
+    results = await _reset_emulation(tab)
+    return "Emulation reset: " + ", ".join(results)
+
+
+@mcp.tool()
 async def emulate_device(
     device: str,
     color_scheme: str = "",
     network_conditions: str = "",
     cpu_throttling_rate: float = 0,
-    geolocation: str = "",
+    geolocation: str | None = None,
 ) -> str:
     """Apply a named mobile/tablet device preset to the current page.
 
@@ -656,29 +781,22 @@ async def emulate_device(
         color_scheme: "dark", "light", or "auto". Empty to skip.
         network_conditions: Throttle network. Options: "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G".
         cpu_throttling_rate: CPU slowdown factor (1-20). Omit or set to 1 to disable.
-        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to clear.
+        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to leave unchanged, or set to "" to clear.
     """
-    preset = _resolve_device_preset(device)
-    if preset is None:
+    if _resolve_device_preset(device) is None:
         supported = ", ".join(sorted(_DEVICE_PRESETS))
         return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
 
     tab = await _active_tab()
-    metadata = _build_user_agent_metadata(preset["metadata"])
-    results = await _apply_emulation(
+    device_results = await _apply_device_preset(tab, device)
+    extra_results = await _apply_emulation(
         tab,
         network_conditions=network_conditions,
         cpu_throttling_rate=cpu_throttling_rate,
         geolocation=geolocation,
-        user_agent=preset["user_agent"],
-        user_agent_platform=preset["platform"],
-        user_agent_metadata=metadata,
-        accept_language=preset.get("accept_language", ""),
         color_scheme=color_scheme,
-        viewport=preset["viewport"],
     )
-    results.insert(0, f"device={device}")
-    return "Emulation applied: " + ", ".join(results)
+    return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
 @mcp.tool()
@@ -1042,6 +1160,7 @@ async def navigate_page(
     handle_before_unload: str = "accept",
     init_script: str = "",
     timeout: int = 0,
+    device: str = "",
 ) -> str:
     """Go to a URL, or back, forward, or reload.
 
@@ -1052,11 +1171,19 @@ async def navigate_page(
         handle_before_unload: Whether to auto accept or decline beforeunload dialogs. Default is "accept".
         init_script: A JavaScript script to be executed on each new document before any other scripts for the next navigation.
         timeout: Maximum wait time in milliseconds. 0 for default timeout.
+        device: Device preset name or alias to apply before navigation. Empty to leave unchanged.
     """
     tab = await _active_tab()
 
     if handle_before_unload not in {"accept", "dismiss"}:
         return f"Error: Unknown handle_before_unload '{handle_before_unload}'."
+    if device and _resolve_device_preset(device) is None:
+        supported = ", ".join(sorted(_DEVICE_PRESETS))
+        return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
+    if type not in {"url", "back", "forward", "reload"}:
+        return f"Error: Unknown type '{type}'."
+    if type == "url" and not url:
+        return "Error: URL is required for type=url."
 
     # Preserve current console/network messages before navigation
     _preserve_on_navigation()
@@ -1095,15 +1222,18 @@ async def navigate_page(
         elif type == "reload":
             await tab.reload(ignore_cache=ignore_cache)
             await tab
-        else:
-            raise ValueError(f"Unknown type '{type}'.")
 
     try:
+        device_results: list[str] = []
+        if device:
+            device_results = await _apply_device_preset(tab, device)
+
         await _await_with_timeout(_navigate(), timeout, f"Navigation ({type})")
         # Auto-enable collection on navigated tab
         await _auto_enable_collection(tab)
         pages = await _format_pages()
-        return f"Navigated to {tab.target.url}{pages}"
+        suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
+        return f"Navigated to {tab.target.url}{suffix}{pages}"
     except Exception as e:
         return f"Error: {e}"
     finally:
@@ -1111,7 +1241,13 @@ async def navigate_page(
 
 
 @mcp.tool()
-async def new_page(url: str = "about:blank", background: bool = False, isolated_context: str = "", timeout: int = 0) -> str:
+async def new_page(
+    url: str = "about:blank",
+    background: bool = False,
+    isolated_context: str = "",
+    timeout: int = 0,
+    device: str = "",
+) -> str:
     """Open a new tab and load a URL.
 
     Args:
@@ -1121,51 +1257,42 @@ async def new_page(url: str = "about:blank", background: bool = False, isolated_
             Pages in the same browser context share cookies and storage.
             Pages in different browser contexts are fully isolated.
         timeout: Maximum wait time in milliseconds. 0 for default.
+        device: Device preset name or alias to apply before the first real navigation request. Empty to leave unchanged.
     """
+    if device and _resolve_device_preset(device) is None:
+        supported = ", ".join(sorted(_DEVICE_PRESETS))
+        return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
+
     browser = await _get_browser()
     previous_tab = await _active_tab()
+    initial_url = "about:blank" if device and url != "about:blank" else url
 
     try:
-        if isolated_context:
-            import nodriver.cdp.target as cdp_target
-
-            ctx = _named_browser_contexts.get(isolated_context)
-            if ctx is None:
-                ctx = await _await_with_timeout(
-                    browser.connection.send(
-                        cdp_target.create_browser_context(dispose_on_detach=False)
-                    ),
-                    timeout,
-                    f"Create isolated context '{isolated_context}'",
-                )
-                _named_browser_contexts[isolated_context] = ctx
-
-            target_id = await _await_with_timeout(
-                browser.connection.send(
-                    cdp_target.create_target(
-                        url=url,
-                        browser_context_id=ctx,
-                        background=background,
-                        for_tab=True,
-                    )
-                ),
-                timeout,
-                "Create new page target",
-            )
-            tab = await _wait_for_target(browser, target_id, timeout)
-            await _await_with_timeout(tab, timeout, "Wait for new page")
-        else:
-            tab = await _await_with_timeout(browser.get(url, new_tab=True), timeout, "Open new page")
-            await _await_with_timeout(tab, timeout, "Wait for new page")
+        tab = await _open_new_tab(
+            browser,
+            url=initial_url,
+            background=background,
+            isolated_context=isolated_context,
+            timeout=timeout,
+        )
 
         # Auto-enable collection on new tab
         await _auto_enable_collection(tab)
+
+        device_results: list[str] = []
+        if device:
+            device_results = await _apply_device_preset(tab, device)
+
+        if url != initial_url:
+            await _await_with_timeout(tab.get(url), timeout, f"Navigate new page to {url}")
+            await _await_with_timeout(tab, timeout, "Wait for new page navigation")
 
         if background and previous_tab != tab:
             await previous_tab.activate()
 
         pages = await _format_pages()
-        return f"Opened new page: {tab.target.url}{pages}"
+        suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
+        return f"Opened new page: {tab.target.url}{suffix}{pages}"
     except Exception as e:
         return f"Error opening new page: {e}"
 

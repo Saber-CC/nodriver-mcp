@@ -58,10 +58,10 @@ Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini 
 | `NODRIVER_BROWSER_PATH` | Chrome executable path | Auto-detected |
 | `NODRIVER_PROXY` | Proxy server address | None |
 
-## Tools (39)
+## Tools (40)
 
 Console and network collection are enabled automatically on each tab, so there is no separate `enable_*_collection` step.
-For mobile-only sites, open `about:blank`, apply `emulate_device` or `emulate(...)`, then call `navigate_page` so the first request already carries mobile signals.
+For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_page(...)` so the first real request already carries mobile signals. The manual `about:blank -> emulate_device/emulate -> navigate_page` flow still works when you want finer control.
 
 ### Input Automation (10)
 `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog`
@@ -75,8 +75,8 @@ For mobile-only sites, open `about:blank`, apply `emulate_device` or `emulate(..
 ### Network Monitoring (2)
 `list_network_requests` · `get_network_request`
 
-### Device Emulation (3)
-`emulate` · `emulate_device` · `resize_page`
+### Device Emulation (4)
+`emulate` · `emulate_device` · `reset_emulation` · `resize_page`
 
 ### Performance (3)
 `performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot`
@@ -100,7 +100,7 @@ For mobile-only sites, open `about:blank`, apply `emulate_device` or `emulate(..
 | Cloudflare bypass | ✗ | ✓ Built-in cf_verify |
 | Install method | npx | uv tool install |
 | Language | TypeScript / Node.js | Python |
-| Core tool coverage | 29 tools | 38 tools |
+| Core tool coverage | 29 tools | 40 tools |
 
 Tools not implemented: `performance_analyze_insight` (requires DevTools frontend trace parser), `lighthouse_audit` (requires Lighthouse Node API), `screencast_start/stop` (requires ffmpeg + Puppeteer), extension management (experimental).
 
