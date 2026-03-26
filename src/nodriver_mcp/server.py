@@ -58,8 +58,9 @@ async def _get_browser() -> uc.Browser:
 
             logger.info("Browser started (headless=%s)", headless)
 
-            # Auto-enable console and network collection on the first tab
-            await _auto_enable_collection(_browser.main_tab)
+            # Auto-enable network collection on the first tab.
+            # Console collection is opt-in because Runtime.enable() can be detected.
+            await _auto_enable_network_collection(_browser.main_tab)
     return _browser
 
 
@@ -96,7 +97,8 @@ _network_requests: list[dict] = []
 _preserved_console_messages: list[list[dict]] = []  # last 3 navigations
 _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
-_collection_enabled_tabs: set[int] = set()  # track which tabs have collection enabled
+_network_collection_enabled_tabs: set[int] = set()  # track which tabs have network collection enabled
+_console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 
 _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
@@ -211,40 +213,16 @@ def _preserve_on_navigation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auto-collection for console / network (mirrors chrome-devtools-mcp)
+# Auto-collection for network (console collection is explicit)
 # ---------------------------------------------------------------------------
-async def _auto_enable_collection(tab: uc.Tab) -> None:
-    """Auto-enable console and network event collection on a tab."""
+async def _auto_enable_network_collection(tab: uc.Tab) -> None:
+    """Auto-enable network event collection on a tab."""
     tab_id = id(tab)
-    if tab_id in _collection_enabled_tabs:
+    if tab_id in _network_collection_enabled_tabs:
         return
-    _collection_enabled_tabs.add(tab_id)
+    _network_collection_enabled_tabs.add(tab_id)
 
-    import nodriver.cdp.runtime as cdp_runtime
     import nodriver.cdp.network as cdp_net
-
-    async def _on_console(event):
-        try:
-            parts = []
-            args = getattr(event, 'args', None) or []
-            for a in args:
-                try:
-                    if isinstance(a, str):
-                        parts.append(a)
-                    else:
-                        parts.append(str(getattr(a, 'value', None) or getattr(a, 'description', None) or a))
-                except Exception:
-                    parts.append(str(a))
-            msg = {
-                "type": str(getattr(event, 'type_', 'log')),
-                "text": " ".join(parts),
-                "timestamp": str(getattr(event, 'timestamp', '')),
-            }
-            _console_messages.append(msg)
-            if len(_console_messages) > 1000:
-                _console_messages.pop(0)
-        except Exception:
-            pass
 
     async def _on_request(event: cdp_net.RequestWillBeSent):
         try:
@@ -261,12 +239,72 @@ async def _auto_enable_collection(tab: uc.Tab) -> None:
             pass
 
     try:
-        await tab.send(cdp_runtime.enable())
-        tab.add_handler(cdp_runtime.ConsoleAPICalled, _on_console)
         await tab.send(cdp_net.enable())
         tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
     except Exception:
         pass
+
+
+async def _enable_console_collection(tab: uc.Tab) -> bool:
+    """Enable console event collection on a tab."""
+    tab_id = id(tab)
+    if tab_id in _console_collection_enabled_tabs:
+        return False
+
+    import nodriver.cdp.runtime as cdp_runtime
+
+    async def _on_console(event):
+        try:
+            parts = []
+            args = getattr(event, "args", None) or []
+            for a in args:
+                try:
+                    if isinstance(a, str):
+                        parts.append(a)
+                    else:
+                        parts.append(str(getattr(a, "value", None) or getattr(a, "description", None) or a))
+                except Exception:
+                    parts.append(str(a))
+            msg = {
+                "type": str(getattr(event, "type_", "log")),
+                "text": " ".join(parts),
+                "timestamp": str(getattr(event, "timestamp", "")),
+            }
+            _console_messages.append(msg)
+            if len(_console_messages) > 1000:
+                _console_messages.pop(0)
+        except Exception:
+            pass
+
+    try:
+        await tab.send(cdp_runtime.enable())
+        tab.add_handler(cdp_runtime.ConsoleAPICalled, _on_console)
+        _console_collection_enabled_tabs.add(tab_id)
+        return True
+    except Exception:
+        return False
+
+
+async def _disable_console_collection(tab: uc.Tab) -> bool:
+    """Disable console event collection on a tab."""
+    tab_id = id(tab)
+    if tab_id not in _console_collection_enabled_tabs:
+        return False
+
+    import nodriver.cdp.runtime as cdp_runtime
+
+    try:
+        tab.remove_handler(cdp_runtime.ConsoleAPICalled)
+    except Exception:
+        pass
+
+    try:
+        await tab.send(cdp_runtime.disable())
+    except Exception:
+        pass
+
+    _console_collection_enabled_tabs.discard(tab_id)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +967,9 @@ async def get_console_message(msgid: int) -> str:
     Args:
         msgid: The message ID (0-based index) from list_console_messages.
     """
+    tab = await _active_tab()
+    if id(tab) not in _console_collection_enabled_tabs:
+        return "Error: Console collection is disabled for the current page. Call enable_console_collection first."
     if msgid < 0 or msgid >= len(_console_messages):
         return f"Error: Invalid msgid {msgid}. Have {len(_console_messages)} messages."
     msg = _console_messages[msgid]
@@ -1075,6 +1116,10 @@ async def list_console_messages(
         types: Filter to specific message types (e.g. ["error", "warn"]). Omit for all.
         include_preserved_messages: Set to true to return the preserved messages over the last 3 navigations. Default is false.
     """
+    tab = await _active_tab()
+    if id(tab) not in _console_collection_enabled_tabs:
+        return "Console collection is disabled for the current page. Call enable_console_collection first."
+
     if include_preserved_messages:
         all_msgs = []
         for batch in _preserved_console_messages:
@@ -1097,6 +1142,26 @@ async def list_console_messages(
         idx = (page_idx * page_size + i) if page_size else i
         lines.append(f"  [{idx}] [{msg['type']}] {msg['text'][:200]}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def enable_console_collection() -> str:
+    """Enable console event collection on the current page."""
+    tab = await _active_tab()
+    changed = await _enable_console_collection(tab)
+    if changed:
+        return "Console collection enabled on the current page."
+    return "Console collection was already enabled on the current page."
+
+
+@mcp.tool()
+async def disable_console_collection() -> str:
+    """Disable console event collection on the current page."""
+    tab = await _active_tab()
+    changed = await _disable_console_collection(tab)
+    if changed:
+        return "Console collection disabled on the current page."
+    return "Console collection was already disabled on the current page."
 
 
 @mcp.tool()
@@ -1229,8 +1294,8 @@ async def navigate_page(
             device_results = await _apply_device_preset(tab, device)
 
         await _await_with_timeout(_navigate(), timeout, f"Navigation ({type})")
-        # Auto-enable collection on navigated tab
-        await _auto_enable_collection(tab)
+        # Auto-enable network collection on navigated tab.
+        await _auto_enable_network_collection(tab)
         pages = await _format_pages()
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
         return f"Navigated to {tab.target.url}{suffix}{pages}"
@@ -1276,8 +1341,8 @@ async def new_page(
             timeout=timeout,
         )
 
-        # Auto-enable collection on new tab
-        await _auto_enable_collection(tab)
+        # Auto-enable network collection on new tab.
+        await _auto_enable_network_collection(tab)
 
         device_results: list[str] = []
         if device:
