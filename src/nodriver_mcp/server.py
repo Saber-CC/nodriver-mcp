@@ -22,6 +22,7 @@ from typing import Any
 import nodriver as uc
 from mcp.server.fastmcp import FastMCP, Image
 
+from .launch import LaunchOptions, ProfileLease
 from .protocol import json_value
 
 logging.basicConfig(
@@ -35,68 +36,68 @@ logger = logging.getLogger("nodriver-mcp")
 # ---------------------------------------------------------------------------
 _browser: uc.Browser | None = None
 _browser_lock = asyncio.Lock()
+_launch_options: LaunchOptions | None = None
+_profile_lease: ProfileLease | None = None
 
 
 async def _get_browser() -> uc.Browser:
-    """Start the browser on first tool call (lazy init, protected by mutex)."""
-    global _browser, _selected_target_id
+    """Lazily launch a temporary browser, or continue the explicitly chosen session."""
     async with _browser_lock:
-        if _browser is None or _browser.stopped:
-            headless = os.environ.get("NODRIVER_HEADLESS", "").lower() in (
-                "1",
-                "true",
-                "yes",
-            )
-            user_data_dir = os.environ.get(
-                "NODRIVER_USER_DATA_DIR",
-                os.path.join(
-                    os.path.expanduser("~"), ".nodriver-mcp", "chrome-profile"
-                ),
-            )
-            browser_path = os.environ.get("NODRIVER_BROWSER_PATH", None)
-            proxy = os.environ.get("NODRIVER_PROXY", None)
+        return await _ensure_browser()
 
-            os.makedirs(user_data_dir, exist_ok=True)
-            kwargs: dict[str, Any] = {
-                "headless": headless,
-                "user_data_dir": user_data_dir,
-            }
-            logger.info("Using user data dir: %s", user_data_dir)
-            if browser_path:
-                kwargs["browser_executable_path"] = browser_path
 
-            browser_args = json.loads(os.environ.get("NODRIVER_BROWSER_ARGS", "[]"))
-            if not isinstance(browser_args, list) or not all(
-                isinstance(arg, str) for arg in browser_args
-            ):
-                raise ValueError(
-                    "NODRIVER_BROWSER_ARGS must be a JSON array of strings."
-                )
-            if proxy:
-                browser_args.append(f"--proxy-server={proxy}")
-                logger.info("Proxy configured: %s", proxy)
-            if browser_args:
-                kwargs["browser_args"] = browser_args
-
-            if _browser is not None:
-                await _shutdown_browser()
-            config = uc.Config(**kwargs)
-            extensions = json.loads(os.environ.get("NODRIVER_EXTENSIONS", "[]"))
-            if not isinstance(extensions, list) or not all(
-                isinstance(path, str) for path in extensions
-            ):
-                raise ValueError("NODRIVER_EXTENSIONS must be a JSON array of paths.")
-            for extension in extensions:
-                config.add_extension(extension)
-            _browser = await uc.start(config=config)
-            _selected_target_id = str(_browser.main_tab.target_id)
-
-            logger.info("Browser started (headless=%s)", headless)
-
-            # Auto-enable network collection on the first tab.
-            # Console collection is opt-in because Runtime.enable() can be detected.
-            await _auto_enable_network_collection(_browser.main_tab)
+async def _ensure_browser(
+    options: LaunchOptions | None = None, *, restart: bool = False
+) -> uc.Browser:
+    """Start/reconfigure the browser while the caller owns _browser_lock."""
+    global _browser, _selected_target_id, _launch_options, _profile_lease
+    options = options or _launch_options or LaunchOptions.resolve()
+    if (
+        _browser is not None
+        and not _browser.stopped
+        and options == _launch_options
+        and not restart
+    ):
+        return _browser
+    if _browser is not None:
+        await _shutdown_browser()
+    try:
+        if options.user_data_dir:
+            _profile_lease = ProfileLease(options.user_data_dir)
+            _profile_lease.acquire()
+        config = options.config()
+        # Keep the official Browser instance during start so partial launch
+        # failures can also stop their process and remove their temporary profile.
+        _browser = uc.Browser(config)
+        _launch_options = options
+        for extension in options.extensions:
+            config.add_extension(extension)
+        await _browser.start()
+        _selected_target_id = str(_browser.main_tab.target_id)
+        await _auto_enable_network_collection(_browser.main_tab)
+        logger.info(
+            "Browser started (headless=%s, persistent=%s, profile=%s)",
+            options.headless,
+            options.persistent,
+            options.profile if options.persistent else "temporary",
+        )
+    except BaseException:
+        await _shutdown_browser()
+        raise
     return _browser
+
+
+def _browser_launch_info() -> dict:
+    if _browser is None or _launch_options is None:
+        return {"running": False}
+    return {
+        "running": not _browser.stopped,
+        "persistent": _launch_options.persistent,
+        "profile": _launch_options.profile if _launch_options.persistent else None,
+        "user_data_dir": _browser.config.user_data_dir,
+        "proxy": _launch_options.proxy,
+        "headless": _launch_options.headless,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +120,13 @@ mcp = FastMCP(
         "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
         "take_snapshot returns searchable HTML text and is much faster and smaller. "
         "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression. "
-        "NOTE: The browser is launched lazily on the first tool call. "
+        "When the user requests a proxy or persistent session, call start_browser "
+        "with the requested proxy/persistent/profile and URL BEFORE opening any website. "
+        "Otherwise the browser starts with a fresh temporary profile by default. "
+        "Use persistent=true only when requested; reuse profile='default' when no name is given. "
+        "Subsequent tools continue the chosen session. Changing startup options restarts Chrome "
+        "and closes its current pages. close_browser ends the session. "
+        "NOTE: The browser is also launched lazily on the first ordinary browser tool call. "
         "The first invocation may take a few extra seconds for Chrome to start — this is normal, just wait for it."
     ),
 )
@@ -187,27 +194,52 @@ def _tab_key(tab: uc.Tab) -> str:
 
 async def _shutdown_browser() -> None:
     global _browser, _selected_target_id, _tracing_active, _trace_tab
+    global _launch_options, _profile_lease
     for callback in _shutdown_callbacks:
-        await callback()
+        try:
+            await callback()
+        except Exception:
+            logger.debug("Tool cleanup failed", exc_info=True)
     browser, _browser = _browser, None
+    lease, _profile_lease = _profile_lease, None
+    _launch_options = None
     connections = list(_frame_connections.values())
-    if browser is not None:
-        connections.extend(browser.targets)
-        for connection in {id(c): c for c in connections}.values():
+    try:
+        if browser is not None:
+            process = browser._process
+            if process is not None and process.returncode is None:
+                try:
+                    # Flush Chrome's persistent cookies/storage before closing
+                    # transport; native stop() terminates the process directly.
+                    await asyncio.wait_for(browser.send(uc.cdp.browser.close()), 3)
+                except Exception:
+                    logger.debug("Graceful browser close did not reply", exc_info=True)
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except asyncio.TimeoutError:
+                    browser.stop()
+                    try:
+                        await asyncio.wait_for(process.wait(), 5)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
+            connections.extend(browser.targets)
+            for connection in {id(c): c for c in connections}.values():
+                try:
+                    await connection.aclose()
+                except Exception:
+                    logger.debug("Connection cleanup failed", exc_info=True)
             try:
-                await connection.aclose()
+                await browser.aclose()
             except Exception:
-                logger.debug("Connection cleanup failed", exc_info=True)
-        await browser.aclose()
-        process = browser._process
-        browser.stop()
-        if process is not None and process.returncode is None:
-            try:
-                await asyncio.wait_for(process.wait(), 5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        uc.util.get_registered_instances().discard(browser)
+                logger.debug("Browser connection cleanup failed", exc_info=True)
+            # Official cleanup removes only native temporary profiles. The
+            # persistent profile remains available for the next MCP process.
+            await uc.util.deconstruct_browser(browser)
+            uc.util.get_registered_instances().discard(browser)
+    finally:
+        if lease is not None:
+            lease.release()
     for state in (
         _network_collection_enabled_tabs,
         _console_collection_enabled_tabs,
@@ -1039,6 +1071,92 @@ async def _format_pages() -> str:
 
 
 @mcp.tool()
+async def start_browser(
+    url: str = "",
+    proxy: str | None = None,
+    persistent: bool = False,
+    profile: str = "default",
+    restart: bool = False,
+    timeout: int = 30000,
+) -> dict:
+    """Start Chrome with optional proxy and persistent login state, then open a URL.
+
+    Call this BEFORE opening the requested website when the user specifies a
+    proxy or persistent session. Otherwise ordinary tools start a temporary
+    session automatically. This configures the browser behind the running MCP
+    server; the user does not need to edit the MCP client's configuration.
+
+    Args:
+        url: Website to open after applying the launch settings. Empty leaves the page unchanged.
+        proxy: HTTP/HTTPS/SOCKS4/SOCKS5 server, e.g. http://127.0.0.1:7890. Null inherits NODRIVER_PROXY/system settings; an empty string forces direct access.
+        persistent: False (default) uses a fresh temporary profile per launch; true reuses cookies/storage across future launches and MCP restarts.
+        profile: Persistent profile name. Use default when the user does not name one; use the same name on future launches. Requires persistent=true for other names.
+        restart: Force a new browser, including a fresh profile for temporary sessions. Changed launch options automatically restart Chrome and close its current pages.
+        timeout: Navigation timeout in milliseconds; 0 disables the timeout.
+
+    Matching settings reuse the running browser. Subsequent tools keep using
+    the chosen proxy and session. Persistent profiles retain unexpired persistent
+    cookies and site storage; websites may still expire or revoke a login.
+    """
+    global _selected_target_id
+    if timeout < 0:
+        raise ValueError("timeout must be nonnegative.")
+    options = LaunchOptions.resolve(persistent=persistent, profile=profile, proxy=proxy)
+    async with _browser_lock:
+        running = _browser is not None and not _browser.stopped
+        changed = restart or options != _launch_options
+        browser = await _ensure_browser(options, restart=restart)
+        # Launch-level persistence belongs to Chrome's default context, not an
+        # isolated/incognito context that happened to be selected previously.
+        pages = [tab for tab in browser.tabs if tab.target.browser_context_id is None]
+        if not pages:
+            tab = await _open_new_tab(
+                browser,
+                url="about:blank",
+                background=False,
+                isolated_context="",
+                timeout=timeout,
+            )
+        else:
+            tab = next(
+                (tab for tab in pages if str(tab.target_id) == _selected_target_id),
+                pages[0],
+            )
+        _selected_target_id = str(tab.target_id)
+        if url:
+            _preserve_on_navigation(tab)
+            _selected_frames.pop(_selected_target_id, None)
+            await tab.send(uc.cdp.page.enable())
+            await _auto_enable_network_collection(tab)
+            await _await_with_timeout(_navigate_url(tab, url), timeout, "Navigation")
+            await _await_with_timeout(tab.wait(), timeout, "Wait for navigation")
+        await browser.update_targets()
+        return {
+            **_browser_launch_info(),
+            "status": "restarted"
+            if running and changed
+            else "reused"
+            if running
+            else "started",
+            "url": tab.target.url,
+            "target_id": str(tab.target_id),
+        }
+
+
+@mcp.tool()
+async def close_browser() -> str:
+    """Close Chrome, clean temporary profiles and retain persistent profiles for future use.
+
+    Ends the current browser session. The next ordinary browser tool starts a
+    fresh temporary session; use start_browser(persistent=true) to reopen a
+    persistent one. This does not stop the MCP server itself.
+    """
+    async with _browser_lock:
+        await _shutdown_browser()
+    return "Browser closed. Temporary profile removed; persistent profiles retained."
+
+
+@mcp.tool()
 async def bypass_insecure_warning() -> str:
     """Click through the browser's insecure connection warning page."""
     tab = await _active_tab()
@@ -1566,7 +1684,11 @@ async def navigate_page(
     timeout: int = 0,
     device: str = "",
 ) -> str:
-    """Navigate the selected page. Optional device emulation runs before navigation."""
+    """Navigate the selected page. Optional device emulation runs before navigation.
+
+    For a user-requested proxy or persistent session, first use start_browser.
+    Otherwise first use starts a temporary browser; subsequent calls keep its session.
+    """
     tab = await _page_tab()
     if type not in {"url", "back", "forward", "reload"} or (type == "url" and not url):
         return "Error: Supply a valid navigation type and URL."
@@ -1625,7 +1747,12 @@ async def new_page(
     timeout: int = 0,
     device: str = "",
 ) -> str:
-    """Open a page, optionally in a named context; apply device settings before its first request."""
+    """Open a page, optionally in a named isolated context, with device settings before its first request.
+
+    For a user-requested proxy or persistent session, use start_browser(url=...)
+    first. Otherwise first use starts a temporary browser. An isolated_context is
+    an incognito context, not a persistent profile; use start_browser's profile instead.
+    """
     global _selected_target_id
     if device and _resolve_device_preset(device) is None:
         return f"Error: Unknown device preset '{device}'."

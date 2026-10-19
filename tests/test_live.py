@@ -91,6 +91,93 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
     async def tool(self, tool_key, **kwargs):
         return await s.mcp._tool_manager.get_tool(tool_key).fn(**kwargs)
 
+    async def test_default_temporary_session_restarts_clean_and_removes_profile(self):
+        first = s._browser_launch_info()
+        self.assertFalse(first["persistent"])
+        self.assertNotEqual(first["user_data_dir"], self.directory.name)
+        await s.set_cookie("temporary_login", "yes", "127.0.0.1")
+        await s.set_local_storage({"temporary_storage": "yes"})
+        reused = await s.start_browser()
+        self.assertEqual(reused["status"], "reused")
+        self.assertIn("temporary_login", await s.get_cookies())
+        restarted = await s.start_browser(url=self.url, restart=True)
+        self.assertEqual(restarted["status"], "restarted")
+        self.assertFalse(Path(first["user_data_dir"]).exists())
+        self.assertNotEqual(first["user_data_dir"], restarted["user_data_dir"])
+        self.assertNotIn("temporary_login", await s.get_cookies())
+        self.assertNotIn("temporary_storage", await s.get_local_storage())
+        await s.close_browser()
+        self.assertFalse(Path(restarted["user_data_dir"]).exists())
+
+    async def test_persistent_start_restores_login_and_storage_after_close(self):
+        temporary_path = Path(self.browser.config.user_data_dir)
+        started = await s.start_browser(url=self.url, persistent=True, proxy="")
+        self.assertEqual(started["status"], "restarted")
+        self.assertFalse(temporary_path.exists())
+        self.assertEqual(
+            started["user_data_dir"], str(Path(self.directory.name).resolve())
+        )
+        await self.tool(
+            "set_cookies",
+            cookies=[
+                {
+                    "name": "persistent_login",
+                    "value": "retained",
+                    "domain": "127.0.0.1",
+                    "path": "/",
+                    "expires": 1900000000.0,
+                }
+            ],
+        )
+        await s.set_local_storage({"persistent_storage": "retained"})
+        reused = await s.start_browser(url=self.url, persistent=True, proxy="")
+        self.assertEqual(reused["status"], "reused")
+        info = await self.tool("get_browser_info")
+        self.assertTrue(info["launch"]["persistent"])
+        await s.close_browser()
+        self.assertTrue(Path(started["user_data_dir"]).exists())
+        restored = await s.start_browser(url=self.url, persistent=True, proxy="")
+        self.assertEqual(restored["user_data_dir"], started["user_data_dir"])
+        self.assertIn("persistent_login", await s.get_cookies())
+        self.assertIn("persistent_storage: retained", await s.get_local_storage())
+        await s.close_browser()
+        await s.new_page(self.url)
+        self.assertFalse(s._browser_launch_info()["persistent"])
+        self.assertNotIn("persistent_login", await s.get_cookies())
+
+    async def test_startup_proxy_is_used_for_the_first_website_request(self):
+        requests = []
+
+        class Proxy(Handler):
+            def do_GET(self):
+                requests.append(self.path)
+                super().do_GET()
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        thread.start()
+        address = f"http://127.0.0.1:{proxy.server_port}"
+        url = "http://startup-proxy-probe.invalid/first-request"
+        try:
+            result = await s.start_browser(url=url, proxy=address, persistent=True)
+            self.assertEqual(result["proxy"], address)
+            self.assertTrue(result["persistent"])
+            self.assertIn(url, requests)
+            self.assertIn("Main input", await s.take_snapshot())
+        finally:
+            await s.close_browser()
+            proxy.shutdown()
+            proxy.server_close()
+            thread.join()
+
+    async def test_invalid_startup_options_keep_the_current_session(self):
+        selected = s._selected_target_id
+        with self.assertRaises(ValueError):
+            await s.start_browser(proxy="not a proxy")
+        self.assertIs(s._browser, self.browser)
+        self.assertEqual(s._selected_target_id, selected)
+        self.assertIn("Main input", await s.take_snapshot())
+
     async def test_native_element_cookie_screenshot_and_page_selection(self):
         snapshot = await s.take_snapshot()
         uid = re.search(r'uid=(\S+) textbox "Main input"', snapshot).group(1)
