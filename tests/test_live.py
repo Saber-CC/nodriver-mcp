@@ -48,7 +48,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.path.startswith("/net-final"):
+        if self.path.startswith("/echo-headers"):
+            data, content_type = (
+                json.dumps(dict(self.headers)).encode(),
+                "application/json",
+            )
+        elif self.path.startswith("/net-final"):
             data, content_type = b"redirect-complete", "text/plain"
         elif self.path.startswith("/api"):
             data, content_type = (
@@ -570,6 +575,146 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                 "document.getElementById('event-input').value", page_id=b
             ),
         )
+
+    async def test_cross_process_media_and_headers_follow_frame_connections(self):
+        page = await s._page_tab()
+        frames = await s._discover_frames(page)
+        frame = next(f for f, c in frames if f.parent_id is not None)
+        frame_id = str(frame.id_)
+        await s.emulate(
+            prefers_reduced_motion="reduce", extra_http_headers={"X-Frame": "first"}
+        )
+        cross = self.url.replace("127.0.0.1", "localhost") + "frame"
+        await self.navigate_frame(page, frame_id, cross, True)
+        await self.tool("select_frame", frame_id=frame_id)
+        self.assertIn(
+            "true",
+            await s.evaluate_script(
+                "matchMedia('(prefers-reduced-motion:reduce)').matches",
+                wait_for_stable=False,
+            ),
+        )
+        self.assertIn(
+            "first",
+            await s.evaluate_script(
+                "fetch('/echo-headers').then(r=>r.json())", wait_for_stable=False
+            ),
+        )
+        await s.emulate(extra_http_headers={"X-Frame": "next"})
+        await self.tool("select_frame")
+        await self.navigate_frame(page, frame_id, self.url + "frame", False)
+        await s._discover_frames(page)
+        await self.navigate_frame(page, frame_id, cross, True)
+        await self.tool("select_frame", frame_id=frame_id)
+        self.assertIn(
+            "next",
+            await s.evaluate_script(
+                "fetch('/echo-headers').then(r=>r.json())", wait_for_stable=False
+            ),
+        )
+        await s.reset_emulation()
+        self.assertIn(
+            "false",
+            await s.evaluate_script(
+                "matchMedia('(prefers-reduced-motion:reduce)').matches",
+                wait_for_stable=False,
+            ),
+        )
+        self.assertNotIn(
+            "X-Frame",
+            await s.evaluate_script(
+                "fetch('/echo-headers').then(r=>r.json())", wait_for_stable=False
+            ),
+        )
+
+    async def test_media_and_headers_merge_persist_and_reset_per_page(self):
+        a = s._selected_target_id
+        opened = await s.new_page(self.url, background=True)
+        b = re.search(r"page_id=(\w+)", opened).group(1)
+        await asyncio.gather(
+            s.emulate(
+                color_scheme="dark",
+                forced_colors="active",
+                prefers_contrast="more",
+                prefers_reduced_motion="reduce",
+                extra_http_headers={"X-Owner": "alpha"},
+                page_id=a,
+            ),
+            s.emulate(
+                forced_colors="none",
+                prefers_contrast="less",
+                extra_http_headers='{"X-Owner":"beta"}',
+                page_id=b,
+            ),
+        )
+        query = "({dark:matchMedia('(prefers-color-scheme:dark)').matches,forced:matchMedia('(forced-colors:active)').matches,more:matchMedia('(prefers-contrast:more)').matches,less:matchMedia('(prefers-contrast:less)').matches,reduce:matchMedia('(prefers-reduced-motion:reduce)').matches})"
+        self.assertEqual(
+            json.loads(
+                (
+                    await s.evaluate_script(query, wait_for_stable=False, page_id=a)
+                ).splitlines()[1]
+            ),
+            {"dark": True, "forced": True, "more": True, "less": False, "reduce": True},
+        )
+        await s.emulate(forced_colors="auto", prefers_contrast="less", page_id=a)
+        values = json.loads(
+            (
+                await s.evaluate_script(query, wait_for_stable=False, page_id=a)
+            ).splitlines()[1]
+        )
+        self.assertTrue(values["dark"])
+        self.assertTrue(values["reduce"])
+        self.assertTrue(values["less"])
+        for page, owner in ((a, "alpha"), (b, "beta")):
+            await s.navigate_page(url=self.url + "interaction", page_id=page)
+            headers = json.loads(
+                (
+                    await s.evaluate_script(
+                        "fetch('/echo-headers').then(r=>r.json())",
+                        wait_for_stable=False,
+                        page_id=page,
+                    )
+                ).splitlines()[1]
+            )
+            self.assertEqual(headers["X-Owner"], owner)
+        await s.reset_emulation(page_id=a)
+        reset = json.loads(
+            (
+                await s.evaluate_script(query, wait_for_stable=False, page_id=a)
+            ).splitlines()[1]
+        )
+        self.assertFalse(reset["forced"])
+        self.assertFalse(reset["reduce"])
+        self.assertFalse(reset["more"])
+        cleared = await s.evaluate_script(
+            "fetch('/echo-headers').then(r=>r.json())", wait_for_stable=False, page_id=a
+        )
+        self.assertNotIn("X-Owner", cleared)
+        self.assertIn(
+            "beta",
+            await s.evaluate_script(
+                "fetch('/echo-headers').then(r=>r.json())",
+                wait_for_stable=False,
+                page_id=b,
+            ),
+        )
+        await s.emulate(extra_http_headers="", page_id=b)
+        self.assertNotIn(
+            "X-Owner",
+            await s.evaluate_script(
+                "fetch('/echo-headers').then(r=>r.json())",
+                wait_for_stable=False,
+                page_id=b,
+            ),
+        )
+        self.assertIn(
+            "true",
+            await s.evaluate_script(
+                "document.hasFocus()", wait_for_stable=False, page_id=a
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "forced_colors"):
+            await s.emulate(forced_colors="invalid", page_id=a)
 
     async def test_background_page_focus_survives_selection_navigation_and_reset(self):
         a = s._selected_target_id

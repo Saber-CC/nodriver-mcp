@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.11 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.12 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -235,6 +235,13 @@ find_elements(text="Continue")
 find_elements(text="Continue", best_match=true)
 find_elements(xpath="//button[contains(., 'Continue')]")
 ```
+
+Media emulation accepts `forced_colors`, `prefers_contrast` and
+`prefers_reduced_motion` alongside `color_scheme`. Updates merge per page;
+`auto` resets only the named feature. `extra_http_headers` accepts a string-valued
+object or JSON string, replaces extra headers and persists across navigation.
+Use `{}` or `""` to clear headers. `reset_emulation` clears all media and headers.
+Overrides are synchronized to discovered iframe connections, including replacements.
 
 ### Screenshots and debugging
 

@@ -252,8 +252,13 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
   1.5.4 对照 `chrome-devtools-mcp/src/McpPage.ts` 的 focused-page 初始化补强后台焦点：
   原先后台页面 `document.hasFocus()` 为 false；现在通过官方 Emulation 命令保持
   页面焦点语义，并验证选页、导航与仿真重置后仍生效。初始化失败可重试，连接退役清理缓存。
-- [ ] ADV-02：`emulate` 增加 forced-colors、prefers-contrast、prefers-reduced-motion
-  和额外 HTTP headers。当前可先通过通用 CDP 工具调用底层能力。
+- [x] ADV-02：1.5.12 的 emulate/emulate_device 新增 forced_colors、prefers_contrast、
+  prefers_reduced_motion 和 extra_http_headers，参考 upstream emulation.ts 的可选值和
+  头替换/清空语义。媒体特性按页合并，auto 仅重置指定特性；省略参数保留既有设置。
+  headers 接受对象或 JSON 字符串，跨导航保留，{} 或空串清空；reset_emulation 清理全部。
+  同步现有和后续发现的 iframe 连接，在设置 headers 前初始化原生 Network 采集，
+  连接退役后可重新同步。真实 Chrome 覆盖两页并发、matchMedia、请求头、导航、
+  reset 与跨进程 iframe 往返重建；故障注入验证初始化重试，stdio 验证新参数。
 - [ ] ADV-03：`evaluate_script` 支持从脚本文件加载源码，明确与内联源码的互斥关系。
 - [ ] ADV-04：控制台支持完整 source map 定位，并按需启用相关调试能力。
 - [ ] ADV-05：`evaluate_script`、`list_pages` 和控制台工具支持扩展 ServiceWorker

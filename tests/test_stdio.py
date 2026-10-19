@@ -339,6 +339,31 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Preview truncated", saved)
                         with open(output, encoding="utf-8") as file:
                             self.assertEqual(json.load(file)["rows"][-1], 499)
+                    await call(
+                        session,
+                        "emulate",
+                        prefers_reduced_motion="reduce",
+                        forced_colors="none",
+                        extra_http_headers={"X-Client": "media"},
+                        page_id=a,
+                    )
+                    self.assertIn(
+                        "true",
+                        await call(
+                            session,
+                            "evaluate_script",
+                            function="matchMedia('(prefers-reduced-motion:reduce)').matches",
+                            wait_for_stable=False,
+                            page_id=a,
+                        ),
+                    )
+                    await call(
+                        session,
+                        "emulate",
+                        prefers_reduced_motion="auto",
+                        extra_http_headers={},
+                        page_id=a,
+                    )
                     with tempfile.TemporaryDirectory() as trace_dir:
                         trace_path = os.path.join(trace_dir, "client-trace.json")
                         report = await call(
