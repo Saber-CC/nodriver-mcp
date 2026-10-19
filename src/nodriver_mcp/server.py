@@ -48,6 +48,7 @@ from .scripts import (
 from .source_maps import symbolize_message, symbolize_messages
 from .traces import TRACE_CATEGORIES, save_trace
 from .uploads import FileUploads, upload_paths
+from .workers import WorkerTargets, worker_info
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -176,6 +177,8 @@ mcp = BrowserMCPServer(
         "and closes its current pages. close_browser ends the session. "
         "Page tools accept optional page_id: use the stable string ID from list_pages "
         "or new_page to operate on multiple pages concurrently without select_page. "
+        "Use list_pages(include_service_workers=true) to discover running service_worker_id "
+        "targets for evaluate_script and console tools; worker IDs exclude page_id and element args. "
         "An explicit page_id does not change the default selected page. Numeric indexes "
         "are also accepted for compatibility but can change when pages close. "
         "NOTE: The browser is also launched lazily on the first ordinary browser tool call. "
@@ -207,6 +210,13 @@ def _page_tool(*, prepare=None, **options):
         async def routed(*args, **kwargs):
             bound = signature.bind(*args, **kwargs)
             arguments = bound.arguments
+            if (
+                arguments.get("service_worker_id")
+                and arguments.get("page_id") is not None
+            ):
+                raise ValueError(
+                    "Specify either page_id or service_worker_id, not both."
+                )
             if prepare is not None:
                 await prepare(arguments)
                 args, kwargs = bound.args, bound.kwargs
@@ -388,6 +398,7 @@ _last_trace_path = ""
 _shutdown_callbacks: list[Any] = []
 _page_cleanup_callbacks: list[Any] = []
 _focused_pages: dict[int, Any] = {}
+_worker_targets = WorkerTargets(lambda tab: _clear_collection_state(tab))
 _emulation_overrides = EmulationOverrides(
     lambda tab: _auto_enable_network_collection(tab)
 )
@@ -487,7 +498,9 @@ async def _shutdown_browser() -> None:
     browser, _browser = _browser, None
     lease, _profile_lease = _profile_lease, None
     _launch_options = None
-    connections = list(_frame_connections.values())
+    connections = list(_frame_connections.values()) + list(
+        _worker_targets.connections.values()
+    )
     try:
         if browser is not None:
             process = browser._process
@@ -549,6 +562,7 @@ async def _shutdown_browser() -> None:
     _selected_target_id = None
     _dialog_state.clear()
     _emulation_overrides.clear()
+    _worker_targets.clear()
     _tracing_active = False
     _trace_stopping = False
     _trace_tab = None
@@ -981,6 +995,8 @@ async def _enable_console_collection(
 
     def collect(record):
         record.update(msgid=next(_message_ids), page_id=_page_key(tab), connection=tab)
+        if getattr(tab.target, "type_", None) == "service_worker":
+            record.update({k: v for k, v in worker_info(tab).items() if k != "url"})
         _console_messages.append(record)
         del _console_messages[:-1000]
 
@@ -1802,6 +1818,7 @@ async def evaluate_script(
     timeout: int = 30000,
     format: Literal["auto", "function", "script"] = "auto",
     source_path: str = "",
+    service_worker_id: str = "",
     file_path: str = "",
     max_output_chars: int = 20000,
     page_id: int | str | None = None,
@@ -1812,6 +1829,8 @@ async def evaluate_script(
     dialog_action is accept (default), dismiss, or manual; prompt_text supplies
     accepted prompt content. timeout bounds execution in milliseconds; 0 disables it.
     Results report completed, interrupted, failed, or timed_out.
+    service_worker_id targets a running worker from list_pages(include_service_workers=true).
+    It excludes page_id and element args; worker calls skip DOM/dialog handling.
     Provide exactly one of function (inline) or source_path (local UTF-8 file).
     Paths may be relative, absolute or file: URLs. Source errors fail before page selection.
     format=auto invokes a function result or evaluates an expression/script once;
@@ -1829,6 +1848,16 @@ async def evaluate_script(
             raise ValueError("Element args require auto or function format.")
         if max_output_chars < 1:
             raise ValueError("max_output_chars must be positive.")
+        if service_worker_id:
+            if args:
+                raise ValueError("Element args cannot be used with service_worker_id.")
+            worker = await _worker_targets.get(await _get_browser(), service_worker_id)
+            value = await _await_with_timeout(
+                execute_script(worker, function, None, format=format, timeout=timeout),
+                timeout,
+                "Script execution",
+            )
+            return await script_result(value, file_path, max_output_chars)
         page = await _page_tab()
         existing = _dialog_state.current.get(str(page.target_id))
         if existing is not None:
@@ -2001,12 +2030,19 @@ async def fill_form(
     return result
 
 
+async def _console_target(service_worker_id="", *, root=False):
+    if service_worker_id:
+        return await _worker_targets.get(await _get_browser(), service_worker_id)
+    return await _page_tab() if root else await _active_tab()
+
+
 @_page_tool()
 async def get_console_message(
     msgid: int,
     *,
     include_stack_traces: bool = True,
     resolve_source_maps: bool = True,
+    service_worker_id: str = "",
     page_id: int | str | None = None,
 ) -> str:
     """Get console/exception details with generated and original source locations.
@@ -2014,7 +2050,7 @@ async def get_console_message(
     resolve_source_maps uses mappings captured by enable_console_collection(source_maps=true);
     this lookup never enables Debugger implicitly. False keeps only generated locations.
     """
-    page_id = _page_key(await _page_tab())
+    page_id = _page_key(await _console_target(service_worker_id, root=True))
     records = _console_messages + [
         m for batch in _preserved_console_messages for m in batch
     ]
@@ -2161,6 +2197,7 @@ async def list_console_messages(
     *,
     include_stack_traces: bool = False,
     resolve_source_maps: bool = True,
+    service_worker_id: str = "",
     page_id: int | str | None = None,
 ) -> str:
     """List console calls and uncaught JS exceptions, optionally including stacks.
@@ -2168,7 +2205,7 @@ async def list_console_messages(
     resolve_source_maps symbolizes requested stacks when source_maps collection was enabled.
     Failed maps retain generated positions and a diagnostic; Debugger is opt-in.
     """
-    tab = await _active_tab()
+    tab = await _console_target(service_worker_id)
     if _tab_key(tab) not in _console_collection_enabled_tabs:
         return "Console collection is disabled. Call enable_console_collection first."
     records = list(_console_messages)
@@ -2202,28 +2239,39 @@ async def list_console_messages(
 
 @_page_tool()
 async def enable_console_collection(
-    *, source_maps: bool | None = None, page_id: int | str | None = None
+    *,
+    source_maps: bool | None = None,
+    service_worker_id: str = "",
+    page_id: int | str | None = None,
 ) -> str:
-    """Enable console collection; source_maps=true opts into Debugger symbolization.
+    """Enable page or service_worker_id console collection; source_maps=true opts into Debugger symbolization.
 
     This enables async stack capture and skips debugger pauses. Omit source_maps
     to preserve its setting, or use false to disable owned Debugger collection.
     """
-    tab = await _active_tab()
+    tab = await _console_target(service_worker_id)
     changed = await _enable_console_collection(tab, source_maps)
+    label = (
+        f"service worker {service_worker_id}" if service_worker_id else "current page"
+    )
     if changed:
-        return "Console collection enabled on the current page."
-    return "Console collection was already enabled on the current page."
+        return f"Console collection enabled on the {label}."
+    return f"Console collection was already enabled on the {label}."
 
 
 @_page_tool()
-async def disable_console_collection(*, page_id: int | str | None = None) -> str:
-    """Disable console event collection on the current page."""
-    tab = await _active_tab()
+async def disable_console_collection(
+    *, service_worker_id: str = "", page_id: int | str | None = None
+) -> str:
+    """Disable console event collection on the page or specified service_worker_id."""
+    tab = await _console_target(service_worker_id)
     changed = await _disable_console_collection(tab)
+    label = (
+        f"service worker {service_worker_id}" if service_worker_id else "current page"
+    )
     if changed:
-        return "Console collection disabled on the current page."
-    return "Console collection was already disabled on the current page."
+        return f"Console collection disabled on the {label}."
+    return f"Console collection was already disabled on the {label}."
 
 
 @_page_tool()
@@ -2261,9 +2309,20 @@ async def list_network_requests(
 
 
 @mcp.tool()
-async def list_pages() -> str:
-    """List stable string page_ids, current numeric indexes, selection and URLs."""
-    return (await _format_pages()).lstrip()
+async def list_pages(include_service_workers: bool = False) -> str:
+    """List stable page IDs; optionally discover running service_worker_id targets.
+
+    Workers include extension ID/URL when applicable. Only running workers appear;
+    stopped IDs fail explicitly. Worker selection never changes the selected page.
+    """
+    result = (await _format_pages()).lstrip()
+    if include_service_workers:
+        workers = await _worker_targets.discover(await _get_browser())
+        result += "\nRunning service workers:\n" + "\n".join(
+            "  " + json.dumps(worker_info(worker), ensure_ascii=False)
+            for worker in workers
+        )
+    return result
 
 
 @_page_tool()

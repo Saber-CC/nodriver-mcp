@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 148 regression/integration tests: **147 passed, 1 skipped** (MCP version 1.5.15).
+- 151 regression/integration tests: **150 passed, 1 skipped** (MCP version 1.5.16).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -209,6 +209,11 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   Real Chrome and stdio clients verified bounded previews and full Unicode body
   exports; fault injection covered binary/empty exports, evicted/unavailable/
   protocol-error states and skipping pending/failed/retired connections.
+- A real temporary MV3 extension passed service-worker discovery, stable target
+  execution, file sources, isolated console/async exceptions, timeout recovery and
+  uninstall cleanup. Worker calls issued no Page/Emulation commands or DOM waits;
+  page/worker and UID argument conflicts failed explicitly. A real stdio client
+  loaded/unloaded an extension through official CDP and exercised worker tools.
 - Opt-in source-map symbolization passed external Cookie-gated browser loading,
   console calls, async exceptions, data/base64/percent maps, indexed and external
   sections, source roots/names/lines, unmapped regions and script offsets. Generated

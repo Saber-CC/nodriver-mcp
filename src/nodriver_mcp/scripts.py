@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 async def prepare_script_call(arguments):
     """Resolve exactly one source before selecting or launching any browser page."""
+    if arguments.get("service_worker_id") and arguments.get("args"):
+        raise ValueError("Element args cannot be used with service_worker_id.")
     inline, source_path = arguments.get("function"), arguments.get("source_path", "")
     if (inline is not None) == bool(source_path):
         raise ValueError("Specify exactly one of function or source_path.")
