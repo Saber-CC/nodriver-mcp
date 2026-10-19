@@ -45,6 +45,7 @@ from .scripts import (
     script_error as _script_error,
     script_result,
 )
+from .source_maps import symbolize_message, symbolize_messages
 from .traces import TRACE_CATEGORIES, save_trace
 from .uploads import FileUploads, upload_paths
 
@@ -966,9 +967,16 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
     _network_collection_enabled_tabs.add(key)
 
 
-async def _enable_console_collection(tab: uc.Tab) -> bool:
+async def _enable_console_collection(
+    tab: uc.Tab, source_maps: bool | None = None
+) -> bool:
     key = _tab_key(tab)
     if key in _console_collection_enabled_tabs:
+        collector = _console_callbacks[key]
+        if source_maps is True:
+            await collector.source_maps.enable()
+        elif source_maps is False:
+            await collector.source_maps.disable()
         return False
 
     def collect(record):
@@ -985,6 +993,8 @@ async def _enable_console_collection(tab: uc.Tab) -> bool:
     await collector.enable()
     _console_callbacks[key] = collector
     _console_collection_enabled_tabs.add(key)
+    if source_maps:
+        await collector.source_maps.enable()
     return True
 
 
@@ -993,8 +1003,11 @@ async def _disable_console_collection(tab: uc.Tab) -> bool:
     collector = _console_callbacks.pop(key, None)
     if collector is None:
         return False
-    collector.remove()
     _console_collection_enabled_tabs.discard(key)
+    try:
+        await collector.source_maps.disable()
+    finally:
+        collector.remove()
     if not any(
         callbacks
         for event, callbacks in tab.handlers.items()
@@ -1993,9 +2006,14 @@ async def get_console_message(
     msgid: int,
     *,
     include_stack_traces: bool = True,
+    resolve_source_maps: bool = True,
     page_id: int | str | None = None,
 ) -> str:
-    """Get a console message or uncaught exception with source and stack metadata."""
+    """Get console/exception details with generated and original source locations.
+
+    resolve_source_maps uses mappings captured by enable_console_collection(source_maps=true);
+    this lookup never enables Debugger implicitly. False keeps only generated locations.
+    """
     page_id = _page_key(await _page_tab())
     records = _console_messages + [
         m for batch in _preserved_console_messages for m in batch
@@ -2005,6 +2023,7 @@ async def get_console_message(
     )
     if message is None:
         return f"Error: Unknown msgid {msgid} for this page."
+    message = await symbolize_message(message, resolve_source_maps)
     return format_message(message, include_stack_traces=include_stack_traces)
 
 
@@ -2141,9 +2160,14 @@ async def list_console_messages(
     include_preserved_messages: bool = False,
     *,
     include_stack_traces: bool = False,
+    resolve_source_maps: bool = True,
     page_id: int | str | None = None,
 ) -> str:
-    """List console calls and uncaught JS exceptions, optionally including stacks."""
+    """List console calls and uncaught JS exceptions, optionally including stacks.
+
+    resolve_source_maps symbolizes requested stacks when source_maps collection was enabled.
+    Failed maps retain generated positions and a diagnostic; Debugger is opt-in.
+    """
     tab = await _active_tab()
     if _tab_key(tab) not in _console_collection_enabled_tabs:
         return "Console collection is disabled. Call enable_console_collection first."
@@ -2160,6 +2184,9 @@ async def list_console_messages(
         if page_size < 1 or page_idx < 0:
             raise ValueError("page_size must be positive and page_idx nonnegative.")
         records = records[page_idx * page_size : (page_idx + 1) * page_size]
+    records = await symbolize_messages(
+        records, resolve_source_maps and include_stack_traces
+    )
     lines = []
     for message in records:
         line = f"  [{message['msgid']}] [{message['type']}] {message['text'][:200]}"
@@ -2167,15 +2194,23 @@ async def list_console_messages(
             stack = format_stack(message.get("stack_trace"))
             if stack:
                 line += "\n" + stack
+        if include_stack_traces and message.get("source_map_errors"):
+            line += "\nSource map: " + "; ".join(message["source_map_errors"])
         lines.append(line)
     return f"Console messages ({len(records)} of {total}):\n" + "\n".join(lines)
 
 
 @_page_tool()
-async def enable_console_collection(*, page_id: int | str | None = None) -> str:
-    """Enable console event collection on the current page."""
+async def enable_console_collection(
+    *, source_maps: bool | None = None, page_id: int | str | None = None
+) -> str:
+    """Enable console collection; source_maps=true opts into Debugger symbolization.
+
+    This enables async stack capture and skips debugger pauses. Omit source_maps
+    to preserve its setting, or use false to disable owned Debugger collection.
+    """
     tab = await _active_tab()
-    changed = await _enable_console_collection(tab)
+    changed = await _enable_console_collection(tab, source_maps)
     if changed:
         return "Console collection enabled on the current page."
     return "Console collection was already enabled on the current page."

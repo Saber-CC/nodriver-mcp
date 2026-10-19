@@ -266,7 +266,16 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
   不存在、目录、编码错误与冲突参数明确失败。保留 auto/function/script、元素 args、
   超时/弹窗策略和输出 file_path。真实 Chrome 与 stdio 覆盖文件执行、格式、UID
   参数和独立输出文件；故障注入验证非法源码路径不会启动浏览器。
-- [ ] ADV-04：控制台支持完整 source map 定位，并按需启用相关调试能力。
+- [x] ADV-04：1.5.15 的 enable_console_collection(source_maps=true) 显式启用 Debugger
+  脚本元数据和异步栈采集，并跳过调试断点；省略保持设置，false 关闭。get/list
+  可 resolve_source_maps=false 保留生成位置。参考 upstream ConsoleFormatter 的
+  原始/生成位置并存，支持标准 v3 VLQ、sourceRoot、函数名、源码行、忽略标记、
+  indexed sections（含外部 section）、data: base64/percent 和异步 parentId 栈。
+  映射文件通过官方 Network.loadNetworkResource（携带 Cookie/代理）加载，
+  IO 流总会清理；读取/解析失败或超时保留原始堆栈和诊断，退役连接不重新连接。
+  普通浏览不启用 Runtime/Debugger。真实 Chrome 验证受 Cookie 保护的外部映射、
+  控制台/异步异常和关闭清理；stdio 验证内联映射定位，单测覆盖 section、未映射区、
+  行列偏移、非法映射、异步父栈与缓存/退役行为。
 - [ ] ADV-05：`evaluate_script`、`list_pages` 和控制台工具支持扩展 ServiceWorker
   的发现、指定执行和日志筛选。
 - [ ] ADV-06：性能 trace 的 Web Vitals 摘要和深入分析。需要单独评估分析器，

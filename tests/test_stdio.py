@@ -339,6 +339,52 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Preview truncated", saved)
                         with open(output, encoding="utf-8") as file:
                             self.assertEqual(json.load(file)["rows"][-1], 499)
+                    await call(
+                        session,
+                        "enable_console_collection",
+                        source_maps=True,
+                        page_id=a,
+                    )
+                    source_map = {
+                        "version": 3,
+                        "sourceRoot": "/src/",
+                        "sources": ["original-client.ts"],
+                        "names": ["clientOriginal"],
+                        "mappings": "AAIEA",
+                    }
+                    encoded = base64.b64encode(json.dumps(source_map).encode()).decode()
+                    script = (
+                        "console.error('source-map-client');\n//# sourceMappingURL=data:application/json;base64,"
+                        + encoded
+                        + "\n//# sourceURL="
+                        + url
+                        + "/client-source.js"
+                    )
+                    await call(
+                        session,
+                        "evaluate_script",
+                        function=script,
+                        format="script",
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    messages = await call(session, "list_console_messages", page_id=a)
+                    msgid = int(
+                        re.search(
+                            r"\[(\d+)\] \[error\] source-map-client", messages
+                        ).group(1)
+                    )
+                    mapped = await call(
+                        session, "get_console_message", msgid=msgid, page_id=a
+                    )
+                    self.assertIn("/src/original-client.ts:5:3", mapped)
+                    self.assertIn("clientOriginal", mapped)
+                    await call(
+                        session,
+                        "enable_console_collection",
+                        source_maps=False,
+                        page_id=a,
+                    )
                     with tempfile.TemporaryDirectory() as script_dir:
                         source = Path(script_dir) / "client 脚本.js"
                         source.write_text(
