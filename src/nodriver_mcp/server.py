@@ -29,6 +29,7 @@ from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import CallToolResult, InputRequiredResult
 from pydantic import ValidationError
 
+from .actions import ActionResult, ActionWaiter
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .protocol import json_value
@@ -170,6 +171,8 @@ class _PageCall:
     requested: int | str | None
     page: uc.Tab | None = None
     frame_id: str | None = None
+    waiter: ActionWaiter | None = None
+    action_results: list[ActionResult] = dataclasses.field(default_factory=list)
 
 
 _page_call: ContextVar[_PageCall | None] = ContextVar("page_call", default=None)
@@ -189,14 +192,19 @@ def _page_tool(**options):
                 requested = None  # Legacy spelling for the selected page.
             if _page_call.get() is not None and requested is None:
                 return await fn(*args, **kwargs)
-            token = _page_call.set(_PageCall(requested))
+            call = _PageCall(requested)
+            token = _page_call.set(call)
             try:
                 if requested is not None:
                     if arguments.get("scope") == "browser":
                         raise ValueError("page_id applies only to scope='page'.")
                     # Validate explicit IDs even for tools that use retained state.
                     await _page_tab()
-                return await fn(*args, **kwargs)
+                result = await fn(*args, **kwargs)
+                summaries = [r.summary() for r in call.action_results if r.summary()]
+                if isinstance(result, str) and summaries:
+                    result += "\n\n" + "\n".join(summaries)
+                return result
             finally:
                 _page_call.reset(token)
 
@@ -998,6 +1006,53 @@ async def _dispatch_mouse_click(tab: uc.Tab, x: float, y: float, double: bool) -
             )
 
 
+async def _perform_action(
+    tab: uc.Tab,
+    action,
+    *,
+    wait_for_stable: bool = True,
+    preserve_navigation: bool = True,
+    ignored_dialogs: frozenset[str] = frozenset(),
+):
+    call = _page_call.get()
+    if call is not None and call.waiter is not None:
+        return await action()
+    browser = await _get_browser()
+    page = call.page if call is not None else None
+    page = page or next(
+        (t for t in browser.tabs if str(t.target_id) == _page_key(tab)), tab
+    )
+
+    def navigated(frame_id):
+        if not preserve_navigation:
+            return
+        if frame_id == waiter.root_frame_id:
+            _preserve_on_navigation(page)
+            if call is not None:
+                call.frame_id = None
+        else:
+            _invalidate_frame_uids(str(page.target_id), frame_id)
+
+    waiter = ActionWaiter(
+        tab,
+        page,
+        browser,
+        _evaluate,
+        navigated,
+        frame_id=_selected_frame_id(page),
+        wait_for_stable=wait_for_stable,
+        ignored_dialogs=ignored_dialogs,
+    )
+    if call is not None:
+        call.waiter = waiter
+    try:
+        return await waiter.run(action)
+    finally:
+        if call is not None:
+            call.waiter = None
+            call.action_results.append(waiter.result)
+
+
 async def _maybe_snapshot(include_snapshot: bool) -> str:
     """Optionally append a snapshot to the response."""
     if include_snapshot:
@@ -1454,7 +1509,9 @@ async def click(
     try:
         connection = await _tab_for_uid(uid)
         x, y = await _get_box_model(connection, uid)
-        await _dispatch_mouse_click(connection, x, y, dbl_click)
+        await _perform_action(
+            connection, lambda: _dispatch_mouse_click(connection, x, y, dbl_click)
+        )
         return f"Clicked uid={uid}" + await _maybe_snapshot(include_snapshot)
     except Exception as exc:
         return f"Error clicking uid={uid}: {exc}"
@@ -1478,7 +1535,7 @@ async def click_at(
         include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
-    await _dispatch_mouse_click(tab, x, y, dbl_click)
+    await _perform_action(tab, lambda: _dispatch_mouse_click(tab, x, y, dbl_click))
     result = f"Clicked at ({x}, {y})"
     result += await _maybe_snapshot(include_snapshot)
     return result
@@ -1527,7 +1584,9 @@ async def drag(
             raise ValueError("Drag endpoints must belong to the same frame connection.")
         src_x, src_y = await _get_box_model(tab, from_uid)
         dst_x, dst_y = await _get_box_model(tab, to_uid)
-        await tab.mouse_drag((src_x, src_y), (dst_x, dst_y))
+        await _perform_action(
+            tab, lambda: tab.mouse_drag((src_x, src_y), (dst_x, dst_y))
+        )
         result = f"Dragged uid={from_uid} to uid={to_uid}"
         result += await _maybe_snapshot(include_snapshot)
         return result
@@ -1619,45 +1678,87 @@ async def emulate_device(
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
+async def _evaluate_script_value(tab, function: str, args: list[str] | None):
+    if args:
+        objects = [await _resolve_uid(tab, uid) for uid in args]
+        result, error = await tab.send(
+            uc.cdp.runtime.call_function_on(
+                function_declaration=function,
+                object_id=objects[0].object_id,
+                arguments=[
+                    uc.cdp.runtime.CallArgument(object_id=o.object_id) for o in objects
+                ],
+                return_by_value=True,
+                await_promise=True,
+                user_gesture=True,
+            )
+        )
+        if error:
+            raise uc.ProtocolException(error)
+        return result.value
+    expression = function.strip()
+    if expression.startswith(("(", "function", "async")):
+        expression = f"({expression})()"
+    return await _evaluate(tab, expression)
+
+
 @_page_tool()
 async def evaluate_script(
-    function: str, args: list[str] | None = None, *, page_id: int | str | None = None
+    function: str,
+    args: list[str] | None = None,
+    *,
+    wait_for_stable: bool = True,
+    page_id: int | str | None = None,
 ) -> str:
-    """Evaluate JavaScript, optionally passing snapshot element uids as arguments."""
+    """Evaluate JavaScript with optional element arguments and bounded DOM settling.
+
+    Set wait_for_stable=false for scripts that only read data.
+    """
     try:
-        tab = await _active_tab()
-        if args:
-            tab = await _tab_for_uid(args[0])
-            for uid in args[1:]:
-                if await _tab_for_uid(uid) is not tab:
-                    raise ValueError(
-                        "Element arguments must belong to the same frame connection."
-                    )
-            objects = [await _resolve_uid(tab, uid) for uid in args]
-            result, error = await tab.send(
-                uc.cdp.runtime.call_function_on(
-                    function_declaration=function,
-                    object_id=objects[0].object_id,
-                    arguments=[
-                        uc.cdp.runtime.CallArgument(object_id=o.object_id)
-                        for o in objects
-                    ],
-                    return_by_value=True,
-                    await_promise=True,
-                    user_gesture=True,
+        tab = await _tab_for_uid(args[0]) if args else await _active_tab()
+        for uid in (args or [])[1:]:
+            if await _tab_for_uid(uid) is not tab:
+                raise ValueError(
+                    "Element arguments must belong to the same frame connection."
                 )
-            )
-            if error:
-                raise uc.ProtocolException(error)
-            value = result.value
-        else:
-            expression = function.strip()
-            if expression.startswith(("(", "function", "async")):
-                expression = f"({expression})()"
-            value = await _evaluate(tab, expression)
+        value = await _perform_action(
+            tab,
+            lambda: _evaluate_script_value(tab, function, args),
+            wait_for_stable=wait_for_stable,
+        )
         return "```json\n" + json.dumps(json_value(value), ensure_ascii=False) + "\n```"
     except Exception as exc:
         return f"Error: {exc}"
+
+
+async def _fill_element(element, value: str):
+    tag = await element.apply("(el) => el.tagName.toLowerCase()")
+    if tag == "select":
+        await element.apply(
+            "(el) => { el.value = "
+            + json.dumps(value)
+            + "; el.dispatchEvent(new Event('input', {bubbles:true})); "
+            "el.dispatchEvent(new Event('change', {bubbles:true})); }"
+        )
+    elif value:
+        await element.clear_input()
+        await element.send_keys(value)
+    else:
+        # Native clear_input does not emit input/change; send_keys("") also
+        # emits nothing. Use the prototype setter to notify controlled inputs
+        # whose own value setter tracks programmatic assignments.
+        await element.apply(
+            """(el) => {
+                el.focus();
+                const setter = Object.getOwnPropertyDescriptor(
+                    Object.getPrototypeOf(el), 'value'
+                )?.set;
+                if (setter) setter.call(el, '');
+                else el.value = '';
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+            }"""
+        )
 
 
 @_page_tool()
@@ -1671,33 +1772,7 @@ async def fill(
     """Fill an input or select and notify the page when clearing its value."""
     try:
         element = await _element_for_uid(uid)
-        tag = await element.apply("(el) => el.tagName.toLowerCase()")
-        if tag == "select":
-            await element.apply(
-                "(el) => { el.value = "
-                + json.dumps(value)
-                + "; el.dispatchEvent(new Event('input', {bubbles:true})); "
-                "el.dispatchEvent(new Event('change', {bubbles:true})); }"
-            )
-        elif value:
-            await element.clear_input()
-            await element.send_keys(value)
-        else:
-            # Native clear_input does not emit input/change; send_keys("") also
-            # emits nothing. Use the prototype setter to notify controlled inputs
-            # whose own value setter tracks programmatic assignments.
-            await element.apply(
-                """(el) => {
-                    el.focus();
-                    const setter = Object.getOwnPropertyDescriptor(
-                        Object.getPrototypeOf(el), 'value'
-                    )?.set;
-                    if (setter) setter.call(el, '');
-                    else el.value = '';
-                    el.dispatchEvent(new Event('input', {bubbles:true}));
-                    el.dispatchEvent(new Event('change', {bubbles:true}));
-                }"""
-            )
+        await _perform_action(element.tab, lambda: _fill_element(element, value))
         return f"Filled uid={uid}" + await _maybe_snapshot(include_snapshot)
     except Exception as exc:
         return f"Error filling uid={uid}: {exc}"
@@ -1711,13 +1786,19 @@ async def fill_form(
     page_id: int | str | None = None,
 ) -> str:
     """Fill multiple {uid, value} entries and report individual failures accurately."""
-    results = []
-    for entry in elements:
-        uid = entry.get("uid", "")
-        result = await fill(uid, entry.get("value", ""))
-        results.append(
-            f"  uid={uid}: {result if result.startswith('Error') else 'filled'}"
-        )
+    tab = await _active_tab()
+
+    async def apply_entries():
+        results = []
+        for entry in elements:
+            uid = entry.get("uid", "")
+            result = await fill(uid, entry.get("value", ""))
+            results.append(
+                f"  uid={uid}: {result if result.startswith('Error') else 'filled'}"
+            )
+        return results
+
+    results = await _perform_action(tab, apply_entries)
     return (
         "Form fill results:\n"
         + "\n".join(results)
@@ -1871,7 +1952,7 @@ async def hover(
     tab = await _tab_for_uid(uid)
     try:
         cx, cy = await _get_box_model(tab, uid)
-        await tab.mouse_move(cx, cy)
+        await _perform_action(tab, lambda: tab.mouse_move(cx, cy))
         result = f"Hovered over uid={uid}"
         result += await _maybe_snapshot(include_snapshot)
         return result
@@ -2024,8 +2105,12 @@ async def navigate_page(
             "forward": tab.forward,
             "reload": lambda: tab.reload(ignore_cache=ignore_cache),
         }
-        await _await_with_timeout(actions[type](), timeout, "Navigation")
-        await _await_with_timeout(tab.wait(), timeout, "Wait for navigation")
+        await _perform_action(
+            tab,
+            lambda: _await_with_timeout(actions[type](), timeout, "Navigation"),
+            preserve_navigation=False,
+            ignored_dialogs=frozenset({"beforeunload"}),
+        )
         return f"Navigated to {tab.target.url}" + await _format_pages()
     except Exception as exc:
         return f"Error: {exc}"
@@ -2067,10 +2152,13 @@ async def new_page(
         if device:
             await _apply_device_preset(tab, device)
         if url != "about:blank":
-            await _await_with_timeout(
-                _navigate_url(tab, url), timeout, "Navigate new page"
+            await _perform_action(
+                tab,
+                lambda: _await_with_timeout(
+                    _navigate_url(tab, url), timeout, "Navigate new page"
+                ),
+                preserve_navigation=False,
             )
-            await _await_with_timeout(tab.wait(), timeout, "Wait for navigation")
         if not background:
             _selected_target_id = str(tab.target_id)
             await tab.activate()
@@ -2167,7 +2255,7 @@ async def press_key(
     """
     tokens = parse_shortcut(key)
     tab = await _active_tab()
-    await dispatch_shortcut(tab, tokens)
+    await _perform_action(tab, lambda: dispatch_shortcut(tab, tokens))
 
     result = f"Pressed {key}"
     result += await _maybe_snapshot(include_snapshot)
@@ -2200,10 +2288,12 @@ async def scroll_page(
         amount: Percentage of page to scroll (25 = quarter page).
     """
     tab = await _active_tab()
-    if direction == "down":
-        await tab.scroll_down(amount)
-    else:
-        await tab.scroll_up(amount)
+    await _perform_action(
+        tab,
+        lambda: (
+            tab.scroll_down(amount) if direction == "down" else tab.scroll_up(amount)
+        ),
+    )
     return f"Scrolled {direction} {amount}%."
 
 
@@ -2569,9 +2659,13 @@ async def type_text(
 ) -> str:
     """Insert Unicode text into the focused control using official CDP."""
     tab = await _active_tab()
-    await tab.send(uc.cdp.input_.insert_text(text))
-    if submit_key:
-        await press_key(submit_key)
+
+    async def insert():
+        await tab.send(uc.cdp.input_.insert_text(text))
+        if submit_key:
+            await press_key(submit_key)
+
+    await _perform_action(tab, insert)
     return f"Typed {len(text)} characters" + (
         f", then pressed {submit_key}" if submit_key else ""
     )
@@ -2586,7 +2680,10 @@ async def upload_file(
     page_id: int | str | None = None,
 ) -> str:
     """Upload through the official Element.send_file helper."""
-    await (await _element_for_uid(uid)).send_file(str(Path(file_path).resolve()))
+    element = await _element_for_uid(uid)
+    await _perform_action(
+        element.tab, lambda: element.send_file(str(Path(file_path).resolve()))
+    )
     return f"Uploaded {file_path} to uid={uid}" + await _maybe_snapshot(
         include_snapshot
     )

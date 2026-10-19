@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.0 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.1 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -142,6 +142,15 @@ work as `"+"`, `"Control++"` or `"Control+Shift++"`; Shift applies to letters an
 punctuation. Invalid shortcuts fail before input is sent, and attempted keys
 are released after errors or cancellation. On macOS, use `Meta+A` to select all;
 native editing commands accompany the trusted keyboard events.
+
+Interactive tools observe navigation, dialogs and popups before sending input.
+They then wait for navigation and a quiet DOM within bounded observation windows,
+so `include_snapshot` reflects the resulting page. Continuing DOM changes return
+a time-limit notice; long-lived network requests do not hold up the tool.
+`evaluate_script(wait_for_stable=false)` skips DOM settling for read-only scripts.
+An unhandled dialog interrupts the action with its type/message and a reminder
+to use `handle_dialog` on the same page. Temporary listeners and DOM observers
+are removed after success, errors and cancellation.
 
 ### Native frames and element search
 

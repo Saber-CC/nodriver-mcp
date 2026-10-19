@@ -49,6 +49,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.patch.start()
         self.addCleanup(self.patch.stop)
+
+        async def perform(_tab, action, **_options):
+            return await action()
+
+        action_patch = patch.object(s, "_perform_action", perform)
+        action_patch.start()
+        self.addCleanup(action_patch.stop)
         self.addAsyncCleanup(s._shutdown_callbacks[0])
         s._selected_target_id = "a"
         for value in (

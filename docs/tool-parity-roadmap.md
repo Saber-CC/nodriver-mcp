@@ -15,7 +15,7 @@
 - [x] FIX-01：修复 `press_key` 组合键、加号键和失败后的按键释放。1.4.3。
 - [x] FIX-02：修复 `click_at` 坐标双击，共用 UID 点击的可信事件实现。1.4.3。
 - [x] ADV-01：页面工具支持每次调用的稳定 `page_id` 和多页面并发。1.5.0。
-- [ ] OPT-01：统一交互后的导航与 DOM 稳定等待。
+- [x] OPT-01：统一交互后的导航与 DOM 稳定等待。1.5.1。
 - [ ] REQ-01：补齐表单控件的指定状态设置。
 - [ ] REQ-02：补齐多文件上传和文件选择器处理。
 - [ ] REQ-03：补齐未捕获 JavaScript 异常和基础调用栈。
@@ -104,6 +104,14 @@ radio、switch 的指定状态设置。
 ## 已有能力优化
 
 ### OPT-01：统一交互等待
+
+已完成于 1.5.1。参考 `chrome-devtools-mcp/src/utils/WaitForHelper.ts`，
+使用官方 Page/Target 事件在动作前开始观察，动作后进行导航探测、有时限的
+导航等待和 MutationObserver 静默窗口。批量填充和输入后的提交键共用一次等待，
+附带快照在等待之后生成。持续变化的 DOM 返回超时限提示，不等待网络空闲。
+脚本新增 `wait_for_stable=false`；未处理弹窗返回明确中断原因，临时回调与观察器
+在所有退出路径清理。真实 Chrome 覆盖延迟 DOM 更新、点击导航、新页面、
+持续变化页面和弹窗中断；故障注入覆盖取消、初始化失败和观察器超时。
 
 涉及 `click`、`click_at`、`fill`、`fill_form`、`press_key`、`type_text`、
 `navigate_page` 和 `evaluate_script` 等交互工具。
