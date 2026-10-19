@@ -188,6 +188,9 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
   Chrome 的浏览器级单实例限制并校验停止时的页面归属。
   真实 Chrome 覆盖两页并发填充/输入、图片、frame、导航、仿真、日志、网络与旧 ID；
   stdio MCP 客户端验证并发调用及新参数 schema。
+  1.5.4 对照 `chrome-devtools-mcp/src/McpPage.ts` 的 focused-page 初始化补强后台焦点：
+  原先后台页面 `document.hasFocus()` 为 false；现在通过官方 Emulation 命令保持
+  页面焦点语义，并验证选页、导航与仿真重置后仍生效。初始化失败可重试，连接退役清理缓存。
 - [ ] ADV-02：`emulate` 增加 forced-colors、prefers-contrast、prefers-reduced-motion
   和额外 HTTP headers。当前可先通过通用 CDP 工具调用底层能力。
 - [ ] ADV-03：`evaluate_script` 支持从脚本文件加载源码，明确与内联源码的互斥关系。

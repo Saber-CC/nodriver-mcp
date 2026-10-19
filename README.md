@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.3 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.4 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -175,7 +175,9 @@ or printed by `new_page`:
 ```
 
 This `evaluate_script` call targets that page without selecting or bringing it
-to the front. The same parameter is available on snapshots, input, navigation,
+to the front. Page focus is emulated, so background tabs retain focus semantics
+for applications that check `document.hasFocus()`. The same parameter is available
+on snapshots, input, navigation,
 screenshots, frames, emulation, cookies, console/network tools and page CDP calls.
 Nested work such as `fill_form` and `include_snapshot` stays on the same page,
 even if another call changes `select_page`. A closed/unknown ID fails explicitly.

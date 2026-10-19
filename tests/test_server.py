@@ -49,6 +49,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        self.prepare_page = s._prepare_page
+        prepare_patch = patch.object(s, "_prepare_page", AsyncMock())
+        prepare_patch.start()
+        self.addCleanup(prepare_patch.stop)
 
         async def perform(_tab, action, **_options):
             return await action()
@@ -60,6 +64,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         s._selected_target_id = "a"
         for value in (
             s._selected_frames,
+            s._focused_pages,
             s._closing_page_ids,
             s._frame_connections,
             s._frame_loaders,
@@ -133,6 +138,25 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await s.select_page(1, bring_to_front=False)
         self.assertIs(await s._active_tab(), self.b)
         self.b.activate.assert_not_awaited()
+
+    async def test_page_focus_preparation_retries_failures_and_reuses_connections(self):
+        error = uc.ProtocolException({"code": -32000, "message": "Session detached"})
+        self.a.send.side_effect = [error, None]
+        with self.assertRaises(uc.ProtocolException):
+            await self.prepare_page(self.a)
+        self.assertNotIn(id(self.a), s._focused_pages)
+        await self.prepare_page(self.a)
+        await self.prepare_page(self.a)
+        self.assertEqual(self.a.send.await_count, 2)
+        self.assertEqual(
+            next(self.a.send.call_args.args[0]),
+            {
+                "method": "Emulation.setFocusEmulationEnabled",
+                "params": {"enabled": True},
+            },
+        )
+        s._clear_collection_state(self.a)
+        self.assertNotIn(id(self.a), s._focused_pages)
 
     async def test_page_ids_are_exposed_in_tool_schemas(self):
         for name in (

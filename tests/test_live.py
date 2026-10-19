@@ -505,6 +505,29 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_background_page_focus_survives_selection_navigation_and_reset(self):
+        a = s._selected_target_id
+        opened = await s.new_page(self.url + "interaction", background=True)
+        b = re.search(r"page_id=(\w+)", opened).group(1)
+        for page in (a, b):
+            self.assertIn(
+                "true",
+                await s.evaluate_script(
+                    "document.hasFocus()", wait_for_stable=False, page_id=page
+                ),
+            )
+        await s.select_page(b, bring_to_front=False)
+        await s.navigate_page(url=self.url + "interaction", page_id=a)
+        await s.reset_emulation(page_id=a)
+        for page in (a, b):
+            self.assertIn(
+                "true",
+                await s.evaluate_script(
+                    "document.hasFocus()", wait_for_stable=False, page_id=page
+                ),
+            )
+        self.assertEqual(s._selected_target_id, b)
+
     async def test_parallel_pages_isolate_frames_navigation_and_emulation(self):
         a = s._selected_target_id
         result = await s.new_page(self.url, background=True)

@@ -264,6 +264,7 @@ def register_tools(mcp, s) -> None:
         )
         s._named_browser_contexts[name] = tab.target.browser_context_id
         s._selected_target_id = str(tab.target_id)
+        await s._prepare_page(tab)
         await s._auto_enable_network_collection(tab)
         return f"Created and selected context '{name}'." + await s._format_pages()
 

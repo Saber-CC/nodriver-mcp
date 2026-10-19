@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 99 regression/integration tests: **98 passed, 1 skipped** (MCP version 1.5.3).
+- 101 regression/integration tests: **100 passed, 1 skipped** (MCP version 1.5.4).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -168,6 +168,10 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   and site-isolated iframe checks. Timeout and unsupported file counts left the
   next upload usable; cancellation removed managed callbacks and interception.
   A real stdio client uploaded multiple files through the new parameter.
+- Background pages emulate focus with the official Emulation command, matching
+  upstream multi-agent page initialization. Both pages retained `document.hasFocus()`
+  across selection changes, navigation and emulation resets. Failed initialization
+  remained retryable and connection retirement removed its preparation cache.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
