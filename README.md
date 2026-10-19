@@ -1,7 +1,7 @@
 # nodriver-mcp
 
 A Python MCP server for Chromium automation using official **nodriver 0.50.6**.
-It exposes 72 MCP tools for page interaction, native cookies and screenshots,
+It exposes 74 MCP tools for browser startup, page interaction, native cookies and screenshots,
 frames, network inspection, website WebMCP tools and the complete generated CDP API.
 
 ## Installation
@@ -47,24 +47,76 @@ shows the available clients on the current platform.
 
 ## Browser configuration
 
-The browser starts on the first browser tool call. Discovery of CDP bindings
-can run without launching Chrome. The server uses stdio transport.
+The browser starts on the first browser tool call, using a **fresh temporary
+profile by default**. Discovery of CDP bindings can run without launching Chrome.
+The server uses stdio transport.
+
+Ask your AI to open a website through a proxy or in a persistent session. It can
+call `start_browser` directly, without editing your MCP client configuration:
+
+```text
+# "Open this website through http://127.0.0.1:7890"
+start_browser(url="https://example.com", proxy="http://127.0.0.1:7890")
+
+# "Open this website using a persistent session"
+start_browser(url="https://example.com", persistent=true)
+
+# Combine proxy and persistence; reuse the same profile name on future launches
+start_browser(url="https://example.com", proxy="http://127.0.0.1:7890",
+              persistent=true, profile="work")
+
+# No startup settings requested: ordinary tools automatically use a temporary session
+new_page(url="https://example.com")
+```
+
+Matching startup settings reuse the running browser. Changing the proxy,
+persistence mode or profile automatically restarts Chrome and closes its current
+pages. `restart=true` forces a restart even when the settings match; temporary
+sessions then get a fresh profile. Other browser tools continue the chosen
+session until it is closed. `close_browser()` closes Chrome, flushes persistent
+storage, and removes temporary profiles, while keeping the MCP server available.
+The next ordinary browser tool starts a new temporary session.
+
+Persistent sessions reuse a Chrome profile across browser and MCP process
+restarts. The `default` profile reuses `~/.nodriver-mcp/chrome-profile` (including
+existing login data from earlier versions); named profiles use
+`~/.nodriver-mcp/profiles/<name>`. Names contain 1-64 letters, digits, underscores
+or hyphens and start with a letter or digit. A profile can be used by one browser
+at a time. Unexpired persistent cookies and site storage are retained; session
+cookies may end when Chrome exits, and websites can expire or revoke logins.
+Isolated contexts remain temporary even inside a persistent browser.
+
+This changes the earlier default of always using a persistent profile: request
+`persistent=true` to continue using that profile. Setting `NODRIVER_USER_DATA_DIR`
+chooses its directory but does not enable persistence by itself.
 
 | Variable | Description | Default |
 | --- | --- | --- |
 | `NODRIVER_HEADLESS` | Run without a visible window | `false` |
-| `NODRIVER_USER_DATA_DIR` | Persistent profile directory | `~/.nodriver-mcp/chrome-profile` |
+| `NODRIVER_USER_DATA_DIR` | Directory for the explicit `persistent=true, profile="default"` session | `~/.nodriver-mcp/chrome-profile` |
 | `NODRIVER_BROWSER_PATH` | Browser executable | Native auto-detection |
-| `NODRIVER_PROXY` | Browser proxy address | Unset |
+| `NODRIVER_PROXY` | Default browser proxy address, overridden by `start_browser(proxy=...)` | Chrome/system settings |
 | `NODRIVER_BROWSER_ARGS` | JSON array of extra native browser arguments | `[]` |
 | `NODRIVER_EXTENSIONS` | JSON array of extension directories/CRX paths, loaded with native Config.add_extension | `[]` |
 
+`start_browser(proxy="")` forces direct access, overriding environment/system
+proxy settings; omitting the argument inherits the configured defaults. Startup
+proxies support HTTP, HTTPS, SOCKS4 and SOCKS5 addresses without credentials.
 `create_browser_context` supports per-context proxies through the native
 `Browser.create_context`, including nodriver's HTTP/SOCKS authentication forwarder.
 Named contexts can also be reused with `new_page(isolated_context="name")`.
 Cookies and storage tools operate in the selected context.
 
 ## Tools
+
+### Browser startup and sessions
+
+`start_browser`, `close_browser`.
+
+Use `start_browser` before the first website request to choose a proxy and
+persistence. `get_browser_info` includes the current launch settings and profile
+directory. Persistent profiles are separate from the explicitly exported JSON
+snapshots provided by `save_session` and `load_session`.
 
 ### Input and navigation
 

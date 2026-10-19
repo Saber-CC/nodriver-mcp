@@ -63,6 +63,7 @@ def register_tools(mcp, s) -> None:
             )
         )
         result["nodriver_version"] = uc.__version__
+        result["launch"] = s._browser_launch_info()
         if include_version_page:
             result["version_page"] = await uc.util.get_browser_version_info(browser)
         return result
