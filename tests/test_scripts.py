@@ -7,10 +7,35 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import nodriver as uc
-from nodriver_mcp.scripts import execute_script, script_result, script_value
+from nodriver_mcp.scripts import (
+    execute_script,
+    prepare_script_call,
+    script_result,
+    script_value,
+)
 
 
 class ScriptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_source_files_support_utf8_bom_file_urls_and_mutual_exclusion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "脚本 文件.js"
+            path.write_text('() => "中文🙂"', encoding="utf-8-sig")
+            for source_path in (str(path), path.as_uri()):
+                args = {"source_path": source_path}
+                await prepare_script_call(args)
+                self.assertEqual(args["function"], '() => "中文🙂"')
+                self.assertEqual(args["source_path"], "")
+            for args in (
+                {},
+                {"function": "1", "source_path": str(path)},
+                {"source_path": str(path / "missing")},
+            ):
+                with self.assertRaises(ValueError):
+                    await prepare_script_call(args)
+            path.write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(ValueError, "UTF-8"):
+                await prepare_script_call({"source_path": str(path)})
+
     async def test_native_evaluation_has_deadline_and_releases_its_object_group(self):
         commands = []
         evaluations = 0

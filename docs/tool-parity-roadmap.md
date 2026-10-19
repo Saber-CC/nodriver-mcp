@@ -259,7 +259,12 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
   同步现有和后续发现的 iframe 连接，在设置 headers 前初始化原生 Network 采集，
   连接退役后可重新同步。真实 Chrome 覆盖两页并发、matchMedia、请求头、导航、
   reset 与跨进程 iframe 往返重建；故障注入验证初始化重试，stdio 验证新参数。
-- [ ] ADV-03：`evaluate_script` 支持从脚本文件加载源码，明确与内联源码的互斥关系。
+- [x] ADV-03：1.5.13 的 evaluate_script 新增 source_path，参考 upstream script.ts
+  的源码互斥规则，function 改为可省略但与 source_path 必须提供且只能提供一个。
+  支持本地相对/绝对路径、file: URL、UTF-8/BOM；预处理在选页/启动浏览器前读取，
+  不存在、目录、编码错误与冲突参数明确失败。保留 auto/function/script、元素 args、
+  超时/弹窗策略和输出 file_path。真实 Chrome 与 stdio 覆盖文件执行、格式、UID
+  参数和独立输出文件；故障注入验证非法源码路径不会启动浏览器。
 - [ ] ADV-04：控制台支持完整 source map 定位，并按需启用相关调试能力。
 - [ ] ADV-05：`evaluate_script`、`list_pages` 和控制台工具支持扩展 ServiceWorker
   的发现、指定执行和日志筛选。

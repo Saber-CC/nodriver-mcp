@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.12 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.13 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -182,11 +182,18 @@ so blocked interactions fail promptly while diagnostic tools remain usable.
 
 Script `format` can be `auto` (default), `function` or `script`. Auto evaluates
 expressions and statements once, invoking a returned function when appropriate.
-The native execution deadline also bounds synchronous loops. Temporary element
+For calls without element arguments, the native deadline also bounds synchronous loops. Temporary element
 handles are released after execution. `file_path` saves the complete JSON result;
 `max_output_chars` limits inline output (default 20000). Larger results are saved
 automatically under `~/.nodriver-mcp/artifacts/scripts`, with a clearly labeled
 preview and the full file path. Set `NODRIVER_ARTIFACTS_DIR` to change this root.
+
+Use `evaluate_script(source_path="/path/to/script.js", format="script")` to read
+UTF-8 source from the MCP server's local filesystem. Relative paths and `file:`
+URLs also work. Provide exactly one of `function` or `source_path`; `file_path`
+remains the output path. Source errors are checked before selecting a page or
+launching Chrome. File sources support the same formats, element arguments,
+dialog policy, timeout and output controls as inline scripts.
 
 ### Native frames and element search
 
