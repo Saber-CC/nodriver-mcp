@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import collections
 import json
@@ -119,6 +120,96 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await s.select_page(1, bring_to_front=False)
         self.assertIs(await s._active_tab(), self.b)
         self.b.activate.assert_not_awaited()
+
+    async def test_shortcut_events_include_modifiers_and_physical_key_codes(self):
+        events = []
+
+        async def send(command):
+            events.append(next(command)["params"])
+
+        self.a.send.side_effect = send
+        await s.press_key("Control+Shift+a")
+        target = next(
+            event
+            for event in events
+            if event["key"].lower() == "a" and event["type"] != "keyUp"
+        )
+        self.assertEqual(target["key"], "A")
+        self.assertEqual(target["code"], "KeyA")
+        self.assertEqual(target["windowsVirtualKeyCode"], 65)
+        self.assertEqual(target["modifiers"], 10)
+        self.assertFalse(target.get("text"))
+        self.assertEqual(
+            [(event["key"], event["modifiers"]) for event in events[-2:]],
+            [("Shift", 2), ("Control", 0)],
+        )
+
+    async def test_plus_shortcuts_keep_the_literal_target_key(self):
+        for shortcut, mask in (("+", 0), ("Control++", 2), ("Control+Shift++", 10)):
+            with self.subTest(shortcut=shortcut):
+                events = []
+
+                async def send(command):
+                    events.append(next(command)["params"])
+
+                self.a.send.side_effect = send
+                await s.press_key(shortcut)
+                target = next(
+                    event
+                    for event in events
+                    if event["key"] == "+" and event["type"] != "keyUp"
+                )
+                self.assertEqual(target["code"], "Equal")
+                self.assertEqual(target["modifiers"], mask)
+                self.assertTrue(all(event["key"] for event in events))
+
+    async def test_invalid_shortcuts_are_rejected_before_opening_a_page(self):
+        with patch.object(s, "_active_tab", AsyncMock()) as active:
+            for shortcut in (
+                "",
+                "Control+",
+                "Control+++",
+                "Control+Control+A",
+                "Bogus+A",
+                "NoSuchKey",
+            ):
+                with self.subTest(shortcut=shortcut), self.assertRaises(ValueError):
+                    await s.press_key(shortcut)
+            active.assert_not_awaited()
+
+    async def test_key_failures_release_remaining_keys_and_keep_original_error(self):
+        for failure_type in ("down", "up", "cancel"):
+            with self.subTest(failure_type=failure_type):
+                events = []
+                error = (
+                    asyncio.CancelledError()
+                    if failure_type == "cancel"
+                    else uc.ProtocolException(
+                        {"code": -32000, "message": "Key dispatch failed"}
+                    )
+                )
+
+                async def send(command):
+                    event = next(command)["params"]
+                    events.append(event)
+                    if event["key"] == "A" and (
+                        event["type"] == "keyUp"
+                        if failure_type == "up"
+                        else event["type"] != "keyUp"
+                    ):
+                        raise error
+                    if event["key"] == "Shift" and event["type"] == "keyUp":
+                        raise RuntimeError("Secondary release failure")
+
+                self.a.send.side_effect = send
+                with self.assertRaises(type(error)) as raised:
+                    await s.press_key("Control+Shift+A")
+                self.assertIs(raised.exception, error)
+                releases = [event for event in events if event["type"] == "keyUp"]
+                self.assertEqual(
+                    [event["key"] for event in releases], ["A", "Shift", "Control"]
+                )
+                self.assertEqual(releases[-1]["modifiers"], 0)
 
     async def test_disable_console_removes_exact_callback_and_does_not_accumulate(self):
         for _ in range(2):

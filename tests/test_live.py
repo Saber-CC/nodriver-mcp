@@ -6,6 +6,7 @@ import io
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 import unittest
@@ -46,6 +47,17 @@ class Handler(BaseHTTPRequestHandler):
                 window.controlledValues = {};
                 window.changedValues = {};
                 window.mouseEvents = [];
+                window.keyEvents = [];
+                for (const type of ['keydown', 'keyup', 'keypress']) {
+                    document.addEventListener(type, event => {
+                        window.keyEvents.push({type, key:event.key, code:event.code,
+                            ctrl:event.ctrlKey, shift:event.shiftKey,
+                            alt:event.altKey, meta:event.metaKey, trusted:event.isTrusted});
+                        if (window.blockShortcuts && (event.ctrlKey || event.altKey || event.metaKey)) {
+                            event.preventDefault();
+                        }
+                    });
+                }
                 for (const id of ['event-input', 'event-textarea']) {
                     const field = document.getElementById(id);
                     window.formValues[id] = field.value;
@@ -72,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) {
                     document.getElementById('event-button').addEventListener(type, event => {
-                        window.mouseEvents.push({type, trusted:event.isTrusted, detail:event.detail});
+                        window.mouseEvents.push({type, trusted:event.isTrusted, detail:event.detail, buttons:event.buttons});
                     });
                 }
                 </script>""",
@@ -201,6 +213,123 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             [event["detail"] for event in events if event["type"] == "click"], [1, 2]
         )
         self.assertTrue(all(event["trusted"] for event in events))
+
+    async def test_coordinate_clicks_emit_complete_trusted_single_and_double_sequences(
+        self,
+    ):
+        await s.new_page(self.url + "interaction")
+        tab = await s._active_tab()
+        box = await s._evaluate(
+            tab,
+            "document.getElementById('event-button').getBoundingClientRect().toJSON()",
+        )
+        x, y = int(box["x"] + box["width"] / 2), int(box["y"] + box["height"] / 2)
+        for double in (False, True):
+            with self.subTest(double=double):
+                await s._evaluate(tab, "window.mouseEvents=[]")
+                result = await s.click_at(x, y, dbl_click=double, include_snapshot=True)
+                self.assertIn("Event button", result)
+                events = await s._evaluate(tab, "window.mouseEvents")
+                expected = ["mousedown", "mouseup", "click"]
+                if double:
+                    expected = expected * 2 + ["dblclick"]
+                self.assertEqual([event["type"] for event in events], expected)
+                self.assertEqual(
+                    [event["detail"] for event in events if event["type"] == "click"],
+                    [1, 2] if double else [1],
+                )
+                self.assertTrue(all(event["trusted"] for event in events))
+                self.assertTrue(
+                    all(
+                        event["buttons"] == 0
+                        for event in events
+                        if event["type"] == "mouseup"
+                    )
+                )
+
+    async def test_keyboard_shortcuts_emit_modifiers_and_release_them(self):
+        await s.new_page(self.url + "interaction")
+        tab = await s._active_tab()
+        for shortcut, target, code, flags in (
+            ("Control+A", "A", "KeyA", {"ctrl"}),
+            ("Control+Shift+x", "X", "KeyX", {"ctrl", "shift"}),
+            ("Alt+x", "x", "KeyX", {"alt"}),
+            ("Meta+b", "b", "KeyB", {"meta"}),
+            ("Control++", "+", "Equal", {"ctrl"}),
+            ("Control+Shift++", "+", "Equal", {"ctrl", "shift"}),
+            ("Shift++", "+", "Equal", {"shift"}),
+            ("Control", "Control", "ControlLeft", {"ctrl"}),
+        ):
+            with self.subTest(shortcut=shortcut):
+                await s._evaluate(
+                    tab,
+                    "document.getElementById('event-input').focus(); window.blockShortcuts=true; window.keyEvents=[]",
+                )
+                self.assertNotIn("Error", await s.press_key(shortcut))
+                events = await s._evaluate(tab, "window.keyEvents")
+                down = next(
+                    event
+                    for event in events
+                    if event["type"] == "keydown" and event["key"] == target
+                )
+                self.assertEqual(down["code"], code)
+                self.assertEqual(
+                    {flag for flag in ("ctrl", "shift", "alt", "meta") if down[flag]},
+                    flags,
+                )
+                self.assertTrue(all(event["trusted"] for event in events))
+                self.assertNotIn(
+                    "keypress",
+                    [
+                        event["type"]
+                        for event in events
+                        if flags & {"ctrl", "alt", "meta"}
+                    ],
+                )
+                await s._evaluate(tab, "window.keyEvents=[]")
+                await s.press_key("b")
+                released = (await s._evaluate(tab, "window.keyEvents"))[0]
+                self.assertEqual(released["key"], "b")
+                self.assertFalse(
+                    any(released[flag] for flag in ("ctrl", "shift", "alt", "meta"))
+                )
+
+    async def test_keyboard_keys_edit_text_select_and_move_focus(self):
+        await s.new_page(self.url + "interaction")
+        tab = await s._active_tab()
+        await s._evaluate(tab, "document.getElementById('event-input').focus()")
+        await s.press_key(("Meta" if sys.platform == "darwin" else "Control") + "+A")
+        selection = await s._evaluate(
+            tab,
+            "[document.activeElement.selectionStart, document.activeElement.selectionEnd]",
+        )
+        self.assertEqual(selection, [0, 3])
+        await s.press_key("Backspace")
+        self.assertEqual(await s._evaluate(tab, "document.activeElement.value"), "")
+        for key in ("x", "Shift+a", "+", "Space", "Digit1", "Shift+Digit1"):
+            await s.press_key(key)
+        self.assertEqual(
+            await s._evaluate(tab, "document.activeElement.value"), "xA+ 1!"
+        )
+        await s.press_key("Tab")
+        self.assertEqual(
+            await s._evaluate(tab, "document.activeElement.id"), "event-textarea"
+        )
+        await s.press_key("Enter")
+        self.assertIn("\n", await s._evaluate(tab, "document.activeElement.value"))
+        await s.press_key("Shift+Tab")
+        self.assertEqual(
+            await s._evaluate(tab, "document.activeElement.id"), "event-input"
+        )
+        await s._evaluate(tab, "document.activeElement.select()")
+        await s.type_text("submitted", submit_key="Tab")
+        self.assertEqual(
+            await s._evaluate(tab, "document.getElementById('event-input').value"),
+            "submitted",
+        )
+        self.assertEqual(
+            await s._evaluate(tab, "document.activeElement.id"), "event-textarea"
+        )
 
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")

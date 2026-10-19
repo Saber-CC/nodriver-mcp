@@ -55,9 +55,17 @@ release; a checkout next to this project is not required at runtime.
   event descriptions flag this limitation to prevent treating incomplete
   conditions as complete routing rules. These hints do not recover lost fields
   or change Chrome's routing. The dependency remains the official package.
-- `Element.click()` uses JavaScript `el.click()`, so the MCP click tool uses
+- `Element.click()` uses JavaScript `el.click()`, so `click` and `click_at` share
   generated CDP mouse events to preserve focus, mouse events and trusted clicks.
-  Double clicks send both press/release pairs with click counts 1 and 2.
+  Double clicks send both press/release pairs with click counts 1 and 2;
+  releases use `buttons=0`.
+- `press_key` uses official `Input.dispatchKeyEvent` with modifier flags,
+  physical codes, virtual key codes and text for ordinary input. The parser
+  preserves literal plus keys such as `Control++` and rejects invalid chords
+  before opening a page. Errors and cancellation trigger release attempts for
+  all attempted keys, retaining the original error if a release also fails.
+  macOS editing shortcuts include Chrome editing commands so `Meta+A` actually
+  selects text. `type_text(submit_key=...)` uses the same dispatcher.
 - `Element.clear_input()` and `send_keys("")` emit no input events. Empty fills
   use the native value setter through `Element.apply`, then dispatch bubbling
   `input` and `change` events, including for controlled input/textarea elements.
@@ -116,16 +124,23 @@ Total: **58** added generated commands.
 
 ## Validation results
 
-Verified locally on 2026-10-19 against official PyPI nodriver 0.50.6 and
+Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 57 regression/integration tests: **56 passed, 1 skipped** (MCP version 1.4.2).
+- 64 regression/integration tests: **63 passed, 1 skipped** (MCP version 1.4.3).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
   input/textarea form models passed. Site-isolated iframe navigation to another
   site and back, document replacement/removal, stale UID rejection and selecting
   the main frame by ID passed.
+- Coordinate single/double clicks produced the complete trusted mouse event
+  sequence, correct click counts and released button state. Keyboard combinations
+  reported correct modifier flags and physical codes, including literal plus
+  keys; actual selection, deletion, character entry and Tab/Shift+Tab/Enter
+  behavior passed. `type_text` also moved focus via `submit_key="Tab"`.
+  Fault injection verified key cleanup after dispatch errors, release errors
+  and cancellation, including preservation of the original failure.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
@@ -142,6 +157,9 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   `uv tool install` also initialized and discovered tools successfully.
   All 675 official command names resolved and command schemas generated.
 - Ruff F checks, lock validation, whitespace checks and source/wheel builds passed.
+
+See [the tool parity roadmap](tool-parity-roadmap.md) for the completed input
+fixes and the prioritized capability/optimization backlog with acceptance criteria.
 
 The WebMCP page-registration test was skipped because this Chrome build did not
 expose `navigator.modelContext`, including when experimental switches were tried.

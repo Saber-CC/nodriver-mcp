@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.4.2 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.4.3 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -133,9 +133,15 @@ snapshots provided by `save_session` and `load_session`.
 preserves that selection. `navigate_page` and `new_page` accept a device preset
 before the first real navigation request.
 
-`click` sends trusted CDP mouse events, including both clicks for a double click.
+`click` and `click_at` send trusted CDP mouse events, including both clicks for
+a double click.
 Clearing an input with `fill(uid, "")` dispatches `input` and `change` events so
 the page's form state follows the displayed value.
+`press_key` supplies modifier flags and physical key codes. Literal plus keys
+work as `"+"`, `"Control++"` or `"Control+Shift++"`; Shift applies to letters and
+punctuation. Invalid shortcuts fail before input is sent, and attempted keys
+are released after errors or cancellation. On macOS, use `Meta+A` to select all;
+native editing commands accompany the trusted keyboard events.
 
 ### Native frames and element search
 
@@ -290,6 +296,8 @@ without disconnecting the client, PNG image responses, and persistent
 cookies/storage across MCP process restarts.
 See [the upgrade coverage and implementation notes](docs/nodriver-0.50.6.md)
 for the complete added-command inventory and native API decisions.
+See [the tool parity roadmap](docs/tool-parity-roadmap.md) for completed fixes,
+missing capabilities, priorities and acceptance criteria for the next iterations.
 
 ## License
 
