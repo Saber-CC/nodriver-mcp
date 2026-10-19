@@ -50,6 +50,11 @@ release; a checkout next to this project is not required at runtime.
 - Official 0.50.6 removes `sameParty` and uses
   `localNetworkAccessRequestPolicy`; the fork-specific Chrome 146 patch is no
   longer required.
+- Official 0.50.6 can omit recursive `or`/`not` fields while parsing
+  `ServiceWorker.workerVersionUpdated.typedRouterRules`. Relevant MCP tool and
+  event descriptions flag this limitation to prevent treating incomplete
+  conditions as complete routing rules. These hints do not recover lost fields
+  or change Chrome's routing. The dependency remains the official package.
 
 ## Coverage policy
 

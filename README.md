@@ -248,6 +248,15 @@ accept Python snake_case or CDP camelCase; nested objects use CDP JSON names.
 Values are constructed with nodriver's generated enums, IDs and dataclasses.
 Discovering a binding does not imply that every Chrome version implements it.
 
+Official nodriver 0.50.6 has a known parsing limitation:
+`ServiceWorker.workerVersionUpdated` can lose recursive `or`/`not` conditions
+inside `typedRouterRules`. Event discovery and the relevant subscription,
+retrieval and connection-history tool descriptions identify this limitation.
+An empty condition `{}` does not establish an unconditional match; verify actual
+request/cache behavior before drawing routing conclusions. Chrome still executes
+the original rules. The MCP continues to use the official package; these hints
+do not restore the missing fields.
+
 ## Validation and upgrade notes
 
 ```bash
