@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.2 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.3 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -143,6 +143,12 @@ again emits no extra click. Changes use trusted mouse events and verify the
 result. Selected radios must be changed by selecting another option. Disabled,
 read-only or unresponsive controls report a clear failure. Text/select values
 continue to require strings.
+`upload_file` accepts the existing `file_path` or a `file_paths` list. File inputs
+delegate to native `Element.send_file`; an ordinary upload button can be clicked
+to intercept and accept its file chooser. Files are validated locally, multiple
+files require a multiple input/chooser, and chooser waiting has a configurable
+`timeout` (3000 ms by default). Temporary interception and listeners are removed
+after completion, failure or cancellation, including inside iframes.
 `press_key` supplies modifier flags and physical key codes. Literal plus keys
 work as `"+"`, `"Control++"` or `"Control+Shift++"`; Shift applies to letters and
 punctuation. Invalid shortcuts fail before input is sent, and attempted keys

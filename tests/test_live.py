@@ -137,6 +137,27 @@ class Handler(BaseHTTPRequestHandler):
                 </script>""",
                 "text/html",
             )
+        elif self.path.startswith(("/uploads", "/upload-child")):
+            data, content_type = (
+                b"""<title>Uploads</title>
+                <input id='one' type='file' aria-label='Single upload'>
+                <input id='many' type='file' multiple aria-label='Multiple upload'>
+                <input id='hidden' type='file' multiple style='display:none'>
+                <button id='choose' onclick="document.getElementById('hidden').click()">Choose files</button>
+                <button id='none'>No chooser</button><output id='names'>No files</output>
+                <script>window.filesChanged={}; document.addEventListener('change', event => {
+                  if (event.target.type !== 'file') return;
+                  const files=Array.from(event.target.files, file=>file.name);
+                  filesChanged[event.target.id]=files;
+                  document.getElementById('names').textContent=files.join(', ');
+                });</script>"""
+                + (
+                    b"<iframe src='/upload-child'></iframe>"
+                    if self.path.startswith("/uploads")
+                    else b""
+                ),
+                "text/html",
+            )
         else:
             html = """<title>Native integration</title>
             <input aria-label="Main input"><select aria-label="Choice"><option value="a">A</option><option value="b">B</option></select>
@@ -710,6 +731,98 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Error", await s.fill(found[0]["uid"], True))
         element = await s._element_for_uid(found[0]["uid"])
         self.assertIs(await element.apply("el => el.checked"), True)
+
+    async def test_file_upload_supports_legacy_multiple_and_button_chooser(self):
+        await s.new_page(self.url + "uploads")
+        tab = await s._active_tab()
+        first, second = (
+            Path(self.directory.name) / "alpha.txt",
+            Path(self.directory.name) / "样例.txt",
+        )
+        first.write_text("alpha", encoding="utf-8")
+        second.write_text("unicode", encoding="utf-8")
+
+        async def uid(selector):
+            return (await self.tool("find_elements", selector=selector))[0]["uid"]
+
+        single = await uid("#one")
+        result = await s.upload_file(single, str(first), include_snapshot=True)
+        self.assertIn("alpha.txt", result)
+        single = await uid("#one")
+        with self.assertRaisesRegex(ValueError, "multiple"):
+            await s.upload_file(single, file_paths=[str(first), str(second)])
+        self.assertEqual(
+            await s._evaluate(tab, "document.getElementById('one').files.length"), 1
+        )
+        multiple = await uid("#many")
+        result = await s.upload_file(
+            multiple, file_paths=[str(first), str(second)], include_snapshot=True
+        )
+        self.assertIn("样例.txt", result)
+        self.assertEqual(
+            await s._evaluate(tab, "window.filesChanged.many"),
+            ["alpha.txt", "样例.txt"],
+        )
+        await s.evaluate_script(
+            "document.getElementById('hidden').multiple=false", wait_for_stable=False
+        )
+        button = await uid("#choose")
+        with self.assertRaisesRegex(ValueError, "multiple"):
+            await s.upload_file(button, file_paths=[str(first), str(second)])
+        await s.evaluate_script(
+            "document.getElementById('hidden').multiple=true", wait_for_stable=False
+        )
+        result = await s.upload_file(
+            button, file_paths=[str(first), str(second)], include_snapshot=True
+        )
+        self.assertIn("alpha.txt", result)
+        self.assertEqual(
+            await s._evaluate(tab, "window.filesChanged.hidden"),
+            ["alpha.txt", "样例.txt"],
+        )
+        self.assertFalse(tab.handlers.get(uc.cdp.page.FileChooserOpened))
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            await s.upload_file(single, file_path=str(first) + ".missing")
+        with self.assertRaisesRegex(ValueError, "not both"):
+            await s.upload_file(single, str(first), file_paths=[str(second)])
+
+    async def test_file_upload_chooser_timeout_cleans_up_for_next_upload(self):
+        await s.new_page(self.url + "uploads")
+        tab = await s._active_tab()
+        file = Path(self.directory.name) / "recovered.txt"
+        file.write_text("file", encoding="utf-8")
+        uid = (await self.tool("find_elements", selector="#none"))[0]["uid"]
+        with self.assertRaisesRegex(TimeoutError, "file chooser"):
+            await s.upload_file(uid, str(file), timeout=100)
+        self.assertFalse(tab.handlers.get(uc.cdp.page.FileChooserOpened))
+        uid = (await self.tool("find_elements", selector="#choose"))[0]["uid"]
+        await s.upload_file(uid, file_paths=[str(file)])
+        self.assertEqual(
+            await s._evaluate(tab, "window.filesChanged.hidden"), ["recovered.txt"]
+        )
+        self.assertFalse(s._file_uploads.leases)
+
+    async def test_cross_process_file_chooser_routes_to_iframe_input(self):
+        await s.new_page(self.url + "uploads")
+        page = await s._page_tab()
+        frames = await self.tool("list_frames")
+        child = next(frame["frame_id"] for frame in frames if frame["parent_id"])
+        await self.tool("select_frame", frame_id=child)
+        file = Path(self.directory.name) / "frame.txt"
+        file.write_text("frame", encoding="utf-8")
+        uid = (await self.tool("find_elements", selector="#one"))[0]["uid"]
+        await s.upload_file(uid, str(file))
+        url = f"http://localhost:{self.http.server_port}/upload-child"
+        await self.navigate_frame(page, child, url, separate=True)
+        uid = (await self.tool("find_elements", selector="#choose"))[0]["uid"]
+        await s.upload_file(uid, str(file))
+        connection = await s._active_tab()
+        self.assertIsNot(connection, page)
+        self.assertEqual(
+            await s._evaluate(connection, "window.filesChanged.hidden"), ["frame.txt"]
+        )
+        for connection in (page, connection):
+            self.assertFalse(connection.handlers.get(uc.cdp.page.FileChooserOpened))
 
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")

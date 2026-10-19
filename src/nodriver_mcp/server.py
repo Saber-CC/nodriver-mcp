@@ -34,6 +34,7 @@ from .forms import fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .protocol import json_value
+from .uploads import FileUploads, upload_paths
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -48,6 +49,7 @@ _browser: uc.Browser | None = None
 _browser_lock = asyncio.Lock()
 _launch_options: LaunchOptions | None = None
 _profile_lease: ProfileLease | None = None
+_file_uploads = FileUploads()
 
 
 async def _get_browser() -> uc.Browser:
@@ -2686,17 +2688,48 @@ async def type_text(
 @_page_tool()
 async def upload_file(
     uid: str,
-    file_path: str,
+    file_path: str = "",
     include_snapshot: bool = False,
     *,
+    file_paths: list[str] | None = None,
+    timeout: int = 3000,
     page_id: int | str | None = None,
 ) -> str:
-    """Upload through the official Element.send_file helper."""
+    """Upload local files through an input or a button that opens a file chooser.
+
+    Use file_path for one file or file_paths for one/many files. Native file
+    inputs use Element.send_file; buttons use official Page/DOM chooser commands.
+    timeout bounds waiting for the chooser in milliseconds; 0 disables it.
+    """
+    paths = upload_paths(file_path, file_paths)
+    if timeout < 0:
+        raise ValueError("timeout must be nonnegative.")
     element = await _element_for_uid(uid)
+    page = await _page_tab()
+
+    async def click_button():
+        x, y = await _get_box_model(element.tab, uid)
+        await _dispatch_mouse_click(element.tab, x, y, False)
+
+    async def chooser_frame(frame_id):
+        await _discover_frames(page)
+        connection = _frame_connections.get((str(page.target_id), frame_id))
+        if connection is None:
+            raise ValueError("File chooser frame no longer exists.")
+        return connection
+
     await _perform_action(
-        element.tab, lambda: element.send_file(str(Path(file_path).resolve()))
+        element.tab,
+        lambda: _file_uploads.upload(
+            element,
+            page,
+            paths,
+            click_button,
+            chooser_frame,
+            timeout,
+        ),
     )
-    return f"Uploaded {file_path} to uid={uid}" + await _maybe_snapshot(
+    return f"Uploaded {', '.join(paths)} to uid={uid}" + await _maybe_snapshot(
         include_snapshot
     )
 
