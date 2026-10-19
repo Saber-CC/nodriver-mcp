@@ -1857,6 +1857,43 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             await s.get_network_request(posted["reqid"], include_body=False),
         )
 
+    async def test_trace_auto_and_manual_exports_keep_complete_files_and_config(self):
+        first = str((await s._page_tab()).target_id)
+        await s.performance_start_trace(reload=False, auto_stop=False, page_id=first)
+        await s.evaluate_script(
+            "performance.mark('complete-file-marker')",
+            wait_for_stable=False,
+            page_id=first,
+        )
+        await s.new_page(self.url, background=False)
+        report = await s.performance_stop_trace()
+        info = json.loads(report.partition("\n")[2])
+        path = Path(info["file_path"])
+        self.assertTrue(path.is_absolute())
+        self.assertEqual(info["config"]["page_id"], first)
+        events = json.loads(path.read_text())["traceEvents"]
+        self.assertEqual(info["event_count"], len(events))
+        self.assertTrue(any(e["name"] == "complete-file-marker" for e in events))
+        self.assertGreater(info["duration_ms"], 0)
+        gzip_path = Path(self.directory.name) / "trace.json.gz"
+        report = await s.performance_start_trace(
+            reload=True, duration_ms=250, file_path=str(gzip_path), ignore_cache=True
+        )
+        info = json.loads(report.partition("\n")[2])
+        import gzip
+
+        self.assertTrue(
+            json.loads(gzip.decompress(gzip_path.read_bytes()))["traceEvents"]
+        )
+        self.assertTrue(info["config"]["ignore_cache"])
+        self.assertFalse(s._tracing_active)
+        self.assertFalse(s._trace_stopping)
+        tab = await s._active_tab()
+        self.assertFalse(tab.handlers.get(uc.cdp.tracing.TracingComplete))
+        await s.close_browser()
+        self.assertTrue(path.exists())
+        self.assertTrue(gzip_path.exists())
+
     async def test_network_console_and_trace(self):
         await s.evaluate_script("() => fetch('/api').then(r => r.json())")
         listing = await s.list_network_requests(

@@ -24,7 +24,7 @@
 - [x] OPT-03：优化脚本超时和大结果输出。1.5.8。
 - [x] OPT-04：完善网络请求诊断和正文可用状态。1.5.9。
 - [x] OPT-05：增加截图返回尺寸限制。1.5.10。
-- [ ] OPT-06：完整保留性能 trace 并返回录制信息。
+- [x] OPT-06：完整保留性能 trace 并返回录制信息。1.5.11。
 
 ## 已完成的正确性修复
 
@@ -223,6 +223,15 @@ Tab.save_screenshot(as_base64=True)。元素裁剪计入滚动偏移并允许视
 PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回行为。
 
 ### OPT-06：性能 trace 保存
+
+已完成于 1.5.11。参考 upstream performance 的原始 trace 保存和录制配置，
+无路径时自动保存到持久 artifacts/traces，返回绝对路径、事件数、原始字节数、
+时长、完整配置及 Chrome 的 data_loss_occurred。开始时指定的路径在手动停止时保留；
+支持 JSON/gzip，默认 categories 对齐 DevTools，加上 JS sampling 和截图。
+新增 duration_ms、categories、ignore_cache；自动/手动停止均使用原始连接。
+取消和 reload/保存失败会清理录制状态与临时监听；关闭原始页或浏览器前完成归档。
+真实 Chrome 验证自动/手动、换页、mark 事件、gzip、配置和浏览器关闭后文件仍在；
+故障注入覆盖取消、磁盘失败和回调清理，stdio 客户端验证完整文件和事件计数。
 
 涉及 `performance_start_trace`、`performance_stop_trace`。
 即使调用方未指定文件路径，也应完整保留 trace，并返回可访问路径、录制时长和配置。
