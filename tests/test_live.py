@@ -231,6 +231,15 @@ class Handler(BaseHTTPRequestHandler):
                 };""",
                 "application/javascript",
             )
+        elif self.path.startswith("/performance"):
+            data, content_type = (
+                b"""<meta charset='utf-8'><title>Performance integration</title>
+                <style>body{margin:0;background:white}h1{font-size:48px}button{width:200px;height:60px}</style>
+                <h1 id='hero'>Performance content</h1><button id='traceAction'>Trace action</button>
+                <script>window.traceClicks=0;traceAction.onclick=()=>{const start=performance.now();while(performance.now()-start<160){}traceClicks++;traceAction.textContent='Trace done';};
+                setTimeout(()=>hero.style.marginTop='160px',250);</script>""",
+                "text/html",
+            )
         elif self.path.startswith("/console-errors"):
             data, content_type = (
                 b"<title>Console stack</title><script src='/errors.js'></script><p>Exception test</p>",
@@ -2237,6 +2246,53 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             "not_requested",
             await s.get_network_request(posted["reqid"], include_body=False),
         )
+
+    @unittest.skipUnless(
+        os.environ.get("NODRIVER_MCP_PERFORMANCE_TESTS") == "1",
+        "Native DevTools engine checks are opt-in",
+    )
+    async def test_real_trace_engine_reports_vitals_and_native_insight_details(self):
+        await s.performance_start_trace(reload=False, auto_stop=False)
+        await s.navigate_page(url=self.url + "performance")
+        await asyncio.sleep(0.5)
+        snapshot = await s.take_snapshot()
+        button = re.search(r'uid=(\S+) button "Trace action"', snapshot).group(1)
+        await s.click(button)
+        await asyncio.sleep(0.15)
+        report = await s.performance_stop_trace(analyze=True)
+        self.assertIn("Engine: chrome-devtools-mcp@1.11.0", report)
+        self.assertFalse(s._tracing_active)
+        self.assertFalse(s._trace_stopping)
+        analysis_path = Path(
+            json.loads(
+                re.search(r"^Analysis file: (.+)$", report, re.MULTILINE).group(1)
+            )
+        )
+        data = json.loads(analysis_path.read_text())
+        own = next(
+            v for v in data["web_vitals"] if v["url"] == self.url + "performance"
+        )
+        self.assertGreater(own["lcp_ms"], 0)
+        self.assertGreater(own["inp_ms"], 0)
+        self.assertIsNotNone(own["cls"])
+        self.assertGreaterEqual(own["cls"], 0)
+        self.assertEqual(data["insight_sets"][0]["errors"], {})
+        self.assertTrue(Path(data["trace_path"]).is_file())
+        detailed = await s.performance_analyze_insight(
+            own["insight_set_id"], "INPBreakdown", max_output_chars=10000
+        )
+        self.assertIn("Input delay", detailed)
+        self.assertIn("Processing duration", detailed)
+        automatic = await s.performance_start_trace(
+            reload=True, duration_ms=600, analyze=True
+        )
+        self.assertIn("Engine: chrome-devtools-mcp@1.11.0", automatic)
+        self.assertFalse(s._tracing_active)
+        await s.close_browser()
+        offline = await s.performance_analyze_trace(max_output_chars=100)
+        self.assertIn("preview truncated", offline)
+        self.assertIsNone(s._browser)
+        self.assertTrue(analysis_path.exists())
 
     async def test_trace_auto_and_manual_exports_keep_complete_files_and_config(self):
         first = str((await s._page_tab()).target_id)

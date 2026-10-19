@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -58,9 +59,38 @@ class InstallationTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(session.initialize(), timeout=30)
                     names = {tool.name for tool in (await session.list_tools()).tools}
                     self.assertTrue(
-                        {"start_browser", "close_browser", "take_snapshot"} <= names
+                        {
+                            "start_browser",
+                            "close_browser",
+                            "take_snapshot",
+                            "performance_analyze_trace",
+                            "performance_analyze_insight",
+                        }
+                        <= names
                     )
                     result = await session.call_tool(
                         "list_cdp_commands", {"domain": "ServiceWorker"}
                     )
                     self.assertFalse(result.is_error, str(result))
+
+                    if os.environ.get("NODRIVER_MCP_PERFORMANCE_TESTS") == "1":
+                        output = root / "installed-analysis.json"
+                        result = await session.call_tool(
+                            "performance_analyze_trace",
+                            {
+                                "trace_path": str(
+                                    project
+                                    / "tests/fixtures/web-dev-with-commit.json.gz"
+                                ),
+                                "file_path": str(output),
+                                "max_output_chars": 100,
+                            },
+                        )
+                        self.assertFalse(result.is_error, str(result))
+                        report = json.loads(output.read_text())
+                        self.assertAlmostEqual(
+                            report["web_vitals"][0]["lcp_ms"], 129.211
+                        )
+                        self.assertGreaterEqual(
+                            len(report["insight_sets"][0]["insights"]), 19
+                        )

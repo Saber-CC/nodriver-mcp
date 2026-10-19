@@ -284,8 +284,16 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
   参考 upstream script/console 的 worker 分支。真实临时 MV3 扩展通过官方 CDP
   加载/卸载，验证发现、脚本、文件源码、异步异常、日志隔离、超时恢复及退役；
   真实 stdio 客户端覆盖相同流程，故障注入断言 worker 调用不访问 Page/Emulation。
-- [ ] ADV-06：性能 trace 的 Web Vitals 摘要和深入分析。需要单独评估分析器，
-  与基础录制、文件保存分开推进。
+- [x] ADV-06：1.5.17 已完成真实 DevTools Trace Engine 分析。
+  参考 upstream PerformanceTrace.ts、DevtoolsUtils.ts、ChunkedTraceParser 与两个性能
+  formatter，按需加载已固定 SHA-512 的官方 npm 1.11.0 包；初始化 locale 后生成
+  真实 Insight models，使用官方大文件分块解析器。新增 performance_analyze_trace 和
+  performance_analyze_insight；start/stop 的 analyze=true 可直接附加分析，默认仍只录制。
+  输出观察到的 LCP/INP/CLS/FCP 和详细 Insights，未观察到的指标为 null；完整 JSON
+  自动保存，内联内容有界，支持 JSON/gzip 和离线读取。分析前释放录制状态，分析失败
+  保留原始 trace，超时/取消清理 Node 子进程。Node 22.12+ 仅分析时需要，支持现有包路径。
+  官方 fixture 验证 19 个模型、129.211ms LCP 及具体分解；真实 Chrome 覆盖导航、
+  可信点击、Web Vitals、自动/手动分析和浏览器关闭后读取；stdio 与隔离安装覆盖新工具。
 
 ## 后续迭代的回归基线
 
@@ -293,3 +301,11 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
 CDP 缩写映射与错误详情、主 frame 搜索、iframe 连接切换及采集恢复有效。
 工具参数或响应发生变化时，验证真实 MCP 客户端调用；依赖或打包变化时，
 补做隔离安装检查。完成一项后更新此文档的状态、版本和验证记录。
+
+## 本轮完成记录
+
+全部清单项已完成，每项均经验证后分别推送。最终版本 1.5.17 使用官方 nodriver 0.50.6
+和 MCP SDK 2.3.0，共 76 个工具。包含隔离安装、真实 Chrome、stdio MCP 客户端和
+真实 DevTools 引擎的全量回归共 160 项：159 项通过，1 项因 Chrome 缺少网站
+navigator.modelContext API 跳过。构建、锁文件、Python 检查及 Node 桥接语法检查通过。
+性能分析的运行方式和观察指标含义见 [performance-analysis.md](performance-analysis.md)。
