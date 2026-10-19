@@ -32,6 +32,7 @@ from pydantic import StrictBool, ValidationError
 
 from .actions import ActionResult, ActionWaiter
 from .console import ConsoleCollector, format_message, format_stack
+from .dialogs import DialogInterrupted, DialogRegistry
 from .forms import fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
@@ -52,6 +53,7 @@ _browser_lock = asyncio.Lock()
 _launch_options: LaunchOptions | None = None
 _profile_lease: ProfileLease | None = None
 _file_uploads = FileUploads()
+_dialog_state = DialogRegistry()
 
 
 async def _get_browser() -> uc.Browser:
@@ -179,6 +181,7 @@ class _PageCall:
     frame_id: str | None = None
     waiter: ActionWaiter | None = None
     action_results: list[ActionResult] = dataclasses.field(default_factory=list)
+    blocked_by_dialog: bool = False
 
 
 _page_call: ContextVar[_PageCall | None] = ContextVar("page_call", default=None)
@@ -198,7 +201,35 @@ def _page_tool(**options):
                 requested = None  # Legacy spelling for the selected page.
             if _page_call.get() is not None and requested is None:
                 return await fn(*args, **kwargs)
-            call = _PageCall(requested)
+            call = _PageCall(
+                requested,
+                blocked_by_dialog=fn.__name__
+                in {
+                    "click",
+                    "click_at",
+                    "fill",
+                    "fill_form",
+                    "press_key",
+                    "type_text",
+                    "drag",
+                    "hover",
+                    "upload_file",
+                    "navigate_page",
+                    "take_snapshot",
+                    "take_screenshot",
+                    "find_elements",
+                    "list_frames",
+                    "select_frame",
+                    "get_local_storage",
+                    "set_local_storage",
+                    "take_memory_snapshot",
+                    "emulate",
+                    "emulate_device",
+                    "resize_page",
+                    "scroll_page",
+                    "wait_for",
+                },
+            )
             token = _page_call.set(call)
             try:
                 if requested is not None:
@@ -233,6 +264,9 @@ async def _page_tab() -> uc.Tab:
     global _selected_target_id
     call = _page_call.get()
     if call is not None and call.page is not None:
+        record = _dialog_state.current.get(str(call.page.target_id))
+        if record is not None and call.blocked_by_dialog:
+            raise DialogInterrupted(record)
         return call.page
     browser = await _get_browser()
     await browser.update_targets()
@@ -262,6 +296,9 @@ async def _page_tab() -> uc.Tab:
             tab = browser.tabs[-1]
             _selected_target_id = str(tab.target_id)
     await _prepare_page(tab)
+    record = _dialog_state.current.get(str(tab.target_id))
+    if record is not None and call is not None and call.blocked_by_dialog:
+        raise DialogInterrupted(record)
     if call is not None:
         call.page = tab
         call.frame_id = _selected_frames.get(str(tab.target_id))
@@ -292,6 +329,10 @@ async def _active_tab() -> uc.Tab:
     frame_id = _selected_frame_id(page)
     if not frame_id:
         return page
+    if page_id in _dialog_state.current:
+        cached = _frame_connections.get((page_id, frame_id))
+        if cached is not None:
+            return cached
     await _discover_frames(page)
     connection = _frame_connections.get((page_id, frame_id))
     if connection is None:
@@ -338,6 +379,7 @@ async def _prepare_page(tab: uc.Tab) -> None:
     if reference is not None and reference() is tab:
         return
     await tab.send(uc.cdp.emulation.set_focus_emulation_enabled(True))
+    _dialog_state.watch(tab, str(tab.target_id))
 
     def retired(reference):
         if _focused_pages.get(key) is reference:
@@ -365,6 +407,7 @@ def _clear_collection_state(tab: uc.Tab) -> None:
     """Remove this connection's collectors before retiring its transport."""
     key = _tab_key(tab)
     _focused_pages.pop(key, None)
+    _dialog_state.forget(tab)
     collector = _console_callbacks.pop(key, None)
     if collector is not None:
         collector.remove()
@@ -476,9 +519,25 @@ async def _shutdown_browser() -> None:
     ):
         state.clear()
     _selected_target_id = None
+    _dialog_state.clear()
     _tracing_active = False
     _trace_stopping = False
     _trace_tab = None
+
+
+def _script_error(error) -> Exception:
+    details = json_value(error)
+    if isinstance(details, dict) and "text" in details:
+        remote = details.get("exception") or {}
+        reason = remote.get("description") or details["text"]
+        if not remote.get("description") and "value" in remote:
+            reason += ": " + json.dumps(remote["value"], ensure_ascii=False)
+        url = details.get("url") or "script:" + str(details.get("scriptId", "unknown"))
+        return ValueError(
+            f"JavaScript exception: {reason}\n"
+            f"at {url}:{details.get('lineNumber', 0) + 1}:{details.get('columnNumber', 0) + 1}"
+        )
+    return uc.ProtocolException(details)
 
 
 async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) -> Any:
@@ -498,7 +557,7 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
             )
         )
         if error:
-            raise uc.ProtocolException(error)
+            raise _script_error(error)
         return result.value
     # The high-level helper always requests deep serialization. MCP script
     # results need ordinary JSON, including false/zero, rather than a deep graph.
@@ -511,7 +570,7 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
         )
     )
     if error:
-        raise uc.ProtocolException(error)
+        raise _script_error(error)
     return result.value
 
 
@@ -621,6 +680,7 @@ async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
 
         retired = {}
         for frame_id, (frame, connection) in discovered.items():
+            _dialog_state.watch(connection, root_id)
             key = (root_id, frame_id)
             previous = _frame_connections.get(key)
             loader = str(frame.loader_id)
@@ -1027,6 +1087,8 @@ async def _perform_action(
     wait_for_stable: bool = True,
     preserve_navigation: bool = True,
     ignored_dialogs: frozenset[str] = frozenset(),
+    dialog_action: str | None = None,
+    prompt_text: str = "",
 ):
     call = _page_call.get()
     if call is not None and call.waiter is not None:
@@ -1056,6 +1118,9 @@ async def _perform_action(
         frame_id=_selected_frame_id(page),
         wait_for_stable=wait_for_stable,
         ignored_dialogs=ignored_dialogs,
+        dialogs=_dialog_state,
+        dialog_action=dialog_action,
+        prompt_text=prompt_text,
     )
     if call is not None:
         call.waiter = waiter
@@ -1709,7 +1774,7 @@ async def _evaluate_script_value(tab, function: str, args: list[str] | None):
             )
         )
         if error:
-            raise uc.ProtocolException(error)
+            raise _script_error(error)
         return result.value
     expression = function.strip()
     if expression.startswith(("(", "function", "async")):
@@ -1723,13 +1788,36 @@ async def evaluate_script(
     args: list[str] | None = None,
     *,
     wait_for_stable: bool = True,
+    dialog_action: str = "accept",
+    prompt_text: str = "",
+    timeout: int = 30000,
     page_id: int | str | None = None,
 ) -> str:
-    """Evaluate JavaScript with optional element arguments and bounded DOM settling.
+    """Evaluate JavaScript with explicit dialog policy and execution status.
 
     Set wait_for_stable=false for scripts that only read data.
+    dialog_action is accept (default), dismiss, or manual; prompt_text supplies
+    accepted prompt content. timeout bounds execution in milliseconds; 0 disables it.
+    Results report completed, interrupted, failed, or timed_out.
     """
     try:
+        if dialog_action not in {"accept", "dismiss", "manual"}:
+            raise ValueError("dialog_action must be accept, dismiss or manual.")
+        if timeout < 0:
+            raise ValueError("timeout must be nonnegative.")
+        page = await _page_tab()
+        existing = _dialog_state.current.get(str(page.target_id))
+        if existing is not None:
+            if dialog_action == "manual":
+                raise DialogInterrupted(existing)
+            await _await_with_timeout(
+                _dialog_state.handle(existing, dialog_action, prompt_text, page),
+                3000,
+                "Dialog handling",
+            )
+            call = _page_call.get()
+            if call is not None:
+                call.action_results.append(ActionResult(dialogs=[existing]))
         tab = await _tab_for_uid(args[0]) if args else await _active_tab()
         for uid in (args or [])[1:]:
             if await _tab_for_uid(uid) is not tab:
@@ -1738,12 +1826,27 @@ async def evaluate_script(
                 )
         value = await _perform_action(
             tab,
-            lambda: _evaluate_script_value(tab, function, args),
+            lambda: _await_with_timeout(
+                _evaluate_script_value(tab, function, args), timeout, "Script execution"
+            ),
             wait_for_stable=wait_for_stable,
+            dialog_action=dialog_action,
+            prompt_text=prompt_text,
         )
-        return "```json\n" + json.dumps(json_value(value), ensure_ascii=False) + "\n```"
+        return (
+            "```json\n"
+            + json.dumps(json_value(value), ensure_ascii=False)
+            + "\n```\nStatus: completed"
+        )
+    except DialogInterrupted as exc:
+        status = "failed" if exc.record.error else "interrupted"
+        return f"Status: {status}\n{exc}\nDialog: " + json.dumps(
+            exc.record.data(), ensure_ascii=False
+        )
+    except TimeoutError as exc:
+        return f"Error: {exc}\nStatus: timed_out"
     except Exception as exc:
-        return f"Error: {exc}"
+        return f"Error: {exc}\nStatus: failed"
 
 
 async def _fill_element(element, value: str | bool, uid: str):
@@ -1958,10 +2061,19 @@ async def handle_dialog(
         action: Whether to "accept" or "dismiss" the dialog.
         prompt_text: Optional text to enter into a prompt dialog.
     """
-    tab = await _active_tab()
+    if action not in {"accept", "dismiss"}:
+        raise ValueError("action must be accept or dismiss.")
+    tab = await _page_tab()
     import nodriver.cdp.page as cdp_page
 
-    if action == "accept":
+    existing = _dialog_state.current.get(str(tab.target_id))
+    if existing is not None:
+        await _await_with_timeout(
+            _dialog_state.handle(existing, action, prompt_text, tab),
+            3000,
+            "Dialog handling",
+        )
+    elif action == "accept":
         await tab.send(
             cdp_page.handle_java_script_dialog(accept=True, prompt_text=prompt_text)
         )
