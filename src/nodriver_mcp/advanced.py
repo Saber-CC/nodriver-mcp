@@ -21,6 +21,16 @@ from .protocol import (
 )
 
 
+_SERVICE_WORKER_ROUTER_NOTE = (
+    "Known limitation in official nodriver 0.50.6: "
+    "ServiceWorker.workerVersionUpdated can lose recursive 'or'/'not' conditions "
+    "in typedRouterRules during parsing. Treat these reported conditions as "
+    "potentially incomplete; an empty condition {} does not prove an unconditional "
+    "match. Do not infer a website's cache/network routing solely from these "
+    "records; check actual request behavior. Chrome's own routing is unaffected."
+)
+
+
 def register_tools(mcp, s) -> None:
     """Register tools with the server's shared page/frame lifecycle services."""
     subscriptions: dict[str, dict] = {}
@@ -68,7 +78,12 @@ def register_tools(mcp, s) -> None:
             result["version_page"] = await uc.util.get_browser_version_info(browser)
         return result
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Read native recent transactions (up to nodriver's 25 retained entries).\n\n"
+            + _SERVICE_WORKER_ROUTER_NOTE
+        )
+    )
     async def get_connection_history(
         limit: int = 10, scope: str = "page"
     ) -> list[dict]:
@@ -332,12 +347,24 @@ def register_tools(mcp, s) -> None:
     @mcp.tool()
     async def list_cdp_events(domain: str = "") -> list[dict]:
         """Discover generated CDP events for subscriptions, including new domains."""
-        return [
-            {"event": name, "description": inspect.getdoc(cls) or ""}
-            for name, cls in sorted(event_types(domain).items())
-        ]
+        result = []
+        for name, cls in sorted(event_types(domain).items()):
+            description = inspect.getdoc(cls) or ""
+            if name == "ServiceWorker.workerVersionUpdated":
+                description = (
+                    description + "\n\n" + _SERVICE_WORKER_ROUTER_NOTE
+                ).strip()
+            result.append({"event": name, "description": description})
+        return result
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Subscribe to official CDP events. Runtime is enabled only when requested here. "
+            "Domains with a parameterless enable command are enabled automatically; "
+            "otherwise enable/configure the domain with send_cdp_command first.\n\n"
+            + _SERVICE_WORKER_ROUTER_NOTE
+        )
+    )
     async def subscribe_cdp_events(
         events: list[str],
         scope: str = "page",
@@ -399,7 +426,12 @@ def register_tools(mcp, s) -> None:
         subscriptions[identifier] = entry
         return identifier
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Read buffered events with stable per-subscription IDs.\n\n"
+            + _SERVICE_WORKER_ROUTER_NOTE
+        )
+    )
     async def get_cdp_events(
         subscription_id: str, after_id: int = 0, clear: bool = False
     ) -> list[dict]:
