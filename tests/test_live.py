@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import nodriver as uc
 from mcp.server.mcpserver import Image
 from PIL import Image as PillowImage
 
@@ -138,6 +139,33 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
     async def tool(self, tool_key, **kwargs):
         return await s.mcp._tool_manager.get_tool(tool_key).fn(**kwargs)
 
+    async def navigate_frame(self, page, frame_id, url, separate):
+        await page.send(
+            uc.cdp.runtime.evaluate(
+                f"document.querySelector('iframe').src = {json.dumps(url)}"
+            )
+        )
+        async with asyncio.timeout(15):
+            while True:
+                tree = await page.get_frame_tree()
+                listed = list(uc.util.flatten_frame_tree(tree))
+                native = await page.get_frames()
+                if (
+                    any(
+                        str(connection.target_id) == frame_id
+                        and connection.target.url == url
+                        for connection in native
+                    )
+                    if separate
+                    else not native
+                    and any(
+                        str(frame.id_) == frame_id and frame.url == url
+                        for frame in listed
+                    )
+                ):
+                    return
+                await asyncio.sleep(0.05)
+
     async def test_click_focuses_input_and_emits_trusted_mouse_events(self):
         await s.new_page(self.url + "interaction")
         snapshot = await s.take_snapshot()
@@ -224,36 +252,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await self.tool("select_frame", frame_id=frame_id)
         cross_url = f"http://localhost:{self.http.server_port}/frame?cross=1"
 
-        async def navigate_frame(url, separate):
-            await page.send(
-                uc.cdp.runtime.evaluate(
-                    f"document.querySelector('iframe').src = {json.dumps(url)}"
-                )
-            )
-            async with asyncio.timeout(15):
-                while True:
-                    tree = await page.get_frame_tree()
-                    listed = list(uc.util.flatten_frame_tree(tree))
-                    native = await page.get_frames()
-                    if (
-                        any(
-                            str(connection.target_id) == frame_id
-                            and connection.target.url == url
-                            for connection in native
-                        )
-                        if separate
-                        else not native
-                        and any(
-                            str(frame.id_) == frame_id and frame.url == url
-                            for frame in listed
-                        )
-                    ):
-                        return
-                    await asyncio.sleep(0.05)
-
-        import nodriver as uc
-
-        await navigate_frame(cross_url, True)
+        await self.navigate_frame(page, frame_id, cross_url, True)
         frames = await self.tool("list_frames")
         child = next(frame for frame in frames if frame["frame_id"] == frame_id)
         self.assertTrue(child["separate_connection"])
@@ -276,7 +275,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await self.tool("list_frames")
         self.assertIs(await s._active_tab(), connection)
 
-        await navigate_frame(self.url + "frame?return=1", False)
+        await self.navigate_frame(page, frame_id, self.url + "frame?return=1", False)
         frames = await self.tool("list_frames")
         child = next(frame for frame in frames if frame["frame_id"] == frame_id)
         self.assertFalse(child["separate_connection"])
@@ -291,7 +290,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             await s._tab_for_uid(old_uid)
 
         current_uid = (await self.tool("find_elements", selector="input"))[0]["uid"]
-        await navigate_frame(self.url + "frame?return=2", False)
+        await self.navigate_frame(page, frame_id, self.url + "frame?return=2", False)
         with self.assertRaisesRegex(ValueError, "stale"):
             await s._tab_for_uid(current_uid)
         self.assertIs(await s._active_tab(), page)
@@ -309,6 +308,85 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "stale"):
             await s._tab_for_uid(current_uid)
         self.assertIsNotNone(page.socket)
+
+    async def test_cross_process_frame_collectors_survive_connection_recreation(self):
+        page = await s._page_tab()
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        frame_id = child["frame_id"]
+        await self.tool("select_frame", frame_id=frame_id)
+        cross_url = f"http://localhost:{self.http.server_port}/frame?collect=1"
+
+        async def collect_probe(connection, marker):
+            self.assertNotIn("already", await s.enable_console_collection())
+            await self.tool("configure_network_capture")
+            # Enabling twice must preserve exactly one copy of each collector.
+            self.assertIn("already", await s.enable_console_collection())
+            await self.tool("configure_network_capture")
+            await s._evaluate(
+                connection,
+                f"(async () => {{ console.log('{marker}'); "
+                f"return (await fetch('/api?probe={marker}')).json(); }})()",
+            )
+            async with asyncio.timeout(5):
+                while not (
+                    any(marker in message["text"] for message in s._console_messages)
+                    and any(
+                        marker in request["url"]
+                        and request["connection"] is connection
+                        and request["finished"]
+                        for request in s._network_requests
+                    )
+                ):
+                    await asyncio.sleep(0.01)
+            self.assertEqual(
+                len(connection.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1
+            )
+            for event in (
+                uc.cdp.network.RequestWillBeSent,
+                uc.cdp.network.ResponseReceived,
+                uc.cdp.network.LoadingFinished,
+                uc.cdp.network.LoadingFailed,
+            ):
+                self.assertEqual(len(connection.handlers[event]), 1)
+            self.assertEqual(
+                sum(marker in message["text"] for message in s._console_messages), 1
+            )
+            requests = [
+                request
+                for request in s._network_requests
+                if marker in request["url"] and request["connection"] is connection
+            ]
+            self.assertEqual(len(requests), 1)
+            self.assertIn(marker, await s.list_console_messages())
+            self.assertIn(marker, await s.list_network_requests(url_filter=marker))
+            self.assertIn(
+                "local-test", await s.get_network_request(requests[0]["reqid"])
+            )
+
+        await self.navigate_frame(page, frame_id, cross_url, True)
+        old = await s._active_tab()
+        self.assertIsNot(old, page)
+        await collect_probe(old, "collection-before-recreation")
+
+        await self.navigate_frame(page, frame_id, self.url + "frame?collect=2", False)
+        self.assertIs(await s._active_tab(), page)
+        self.assertIsNone(old.socket)
+
+        await self.navigate_frame(page, frame_id, cross_url, True)
+        replacement = await s._active_tab()
+        self.assertIsNot(replacement, old)
+        self.assertEqual(str(replacement.target_id), str(old.target_id))
+        await collect_probe(replacement, "collection-after-recreation")
+        self.assertNotIn(s._tab_key(old), s._console_collection_enabled_tabs)
+        self.assertNotIn(s._tab_key(old), s._network_collection_enabled_tabs)
+        self.assertNotIn(s._tab_key(old), s._console_callbacks)
+        self.assertNotIn(s._tab_key(old), s._network_callbacks)
+        self.assertFalse(old.handlers.get(uc.cdp.runtime.ConsoleAPICalled))
+        self.assertFalse(old.handlers.get(uc.cdp.network.RequestWillBeSent))
 
     async def test_default_temporary_session_restarts_clean_and_removes_profile(self):
         first = s._browser_launch_info()

@@ -66,6 +66,10 @@ release; a checkout next to this project is not required at runtime.
   replaced/removed documents invalidate UIDs, and obsolete iframe sockets close
   without closing the shared page. Selecting the root frame ID selects the main
   page, which has no iframe owner to query.
+- Console and network collector state belongs to each connection instance.
+  Retiring a connection removes its managed callbacks and enabled flags;
+  stable page connections keep their collectors. Re-enabling collection on a
+  new iframe connection works even when it reuses the previous target ID.
 - Command and parameter aliases match snake_case and CDP camelCase without
   guessing acronym capitalization. Parameter discovery reads exact JSON names
   from the official generated serializers, including `includeShadowDOM` and
@@ -115,7 +119,7 @@ Total: **58** added generated commands.
 Verified locally on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 54 regression/integration tests: **53 passed, 1 skipped** (MCP version 1.4.1).
+- 57 regression/integration tests: **56 passed, 1 skipped** (MCP version 1.4.2).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -128,6 +132,11 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   full-page output was checked against a 2400-pixel document.
 - Network filtering/body retrieval, explicit console cleanup and nonempty trace
   stream export passed.
+- Console and network collection resumed after a site-isolated iframe navigated
+  back to the page's site and then returned to its original site with a recreated
+  connection and the same target ID. Repeated enable calls retained one callback
+  per event; console messages, fetch completion and response bodies were verified.
+  Retiring an iframe cleared its collectors and preserved the page's collectors.
 - A real stdio MCP client initialized, discovered tools and called command
   discovery successfully under both supported protocol modes. A fresh isolated
   `uv tool install` also initialized and discovered tools successfully.
