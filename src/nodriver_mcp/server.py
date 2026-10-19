@@ -16,11 +16,15 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
 import nodriver as uc
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.types import CallToolResult, InputRequiredResult
+from pydantic import ValidationError
 
 from .launch import LaunchOptions, ProfileLease
 from .protocol import json_value
@@ -103,6 +107,26 @@ def _browser_launch_info() -> dict:
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
+class BrowserMCPServer(MCPServer):
+    """Report browser input and timeout errors through the SDK's ToolError API."""
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        try:
+            return await super().call_tool(name, arguments, context)
+        except UnexpectedToolError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, (ValueError, TimeoutError)) and not isinstance(
+                cause, ValidationError
+            ):
+                raise ToolError(str(cause)) from cause
+            raise
+
+
 @asynccontextmanager
 async def _lifespan(_server):
     try:
@@ -111,8 +135,9 @@ async def _lifespan(_server):
         await _shutdown_browser()
 
 
-mcp = FastMCP(
+mcp = BrowserMCPServer(
     "nodriver-mcp",
+    version=package_version("nodriver-mcp"),
     lifespan=_lifespan,
     instructions=(
         "Undetected Chrome browser automation via nodriver. "

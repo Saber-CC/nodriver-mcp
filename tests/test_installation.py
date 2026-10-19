@@ -63,4 +63,4 @@ class InstallationTests(unittest.IsolatedAsyncioTestCase):
                     result = await session.call_tool(
                         "list_cdp_commands", {"domain": "ServiceWorker"}
                     )
-                    self.assertFalse(result.isError, str(result))
+                    self.assertFalse(result.is_error, str(result))

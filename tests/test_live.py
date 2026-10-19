@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from mcp.server.fastmcp import Image
+from mcp.server.mcpserver import Image
 from PIL import Image as PillowImage
 
 from nodriver_mcp import server as s
@@ -184,10 +184,9 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Error", await s.fill(uid, "hello 中文"))
         self.assertIn("hello 中文", await s.evaluate_script("el => el.value", [uid]))
         self.assertIsInstance(await s.take_screenshot(), Image)
-        content = await s.mcp.call_tool("take_screenshot", {})
-        if isinstance(content, tuple):
-            content = content[0]
-        self.assertTrue(any(item.type == "image" for item in content))
+        result = await s.mcp.call_tool("take_screenshot", {})
+        self.assertFalse(result.is_error)
+        self.assertTrue(any(item.type == "image" for item in result.content))
         await s.evaluate_script(
             "() => {document.body.style.minHeight='2400px'; return true;}"
         )

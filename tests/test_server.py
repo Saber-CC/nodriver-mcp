@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import nodriver as uc
-from mcp.server.fastmcp import Image
+from mcp.server.mcpserver import Image
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from pydantic import ValidationError
 
 from nodriver_mcp import server as s
 
@@ -62,6 +64,31 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             value.clear()
         s._tracing_active = False
         s._trace_tab = None
+
+    async def test_tool_timeouts_keep_details_and_unexpected_failures_stay_generic(
+        self,
+    ):
+        with patch.object(
+            s, "_active_tab", AsyncMock(side_effect=TimeoutError("Capture timed out"))
+        ):
+            with self.assertRaisesRegex(ToolError, "Capture timed out"):
+                await s.mcp.call_tool("take_screenshot", {})
+        with patch.object(
+            s, "_active_tab", AsyncMock(side_effect=RuntimeError("internal diagnostic"))
+        ):
+            with self.assertRaises(UnexpectedToolError) as raised:
+                await s.mcp.call_tool("take_screenshot", {})
+            self.assertNotIn("internal diagnostic", str(raised.exception))
+
+    async def test_invalid_tool_output_keeps_sdk_validation_failure(self):
+        async def invalid_output() -> int:
+            return {"unexpected": "output"}
+
+        s.mcp.add_tool(invalid_output, name="invalid_output_probe")
+        self.addCleanup(s.mcp.remove_tool, "invalid_output_probe")
+        with self.assertRaises(UnexpectedToolError) as raised:
+            await s.mcp.call_tool("invalid_output_probe", {})
+        self.assertIsInstance(raised.exception.__cause__, ValidationError)
 
     async def test_selected_page_persists_for_subsequent_tools(self):
         await s.select_page(0)
