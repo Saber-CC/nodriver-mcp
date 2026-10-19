@@ -276,8 +276,14 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
   普通浏览不启用 Runtime/Debugger。真实 Chrome 验证受 Cookie 保护的外部映射、
   控制台/异步异常和关闭清理；stdio 验证内联映射定位，单测覆盖 section、未映射区、
   行列偏移、非法映射、异步父栈与缓存/退役行为。
-- [ ] ADV-05：`evaluate_script`、`list_pages` 和控制台工具支持扩展 ServiceWorker
-  的发现、指定执行和日志筛选。
+- [x] ADV-05：1.5.16 的 list_pages(include_service_workers=true) 发现运行中的
+  ServiceWorker（含扩展 ID/URL）；evaluate_script 和控制台 enable/disable/list/get
+  接受稳定 service_worker_id，与 page_id 互斥，执行时不接受元素 args，不访问 Page
+  或等待 DOM。复用官方 Runtime 执行、格式、文件源码、超时和输出；日志/异常按 worker
+  隔离，保持默认选页。连接替换、worker 停止或卸载时清理采集回调，不回退到页面。
+  参考 upstream script/console 的 worker 分支。真实临时 MV3 扩展通过官方 CDP
+  加载/卸载，验证发现、脚本、文件源码、异步异常、日志隔离、超时恢复及退役；
+  真实 stdio 客户端覆盖相同流程，故障注入断言 worker 调用不访问 Page/Emulation。
 - [ ] ADV-06：性能 trace 的 Web Vitals 摘要和深入分析。需要单独评估分析器，
   与基础录制、文件保存分开推进。
 

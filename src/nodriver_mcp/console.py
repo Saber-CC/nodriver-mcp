@@ -57,6 +57,8 @@ def format_message(message, *, include_stack_traces=True, detailed=True):
                 "source",
                 "location",
                 "execution_context_id",
+                "service_worker_id",
+                "extension_id",
                 "exception_id",
                 "revoked",
                 "revocation_reason",

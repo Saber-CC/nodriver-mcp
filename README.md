@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.15 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.16 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -280,6 +280,16 @@ positions. External maps load through Chrome with its proxy and cookies; inline
 and indexed maps are supported. Failed or slow maps retain raw positions and a
 diagnostic. `resolve_source_maps=false` skips resolution; `source_maps=false`
 disables owned Debugger collection. Ordinary browsing keeps these domains disabled.
+
+`list_pages(include_service_workers=true)` also lists running service workers
+and their stable `service_worker_id`, including extension IDs when applicable.
+Pass that ID to `evaluate_script` or console enable/disable/list/get tools.
+Worker calls exclude `page_id` and element arguments, leave the selected page
+unchanged and skip DOM/dialog handling. Script formats, source/output files and
+timeouts work as on pages. Logs and exceptions remain isolated by worker.
+Stopped workers disappear; rediscover after a restart rather than reusing an old ID.
+Loading unpacked extensions via CDP requires Chrome's
+`--enable-unsafe-extension-debugging` startup argument.
 
 ### Cookies, storage and sessions
 

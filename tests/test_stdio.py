@@ -114,7 +114,7 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_HEADLESS": "true",
                 "NODRIVER_PROXY": "",
                 "NODRIVER_EXTENSIONS": "[]",
-                "NODRIVER_BROWSER_ARGS": "[]",
+                "NODRIVER_BROWSER_ARGS": '["--enable-unsafe-extension-debugging"]',
             },
         )
 
@@ -385,6 +385,97 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         source_maps=False,
                         page_id=a,
                     )
+                    with tempfile.TemporaryDirectory() as extension_dir:
+                        extension = Path(extension_dir)
+                        (extension / "manifest.json").write_text(
+                            json.dumps(
+                                {
+                                    "manifest_version": 3,
+                                    "name": "MCP worker",
+                                    "version": "1.0",
+                                    "background": {"service_worker": "sw.js"},
+                                }
+                            )
+                        )
+                        (extension / "sw.js").write_text(
+                            "globalThis.workerClientValue='client-worker';chrome.runtime.onInstalled.addListener(()=>{});"
+                        )
+                        loaded = await call(
+                            session,
+                            "send_cdp_command",
+                            domain="Extensions",
+                            command="loadUnpacked",
+                            parameters={"path": str(extension)},
+                            scope="browser",
+                        )
+                        extension_id = loaded.strip('"')
+                        async with asyncio.timeout(10):
+                            while True:
+                                targets = await call(
+                                    session, "list_pages", include_service_workers=True
+                                )
+                                lines = [
+                                    line
+                                    for line in targets.splitlines()
+                                    if "service_worker_id" in line
+                                    and extension_id in line
+                                ]
+                                if lines:
+                                    worker_id = json.loads(lines[0].strip())[
+                                        "service_worker_id"
+                                    ]
+                                    break
+                                await asyncio.sleep(0.05)
+                        self.assertIn(
+                            "client-worker",
+                            await call(
+                                session,
+                                "evaluate_script",
+                                function="workerClientValue",
+                                service_worker_id=worker_id,
+                            ),
+                        )
+                        await call(
+                            session,
+                            "enable_console_collection",
+                            service_worker_id=worker_id,
+                        )
+                        await call(
+                            session,
+                            "evaluate_script",
+                            function="console.log('client-worker-log')",
+                            service_worker_id=worker_id,
+                        )
+                        self.assertIn(
+                            "client-worker-log",
+                            await call(
+                                session,
+                                "list_console_messages",
+                                service_worker_id=worker_id,
+                            ),
+                        )
+                        failure = await session.call_tool(
+                            "evaluate_script",
+                            {
+                                "function": "1",
+                                "service_worker_id": worker_id,
+                                "page_id": a,
+                            },
+                        )
+                        self.assertTrue(failure.is_error)
+                        await call(
+                            session,
+                            "disable_console_collection",
+                            service_worker_id=worker_id,
+                        )
+                        await call(
+                            session,
+                            "send_cdp_command",
+                            domain="Extensions",
+                            command="uninstall",
+                            parameters={"id": extension_id},
+                            scope="browser",
+                        )
                     with tempfile.TemporaryDirectory() as script_dir:
                         source = Path(script_dir) / "client 脚本.js"
                         source.write_text(

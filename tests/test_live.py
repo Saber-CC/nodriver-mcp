@@ -12,7 +12,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import nodriver as uc
 from mcp.server.mcpserver import Image
@@ -303,7 +303,9 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_EXTENSIONS": "[]",
                 "NODRIVER_ARTIFACTS_DIR": str(Path(self.directory.name) / "artifacts"),
                 "NODRIVER_PROXY": "",
-                "NODRIVER_BROWSER_ARGS": '["--enable-blink-features=WebMCPSupport,WebMCPTesting"]'
+                "NODRIVER_BROWSER_ARGS": '["--enable-unsafe-extension-debugging"]'
+                if "service_worker" in self._testMethodName
+                else '["--enable-blink-features=WebMCPSupport,WebMCPTesting"]'
                 if "webmcp" in self._testMethodName
                 else '["--site-per-process", "--disable-features="]'
                 if "cross_process" in self._testMethodName
@@ -1401,6 +1403,123 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                             tab, "JSON.parse(sessionStorage.getItem('batchEvents'))"
                         ),
                     )
+
+    async def test_extension_service_worker_discovery_scripts_logs_and_retirement(self):
+        extension = Path(self.directory.name) / "test-extension"
+        extension.mkdir()
+        (extension / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "manifest_version": 3,
+                    "name": "Worker integration",
+                    "version": "1.0",
+                    "background": {"service_worker": "sw.js"},
+                }
+            )
+        )
+        (extension / "sw.js").write_text(
+            "globalThis.workerValue='worker-ready';chrome.runtime.onInstalled.addListener(()=>console.log('worker-installed'));"
+        )
+        extension_id = await self.browser.send(
+            uc.cdp.extensions.load_unpacked(str(extension))
+        )
+        selected = s._selected_target_id
+        page = await s._page_tab()
+        async with asyncio.timeout(10):
+            while True:
+                listed = await s.list_pages(include_service_workers=True)
+                lines = [
+                    line
+                    for line in listed.splitlines()
+                    if "service_worker_id" in line and extension_id in line
+                ]
+                if lines:
+                    worker_id = json.loads(lines[0].strip())["service_worker_id"]
+                    break
+                await asyncio.sleep(0.05)
+        self.assertEqual(s._selected_target_id, selected)
+        with patch.object(
+            s,
+            "_perform_action",
+            AsyncMock(side_effect=AssertionError("worker must not observe DOM")),
+        ):
+            result = await s.evaluate_script(
+                "() => ({id:chrome.runtime.id,value:workerValue,document:typeof document})",
+                service_worker_id=worker_id,
+            )
+        values = json.loads(result.splitlines()[1])
+        self.assertEqual(
+            values,
+            {"id": extension_id, "value": "worker-ready", "document": "undefined"},
+        )
+        await s.enable_console_collection(service_worker_id=worker_id)
+        await s.enable_console_collection(page_id=selected)
+        await s.evaluate_script(
+            "console.log('worker-isolation-marker');setTimeout(()=>{throw new Error('worker-async-error')},10)",
+            format="script",
+            service_worker_id=worker_id,
+        )
+        await s.evaluate_script(
+            "console.log('page-isolation-marker')",
+            wait_for_stable=False,
+            page_id=selected,
+        )
+        async with asyncio.timeout(5):
+            while "worker-async-error" not in await s.list_console_messages(
+                service_worker_id=worker_id
+            ):
+                await asyncio.sleep(0.02)
+        worker_logs = await s.list_console_messages(
+            service_worker_id=worker_id, include_stack_traces=True
+        )
+        page_logs = await s.list_console_messages(page_id=selected)
+        self.assertIn("worker-isolation-marker", worker_logs)
+        self.assertNotIn("page-isolation-marker", worker_logs)
+        self.assertNotIn("worker-isolation-marker", page_logs)
+        msgid = int(
+            re.search(r"\[(\d+)\] \[log\] worker-isolation-marker", worker_logs).group(
+                1
+            )
+        )
+        detail = await s.get_console_message(msgid, service_worker_id=worker_id)
+        self.assertIn(extension_id, detail)
+        self.assertIn(worker_id, detail)
+        timeout = await s.evaluate_script(
+            "new Promise(()=>{})", service_worker_id=worker_id, timeout=50
+        )
+        self.assertIn("Status: timed_out", timeout)
+        self.assertIn(
+            "worker-ready",
+            await s.evaluate_script("workerValue", service_worker_id=worker_id),
+        )
+        source = Path(self.directory.name) / "worker-source.js"
+        source.write_text("() => chrome.runtime.id")
+        self.assertIn(
+            extension_id,
+            await s.evaluate_script(
+                source_path=str(source), service_worker_id=worker_id
+            ),
+        )
+        for options in ({"page_id": selected}, {"args": ["uid"]}):
+            with self.assertRaises(ValueError):
+                await s.evaluate_script("1", service_worker_id=worker_id, **options)
+        with self.assertRaises(ValueError):
+            await s.list_console_messages(page_id=selected, service_worker_id=worker_id)
+        worker = s._worker_targets.connections[worker_id]
+        await s.disable_console_collection(service_worker_id=worker_id)
+        self.assertFalse(worker.handlers.get(uc.cdp.runtime.ConsoleAPICalled))
+        self.assertTrue(page.handlers.get(uc.cdp.runtime.ConsoleAPICalled))
+        await s.enable_console_collection(service_worker_id=worker_id)
+        await self.browser.send(uc.cdp.extensions.uninstall(extension_id))
+        async with asyncio.timeout(5):
+            while extension_id in await s.list_pages(include_service_workers=True):
+                await asyncio.sleep(0.05)
+        self.assertFalse(worker.handlers.get(uc.cdp.runtime.ConsoleAPICalled))
+        self.assertIn(
+            "Unknown or stopped",
+            await s.evaluate_script("1", service_worker_id=worker_id),
+        )
+        self.assertEqual(s._selected_target_id, selected)
 
     async def test_source_maps_use_browser_credentials_and_symbolize_async_stacks(self):
         tab = await s._active_tab()

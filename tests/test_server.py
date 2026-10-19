@@ -43,6 +43,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         s._dialog_state.clear()
         s._emulation_overrides.clear()
+        s._worker_targets.clear()
         self.addCleanup(s._dialog_state.clear)
         self.a, self.b = FakeTab("a"), FakeTab("b")
         self.browser = SimpleNamespace(
@@ -95,6 +96,65 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         artifacts = patch.dict(os.environ, {"NODRIVER_ARTIFACTS_DIR": directory.name})
         artifacts.start()
         self.addCleanup(artifacts.stop)
+
+    async def test_worker_calls_never_resolve_a_page_and_reject_mixed_targets(self):
+        worker = FakeTab("worker")
+        worker.target.type_ = "service_worker"
+        worker.target.url = "chrome-extension://extension/sw.js"
+        worker.aclose = AsyncMock()
+        self.a.target.type_ = self.b.target.type_ = "page"
+        self.browser.targets = [self.a, self.b, worker]
+        commands = []
+
+        async def send(command):
+            packet = next(command)
+            commands.append(packet)
+            if packet["method"] == "Runtime.evaluate":
+                return uc.cdp.runtime.RemoteObject(type_="number", value=42), None
+
+        worker.send.side_effect = send
+        with patch.object(
+            s, "_page_tab", AsyncMock(side_effect=AssertionError("page lookup"))
+        ):
+            result = await s.evaluate_script(
+                "40+2", format="script", service_worker_id="worker"
+            )
+            self.assertEqual(json.loads(result.splitlines()[1]), 42)
+            await s.enable_console_collection(service_worker_id="worker")
+            event = uc.cdp.runtime.ConsoleAPICalled(
+                "log",
+                [uc.cdp.runtime.RemoteObject(type_="string", value="worker-log")],
+                uc.cdp.runtime.ExecutionContextId(1),
+                uc.cdp.runtime.Timestamp(1),
+                None,
+                None,
+            )
+            for callback in worker.handlers[uc.cdp.runtime.ConsoleAPICalled]:
+                callback(event)
+            self.assertIn(
+                "worker-log", await s.list_console_messages(service_worker_id="worker")
+            )
+            msgid = s._console_messages[-1]["msgid"]
+            self.assertIn(
+                "extension",
+                await s.get_console_message(msgid, service_worker_id="worker"),
+            )
+            await s.disable_console_collection(service_worker_id="worker")
+        self.assertFalse(
+            any(c["method"].startswith(("Page.", "Emulation.")) for c in commands)
+        )
+        self.assertEqual(s._selected_target_id, "a")
+        for name in (
+            "enable_console_collection",
+            "disable_console_collection",
+            "list_console_messages",
+            "get_console_message",
+        ):
+            kwargs = {"page_id": "a", "service_worker_id": "worker"}
+            if name == "get_console_message":
+                kwargs["msgid"] = msgid
+            with self.assertRaisesRegex(ValueError, "either page_id"):
+                await getattr(s, name)(**kwargs)
 
     async def test_source_validation_precedes_browser_resolution_even_for_explicit_pages(
         self,
