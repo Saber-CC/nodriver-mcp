@@ -31,6 +31,7 @@ from mcp.types import CallToolResult, InputRequiredResult
 from pydantic import StrictBool, ValidationError
 
 from .actions import ActionResult, ActionWaiter
+from .console import ConsoleCollector, format_message, format_stack
 from .forms import fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
@@ -320,7 +321,7 @@ _closing_page_ids: set[str] = set()
 _frame_connections: dict[tuple[str, str], uc.Tab] = {}
 _frame_loaders: dict[tuple[str, str], str] = {}
 _frame_discovery_locks: dict[str, asyncio.Lock] = {}
-_console_callbacks: dict[int, Any] = {}
+_console_callbacks: dict[int, ConsoleCollector] = {}
 _network_callbacks: dict[int, list[tuple[type, Any]]] = {}
 _uid_owners: dict[str, tuple[str, uc.Tab, str]] = {}
 _request_ids = itertools.count()
@@ -364,9 +365,9 @@ def _clear_collection_state(tab: uc.Tab) -> None:
     """Remove this connection's collectors before retiring its transport."""
     key = _tab_key(tab)
     _focused_pages.pop(key, None)
-    callback = _console_callbacks.pop(key, None)
-    if callback is not None:
-        tab.remove_handler(uc.cdp.runtime.ConsoleAPICalled, callback)
+    collector = _console_callbacks.pop(key, None)
+    if collector is not None:
+        collector.remove()
     _console_collection_enabled_tabs.discard(key)
     for event, callback in _network_callbacks.pop(key, []):
         tab.remove_handler(event, callback)
@@ -945,39 +946,29 @@ async def _enable_console_collection(tab: uc.Tab) -> bool:
     if key in _console_collection_enabled_tabs:
         return False
 
-    def on_console(event):
-        parts = [
-            str(a.value if a.value is not None else a.description or a.type_)
-            for a in event.args
-        ]
-        _console_messages.append(
-            {
-                "msgid": next(_message_ids),
-                "page_id": _page_key(tab),
-                "type": event.type_,
-                "text": " ".join(parts),
-                "timestamp": float(event.timestamp),
-            }
-        )
+    def collect(record):
+        record.update(msgid=next(_message_ids), page_id=_page_key(tab), connection=tab)
+        _console_messages.append(record)
         del _console_messages[:-1000]
 
-    tab.add_handler(uc.cdp.runtime.ConsoleAPICalled, on_console)
-    try:
-        await tab.send(uc.cdp.runtime.enable())
-    except BaseException:
-        tab.remove_handler(uc.cdp.runtime.ConsoleAPICalled, on_console)
-        raise
-    _console_callbacks[key] = on_console
+    def records():
+        return [
+            m for batch in _preserved_console_messages for m in batch
+        ] + _console_messages
+
+    collector = ConsoleCollector(tab, collect, records)
+    await collector.enable()
+    _console_callbacks[key] = collector
     _console_collection_enabled_tabs.add(key)
     return True
 
 
 async def _disable_console_collection(tab: uc.Tab) -> bool:
     key = _tab_key(tab)
-    callback = _console_callbacks.pop(key, None)
-    if callback is None:
+    collector = _console_callbacks.pop(key, None)
+    if collector is None:
         return False
-    tab.remove_handler(uc.cdp.runtime.ConsoleAPICalled, callback)
+    collector.remove()
     _console_collection_enabled_tabs.discard(key)
     if not any(
         callbacks
@@ -1842,8 +1833,13 @@ async def fill_form(
 
 
 @_page_tool()
-async def get_console_message(msgid: int, *, page_id: int | str | None = None) -> str:
-    """Get a stable message ID from list_console_messages on the selected page."""
+async def get_console_message(
+    msgid: int,
+    *,
+    include_stack_traces: bool = True,
+    page_id: int | str | None = None,
+) -> str:
+    """Get a console message or uncaught exception with source and stack metadata."""
     page_id = _page_key(await _page_tab())
     records = _console_messages + [
         m for batch in _preserved_console_messages for m in batch
@@ -1853,7 +1849,7 @@ async def get_console_message(msgid: int, *, page_id: int | str | None = None) -
     )
     if message is None:
         return f"Error: Unknown msgid {msgid} for this page."
-    return f"[{message['type']}] {message['text']} (timestamp: {message['timestamp']})"
+    return format_message(message, include_stack_traces=include_stack_traces)
 
 
 @_page_tool()
@@ -2002,9 +1998,10 @@ async def list_console_messages(
     types: list[str] | None = None,
     include_preserved_messages: bool = False,
     *,
+    include_stack_traces: bool = False,
     page_id: int | str | None = None,
 ) -> str:
-    """List stable console message IDs for the selected page, with optional filtering."""
+    """List console calls and uncaught JS exceptions, optionally including stacks."""
     tab = await _active_tab()
     if _tab_key(tab) not in _console_collection_enabled_tabs:
         return "Console collection is disabled. Call enable_console_collection first."
@@ -2021,9 +2018,15 @@ async def list_console_messages(
         if page_size < 1 or page_idx < 0:
             raise ValueError("page_size must be positive and page_idx nonnegative.")
         records = records[page_idx * page_size : (page_idx + 1) * page_size]
-    return f"Console messages ({len(records)} of {total}):\n" + "\n".join(
-        f"  [{m['msgid']}] [{m['type']}] {m['text'][:200]}" for m in records
-    )
+    lines = []
+    for message in records:
+        line = f"  [{message['msgid']}] [{message['type']}] {message['text'][:200]}"
+        if include_stack_traces:
+            stack = format_stack(message.get("stack_trace"))
+            if stack:
+                line += "\n" + stack
+        lines.append(line)
+    return f"Console messages ({len(records)} of {total}):\n" + "\n".join(lines)
 
 
 @_page_tool()

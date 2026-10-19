@@ -18,7 +18,7 @@
 - [x] OPT-01：统一交互后的导航与 DOM 稳定等待。1.5.1。
 - [x] REQ-01：补齐表单控件的指定状态设置。1.5.2。
 - [x] REQ-02：补齐多文件上传和文件选择器处理。1.5.3。
-- [ ] REQ-03：补齐未捕获 JavaScript 异常和基础调用栈。
+- [x] REQ-03：补齐未捕获 JavaScript 异常和基础调用栈。1.5.5。
 - [ ] REQ-04：补齐脚本执行时的弹窗处理策略。
 - [ ] OPT-02：优化长文本输入和批量表单填充。
 - [ ] OPT-03：优化脚本超时和大结果输出。
@@ -94,6 +94,14 @@ node 定位输入框，用官方 DOM 命令设置文件。按页面串行接管�
 - 正确处理 iframe 所属连接，且在成功、失败、超时时移除临时监听器。
 
 ### REQ-03：异常与调用栈
+
+已完成于 1.5.5。参考 `chrome-devtools-mcp/src/collectors/PageCollector.ts`
+的 `Runtime.exceptionThrown` 与 `src/formatters/ConsoleFormatter.ts`，
+将未捕获异常和 Promise 拒绝作为 error 消息采集；保存来源、脚本位置、上下文和
+原生调用栈，异常之后被处理时保留撤销标记。列表新增 `include_stack_traces`，
+详情默认展示堆栈并可关闭。仍须显式开启 Runtime 采集，所有新增回调跟随连接清理。
+真实 Chrome 覆盖异步异常、Promise 拒绝、来源和行列号、导航后保留及禁用清理；
+iframe 往返重建测试覆盖异常采集恢复，stdio 客户端验证新参数与详情。
 
 涉及 `list_console_messages`、`get_console_message`。当前主要收集 `console.*`，
 需要接入未捕获 JavaScript 异常，保留基础堆栈、脚本 URL、行号和列号。

@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.4 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.5 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -226,6 +226,11 @@ arguments are not exposed by the native helper.
 
 Console collection is opt-in and does not enable `Runtime` during ordinary
 browsing. Explicit console/event tools can enable it when needed.
+Once enabled, it captures `console.*`, uncaught JavaScript errors and unhandled
+Promise rejections. `list_console_messages(include_stack_traces=true)` includes
+native stacks; `get_console_message` shows stack and source/context metadata by
+default. Disabling or retiring a connection removes all managed console/error
+callbacks. Full source-map symbolization is tracked separately in the roadmap.
 
 ### Cookies, storage and sessions
 
