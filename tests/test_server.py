@@ -585,12 +585,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await s._tab_for_uid("old")
 
     async def test_fill_form_preserves_failure(self):
-        with patch.object(
-            s, "fill", AsyncMock(return_value="Error filling uid=missing: stale")
+        resolver = AsyncMock(side_effect=ValueError("stale uid"))
+        with (
+            patch.object(s, "_discover_frames", AsyncMock(return_value=[])),
+            patch.object(s, "_element_for_uid", resolver),
         ):
-            result = await s.fill_form([{"uid": "missing", "value": "x"}])
+            result = await s.fill_form(
+                [{"uid": "missing", "value": "x"}, {"uid": "later", "value": "y"}]
+            )
         self.assertIn("Error", result)
         self.assertNotIn(": filled", result)
+        self.assertIn("Skipped 1", result)
+        self.assertEqual(resolver.await_count, 1)
+
+    async def test_fill_form_reports_failure_on_a_repeated_uid_as_a_new_entry(self):
+        element = SimpleNamespace(tab=self.a)
+        filler = AsyncMock(side_effect=[None, ValueError("second assignment rejected")])
+        with (
+            patch.object(s, "_discover_frames", AsyncMock(return_value=[])),
+            patch.object(s, "_element_for_uid", AsyncMock(return_value=element)),
+            patch.object(s, "_fill_element", filler),
+        ):
+            result = await s.fill_form(
+                [
+                    {"uid": "same", "value": "first"},
+                    {"uid": "same", "value": "second"},
+                    {"uid": "later", "value": "skip"},
+                ]
+            )
+        self.assertIn("Completed 1 of 3", result)
+        self.assertIn("second assignment rejected", result)
+        self.assertIn("Skipped 1", result)
+        self.assertEqual(filler.await_count, 2)
 
     async def test_element_script_unpacks_result_and_reports_js_errors(self):
         s._uid_owners["el"] = ("a", self.a, "")

@@ -33,7 +33,7 @@ from pydantic import StrictBool, ValidationError
 from .actions import ActionResult, ActionWaiter
 from .console import ConsoleCollector, format_message, format_stack
 from .dialogs import DialogInterrupted, DialogRegistry
-from .forms import fill_toggle
+from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .protocol import json_value
@@ -574,10 +574,10 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
     return result.value
 
 
-async def _tab_for_uid(uid: str) -> uc.Tab:
+async def _tab_for_uid(uid: str, *, refresh: bool = True) -> uc.Tab:
     owner = _uid_owners.get(uid)
     page = await _page_tab()
-    if owner is not None and owner[0] == str(page.target_id) and owner[2]:
+    if refresh and owner is not None and owner[0] == str(page.target_id) and owner[2]:
         await _discover_frames(page)
         owner = _uid_owners.get(uid)
     if owner is None or owner[0] != str(page.target_id):
@@ -587,8 +587,8 @@ async def _tab_for_uid(uid: str) -> uc.Tab:
     return owner[1]
 
 
-async def _element_for_uid(uid: str) -> uc.Element:
-    tab = await _tab_for_uid(uid)
+async def _element_for_uid(uid: str, *, refresh: bool = True) -> uc.Element:
+    tab = await _tab_for_uid(uid, refresh=refresh)
     node = await tab.send(
         uc.cdp.dom.describe_node(
             backend_node_id=uc.cdp.dom.BackendNodeId(_uid_to_backend_node_id[uid]),
@@ -1854,37 +1854,14 @@ async def _fill_element(element, value: str | bool, uid: str):
         x, y = await _get_box_model(element.tab, uid)
         await _dispatch_mouse_click(element.tab, x, y, False)
 
-    if await fill_toggle(element, value, click_toggle):
+    state = await control_state(element)
+    if not state["connected"]:
+        raise ValueError("Form control is detached from the current document.")
+    if await fill_toggle(element, value, click_toggle, initial=state):
         return
     if not isinstance(value, str):
         raise ValueError("Text inputs and select controls require a string value.")
-    tag = await element.apply("(el) => el.tagName.toLowerCase()")
-    if tag == "select":
-        await element.apply(
-            "(el) => { el.value = "
-            + json.dumps(value)
-            + "; el.dispatchEvent(new Event('input', {bubbles:true})); "
-            "el.dispatchEvent(new Event('change', {bubbles:true})); }"
-        )
-    elif value:
-        await element.clear_input()
-        await element.send_keys(value)
-    else:
-        # Native clear_input does not emit input/change; send_keys("") also
-        # emits nothing. Use the prototype setter to notify controlled inputs
-        # whose own value setter tracks programmatic assignments.
-        await element.apply(
-            """(el) => {
-                el.focus();
-                const setter = Object.getOwnPropertyDescriptor(
-                    Object.getPrototypeOf(el), 'value'
-                )?.set;
-                if (setter) setter.call(el, '');
-                else el.value = '';
-                el.dispatchEvent(new Event('input', {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-            }"""
-        )
+    await fill_text(element, value, state)
 
 
 @_page_tool()
@@ -1914,25 +1891,90 @@ async def fill_form(
     *,
     page_id: int | str | None = None,
 ) -> str:
-    """Fill multiple {uid, value} entries and report individual failures accurately."""
-    tab = await _active_tab()
+    """Fill a batch with one frame refresh/wait; stop on its first interruption.
 
-    async def apply_entries():
-        results = []
-        for entry in elements:
-            uid = entry.get("uid", "")
-            result = await fill(uid, entry.get("value", ""))
-            results.append(
-                f"  uid={uid}: {result if result.startswith('Error') else 'filled'}"
-            )
-        return results
+    Report completed fields, the failed/interrupted UID and skipped entries.
+    """
+    if not elements:
+        return "Form fill results:\nCompleted 0 of 0 fields."
+    lines, completed = [], []
+    current_uid, failed_uid, stop_reason = None, None, None
+    current_completed = False
 
-    results = await _perform_action(tab, apply_entries)
-    return (
-        "Form fill results:\n"
-        + "\n".join(results)
-        + await _maybe_snapshot(include_snapshot)
+    def failed(reason):
+        nonlocal failed_uid, stop_reason
+        stop_reason = f"Error: {reason}"
+        if current_uid is not None and not current_completed and failed_uid is None:
+            failed_uid = current_uid
+            lines.append(f"  uid={current_uid}: Error: {reason}")
+
+    try:
+        page = await _page_tab()
+        await _discover_frames(page)
+        selected = _selected_frame_id(page)
+        tab = (
+            _frame_connections.get((str(page.target_id), selected))
+            if selected
+            else page
+        )
+        if tab is None:
+            raise ValueError("Selected frame no longer exists.")
+
+        async def apply_entries():
+            nonlocal current_uid, stop_reason, current_completed
+            call = _page_call.get()
+            if call is not None and call.waiter is not None:
+                call.waiter.frame_ids.update(
+                    owner[2]
+                    for entry in elements
+                    if (owner := _uid_owners.get(entry.get("uid", "")))
+                    and owner[0] == str(page.target_id)
+                    and owner[2]
+                )
+            for entry in elements:
+                current_uid = entry.get("uid", "")
+                current_completed = False
+                try:
+                    if not isinstance(current_uid, str) or not current_uid:
+                        raise ValueError("Each form entry requires a nonempty uid.")
+                    element = await _element_for_uid(current_uid, refresh=False)
+                    await _fill_element(element, entry.get("value", ""), current_uid)
+                    completed.append(current_uid)
+                    current_completed = True
+                    lines.append(f"  uid={current_uid}: filled")
+                    if (
+                        call is not None
+                        and call.waiter is not None
+                        and call.waiter.navigating.is_set()
+                    ):
+                        stop_reason = f"Navigation started after uid={current_uid}."
+                        return
+                    dialog = _dialog_state.current.get(str(page.target_id))
+                    if dialog is not None:
+                        raise DialogInterrupted(dialog)
+                except Exception as exc:
+                    failed(exc)
+                    return
+            current_uid = None
+
+        await _perform_action(tab, apply_entries)
+    except Exception as exc:
+        failed(exc)
+    skipped = len(elements) - len(completed) - (1 if failed_uid is not None else 0)
+    result = (
+        f"Form fill results:\nCompleted {len(completed)} of {len(elements)} fields.\n"
+        + "\n".join(lines)
     )
+    if stop_reason:
+        result += (
+            f"\nStopped: {stop_reason}\nSkipped {max(0, skipped)} remaining fields."
+        )
+    if include_snapshot:
+        try:
+            result += await _maybe_snapshot(True)
+        except Exception as exc:
+            result += f"\nSnapshot unavailable: {exc}"
+    return result
 
 
 @_page_tool()
