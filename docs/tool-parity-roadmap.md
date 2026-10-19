@@ -16,7 +16,7 @@
 - [x] FIX-02：修复 `click_at` 坐标双击，共用 UID 点击的可信事件实现。1.4.3。
 - [x] ADV-01：页面工具支持每次调用的稳定 `page_id` 和多页面并发。1.5.0。
 - [x] OPT-01：统一交互后的导航与 DOM 稳定等待。1.5.1。
-- [ ] REQ-01：补齐表单控件的指定状态设置。
+- [x] REQ-01：补齐表单控件的指定状态设置。1.5.2。
 - [ ] REQ-02：补齐多文件上传和文件选择器处理。
 - [ ] REQ-03：补齐未捕获 JavaScript 异常和基础调用栈。
 - [ ] REQ-04：补齐脚本执行时的弹窗处理策略。
@@ -55,6 +55,14 @@ Enter 和 `type_text(submit_key=...)`。故障注入覆盖发送失败、释放�
 ## 必须补齐的缺失能力
 
 ### REQ-01：表单控件状态
+
+已完成于 1.5.2。参考 `chrome-devtools-mcp/src/tools/input.ts` 的
+`fillFormElements` 与 toggle 分支，增加布尔值及兼容的 `"true"`/`"false"`。
+先读取实际状态，已满足时不重复点击；通过可信 CDP 点击改变状态，并核验
+原生 checked/indeterminate 或 aria-checked。选中的 radio 不允许直接取消，
+禁用、只读、状态未变化及非法输入明确失败。真实 Chrome 覆盖原生/ARIA 控件、
+幂等操作、混合状态、radio 分组、批量填充及同进程/跨进程 iframe；
+真实 stdio 客户端覆盖布尔输入与数字输入拒绝。
 
 涉及 `fill`、`fill_form`。增加原生 checkbox、radio，以及 ARIA checkbox、
 radio、switch 的指定状态设置。

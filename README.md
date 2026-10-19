@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.1 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.2 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -137,6 +137,12 @@ before the first real navigation request.
 a double click.
 Clearing an input with `fill(uid, "")` dispatches `input` and `change` events so
 the page's form state follows the displayed value.
+`fill` and `fill_form` also set native checkbox/radio and ARIA checkbox/radio/switch
+states. Use booleans or the strings `"true"`/`"false"`; setting the current state
+again emits no extra click. Changes use trusted mouse events and verify the
+result. Selected radios must be changed by selecting another option. Disabled,
+read-only or unresponsive controls report a clear failure. Text/select values
+continue to require strings.
 `press_key` supplies modifier flags and physical key codes. Literal plus keys
 work as `"+"`, `"Control++"` or `"Control+Shift++"`; Shift applies to letters and
 punctuation. Invalid shortcuts fail before input is sent, and attempted keys

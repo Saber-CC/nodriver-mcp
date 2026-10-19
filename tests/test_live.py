@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import nodriver as uc
 from mcp.server.mcpserver import Image
+from mcp.server.mcpserver.exceptions import ToolError
 from PIL import Image as PillowImage
 
 from nodriver_mcp import server as s
@@ -104,6 +105,36 @@ class Handler(BaseHTTPRequestHandler):
                 <button onclick="window.open('/actions/destination')">Open popup</button>
                 <button onclick="window.busy=setInterval(() => result.textContent=String(Date.now()), 20)">Busy DOM</button>
                 <button onclick="alert('manual dialog probe')">Open dialog</button>""",
+                "text/html",
+            )
+        elif self.path.startswith("/toggle-child"):
+            data, content_type = (
+                b"<input type='checkbox' aria-label='Frame toggle'>",
+                "text/html",
+            )
+        elif self.path.startswith("/toggles"):
+            data, content_type = (
+                b"""<title>Toggle controls</title>
+                <input id='native' type='checkbox' aria-label='Native checkbox'>
+                <input id='mixed' type='checkbox' aria-label='Mixed checkbox'>
+                <input id='disabled' type='checkbox' disabled aria-label='Disabled checkbox'>
+                <input id='radioA' type='radio' name='native-radio' aria-label='Native radio A'>
+                <input id='radioB' type='radio' name='native-radio' aria-label='Native radio B'>
+                <div id='aria' role='checkbox' tabindex='0' aria-label='ARIA checkbox' aria-checked='false'
+                  onclick="this.setAttribute('aria-checked',this.getAttribute('aria-checked')==='true'?'false':'true')">custom</div>
+                <div id='switch' role='switch' tabindex='0' aria-label='ARIA switch' aria-checked='false'
+                  onclick="setTimeout(() => this.setAttribute('aria-checked',this.getAttribute('aria-checked')==='true'?'false':'true'),30)">switch</div>
+                <div id='stuck' role='checkbox' tabindex='0' aria-label='Stuck checkbox' aria-checked='false'>stuck</div>
+                <div id='ariaRadioA' role='radio' tabindex='0' aria-label='ARIA radio A' aria-checked='false'
+                  onclick="ariaRadioA.setAttribute('aria-checked','true');ariaRadioB.setAttribute('aria-checked','false')">A</div>
+                <div id='ariaRadioB' role='radio' tabindex='0' aria-label='ARIA radio B' aria-checked='false'
+                  onclick="ariaRadioA.setAttribute('aria-checked','false');ariaRadioB.setAttribute('aria-checked','true')">B</div>
+                <iframe src='/toggle-child'></iframe>
+                <script>
+                mixed.checked=true; mixed.indeterminate=true;
+                window.toggleClicks=[];
+                document.addEventListener('click', e => toggleClicks.push({id:e.target.id,trusted:e.isTrusted}));
+                </script>""",
                 "text/html",
             )
         else:
@@ -582,6 +613,103 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {event: len(page.handlers.get(event, [])) for event in events}, counts
         )
+
+    async def test_toggle_fill_is_idempotent_trusted_and_checks_actual_state(self):
+        await s.new_page(self.url + "toggles")
+        tab = await s._active_tab()
+        snapshot = await s.take_snapshot()
+        uids = {
+            name: uid
+            for uid, _, name in re.findall(
+                r'uid=(\S+) (checkbox|radio|switch) "([^"]+)"', snapshot
+            )
+        }
+        for name, element_id in (
+            ("Native checkbox", "native"),
+            ("ARIA checkbox", "aria"),
+            ("ARIA switch", "switch"),
+        ):
+            with self.subTest(control=name):
+                self.assertNotIn("Error", await s.fill(uids[name], True))
+                clicks = len(await s._evaluate(tab, "window.toggleClicks"))
+                self.assertNotIn("Error", await s.fill(uids[name], "true"))
+                self.assertEqual(
+                    len(await s._evaluate(tab, "window.toggleClicks")), clicks
+                )
+                self.assertNotIn("Error", await s.fill(uids[name], "false"))
+                state = await s._evaluate(
+                    tab,
+                    f"document.getElementById('{element_id}').checked"
+                    if element_id == "native"
+                    else f"document.getElementById('{element_id}').getAttribute('aria-checked')",
+                )
+                self.assertIn(state, (False, "false"))
+        self.assertNotIn("Error", await s.fill(uids["Mixed checkbox"], True))
+        self.assertEqual(
+            await s._evaluate(tab, "[mixed.checked,mixed.indeterminate]"), [True, False]
+        )
+        self.assertIn("disabled", await s.fill(uids["Disabled checkbox"], True))
+        self.assertNotIn("Error", await s.fill(uids["Disabled checkbox"], False))
+        self.assertIn("did not reach", await s.fill(uids["Stuck checkbox"], True))
+        self.assertIn("boolean", await s.fill(uids["Native checkbox"], "yes"))
+        self.assertTrue(
+            all(
+                event["trusted"]
+                for event in await s._evaluate(tab, "window.toggleClicks")
+            )
+        )
+        with self.assertRaises(ToolError):
+            await s.mcp.call_tool("fill", {"uid": uids["Native checkbox"], "value": 1})
+
+    async def test_toggle_fill_form_and_radio_groups_preserve_selection_rules(self):
+        await s.new_page(self.url + "toggles")
+        tab = await s._active_tab()
+        snapshot = await s.take_snapshot()
+        uids = {
+            name: uid
+            for uid, _, name in re.findall(
+                r'uid=(\S+) (checkbox|radio|switch) "([^"]+)"', snapshot
+            )
+        }
+        result = await s.fill_form(
+            [
+                {"uid": uids["Native checkbox"], "value": True},
+                {"uid": uids["ARIA switch"], "value": "true"},
+            ],
+            include_snapshot=True,
+        )
+        self.assertNotIn("Error", result)
+        for label, prefix in (("Native", "radio"), ("ARIA", "ariaRadio")):
+            self.assertNotIn("Error", await s.fill(uids[label + " radio A"], "true"))
+            self.assertNotIn("Error", await s.fill(uids[label + " radio B"], True))
+            self.assertNotIn("Error", await s.fill(uids[label + " radio A"], False))
+            self.assertIn(
+                "Cannot uncheck", await s.fill(uids[label + " radio B"], False)
+            )
+            expression = (
+                f"[document.getElementById('{prefix}A').checked,document.getElementById('{prefix}B').checked]"
+                if label == "Native"
+                else "[ariaRadioA.getAttribute('aria-checked'),ariaRadioB.getAttribute('aria-checked')]"
+            )
+            self.assertEqual(
+                await s._evaluate(tab, expression),
+                [False, True] if label == "Native" else ["false", "true"],
+            )
+
+    async def test_cross_process_toggle_fill_uses_its_frame_connection(self):
+        await s.new_page(self.url + "toggles")
+        page = await s._page_tab()
+        frames = await self.tool("list_frames")
+        child = next(frame["frame_id"] for frame in frames if frame["parent_id"])
+        await self.tool("select_frame", frame_id=child)
+        found = await self.tool("find_elements", selector="input")
+        self.assertNotIn("Error", await s.fill(found[0]["uid"], True))
+        url = f"http://localhost:{self.http.server_port}/toggle-child"
+        await self.navigate_frame(page, child, url, separate=True)
+        found = await self.tool("find_elements", selector="input")
+        self.assertNotIn("Error", await s.fill(found[0]["uid"], True))
+        element = await s._element_for_uid(found[0]["uid"])
+        self.assertIs(await element.apply("el => el.checked"), True)
 
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")

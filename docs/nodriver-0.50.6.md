@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 85 regression/integration tests: **84 passed, 1 skipped** (MCP version 1.5.1).
+- 92 regression/integration tests: **91 passed, 1 skipped** (MCP version 1.5.2).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -158,6 +158,11 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   updates, click navigation, popup IDs, busy-DOM time limits and dialog
   interruption/cleanup. Script callers may skip DOM settling for read-only work.
   Cancellation, setup failure and stalled-observer cleanup passed fault injection.
+- Checkbox/radio/ARIA switch state setting passed native and custom-control
+  checks: idempotence, trusted clicks, indeterminate state, delayed ARIA updates,
+  radio groups, disabled/unresponsive controls and invalid values. Same-process
+  and site-isolated iframe controls passed. A real MCP client accepted boolean
+  values and rejected numbers without coercing them into checked states.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
