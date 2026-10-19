@@ -39,7 +39,12 @@ from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .network import NetworkCollector, request_details
 from .screenshots import screenshot_clip
-from .scripts import execute_script, script_error as _script_error, script_result
+from .scripts import (
+    execute_script,
+    prepare_script_call,
+    script_error as _script_error,
+    script_result,
+)
 from .traces import TRACE_CATEGORIES, save_trace
 from .uploads import FileUploads, upload_paths
 
@@ -191,7 +196,7 @@ class _PageCall:
 _page_call: ContextVar[_PageCall | None] = ContextVar("page_call", default=None)
 
 
-def _page_tool(**options):
+def _page_tool(*, prepare=None, **options):
     """Publish an explicit page_id parameter and bind nested work to one page."""
 
     def register(fn):
@@ -199,7 +204,11 @@ def _page_tool(**options):
 
         @wraps(fn)
         async def routed(*args, **kwargs):
-            arguments = signature.bind(*args, **kwargs).arguments
+            bound = signature.bind(*args, **kwargs)
+            arguments = bound.arguments
+            if prepare is not None:
+                await prepare(arguments)
+                args, kwargs = bound.args, bound.kwargs
             requested = arguments.get("page_id")
             if fn.__name__ == "close_page" and requested == -1:
                 requested = None  # Legacy spelling for the selected page.
@@ -1769,9 +1778,9 @@ async def _evaluate_script_value(
     )
 
 
-@_page_tool()
+@_page_tool(prepare=prepare_script_call)
 async def evaluate_script(
-    function: str,
+    function: str | None = None,
     args: list[str] | None = None,
     *,
     wait_for_stable: bool = True,
@@ -1779,6 +1788,7 @@ async def evaluate_script(
     prompt_text: str = "",
     timeout: int = 30000,
     format: Literal["auto", "function", "script"] = "auto",
+    source_path: str = "",
     file_path: str = "",
     max_output_chars: int = 20000,
     page_id: int | str | None = None,
@@ -1789,6 +1799,8 @@ async def evaluate_script(
     dialog_action is accept (default), dismiss, or manual; prompt_text supplies
     accepted prompt content. timeout bounds execution in milliseconds; 0 disables it.
     Results report completed, interrupted, failed, or timed_out.
+    Provide exactly one of function (inline) or source_path (local UTF-8 file).
+    Paths may be relative, absolute or file: URLs. Source errors fail before page selection.
     format=auto invokes a function result or evaluates an expression/script once;
     function/script choose explicitly. file_path saves complete JSON. Oversized
     inline output is saved automatically; max_output_chars bounds its preview.

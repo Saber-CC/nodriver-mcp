@@ -3,7 +3,10 @@
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 from uuid import uuid4
 
 import nodriver as uc
@@ -12,6 +15,29 @@ from .artifacts import artifact_path
 from .protocol import json_value
 
 logger = logging.getLogger(__name__)
+
+
+async def prepare_script_call(arguments):
+    """Resolve exactly one source before selecting or launching any browser page."""
+    inline, source_path = arguments.get("function"), arguments.get("source_path", "")
+    if (inline is not None) == bool(source_path):
+        raise ValueError("Specify exactly one of function or source_path.")
+    if source_path:
+        local = source_path
+        if source_path.startswith("file:"):
+            parsed = urlsplit(source_path)
+            if parsed.netloc not in {"", "localhost"} and os.name != "nt":
+                raise ValueError("source_path must refer to a local file.")
+            local = url2pathname(parsed.path)
+            if parsed.netloc not in {"", "localhost"}:
+                local = "//" + parsed.netloc + local
+        path = Path(local).expanduser().resolve()
+        try:
+            inline = await asyncio.to_thread(path.read_text, encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Cannot read UTF-8 script from {path}: {exc}") from exc
+    arguments["function"] = inline
+    arguments["source_path"] = ""
 
 
 def script_error(error) -> Exception:

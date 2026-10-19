@@ -1369,6 +1369,44 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
 
+    async def test_script_files_support_formats_elements_and_output_paths(self):
+        source = Path(self.directory.name) / "源 文件.js"
+        source.write_text('() => "文件🙂"', encoding="utf-8-sig")
+        self.assertIn(
+            "文件🙂",
+            await s.evaluate_script(source_path=str(source), wait_for_stable=False),
+        )
+        source.write_text(
+            "globalThis.fileRuns=(globalThis.fileRuns||0)+1;fileRuns", encoding="utf-8"
+        )
+        result = await s.evaluate_script(
+            source_path=source.as_uri(), format="script", wait_for_stable=False
+        )
+        self.assertEqual(json.loads(result.splitlines()[1]), 1)
+        uid = re.search(
+            r'uid=(\S+) textbox "Main input"', await s.take_snapshot()
+        ).group(1)
+        source.write_text("(el) => el.tagName", encoding="utf-8")
+        self.assertIn(
+            "INPUT",
+            await s.evaluate_script(
+                source_path=str(source),
+                args=[uid],
+                format="function",
+                wait_for_stable=False,
+            ),
+        )
+        output = Path(self.directory.name) / "输出.json"
+        await s.evaluate_script(
+            source_path=str(source),
+            args=[uid],
+            file_path=str(output),
+            wait_for_stable=False,
+        )
+        self.assertEqual(json.loads(output.read_text()), "INPUT")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            await s.evaluate_script("1", source_path=str(source))
+
     async def test_script_formats_execute_functions_iifes_and_statements_once(self):
         await s.evaluate_script(
             "window.value=9", format="script", wait_for_stable=False

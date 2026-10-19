@@ -96,6 +96,20 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         artifacts.start()
         self.addCleanup(artifacts.stop)
 
+    async def test_source_validation_precedes_browser_resolution_even_for_explicit_pages(
+        self,
+    ):
+        get_browser = s._get_browser
+        get_browser.reset_mock()
+        for arguments in (
+            {"page_id": "unknown"},
+            {"function": "1", "source_path": "conflict.js", "page_id": "a"},
+            {"source_path": "/missing/script.js", "page_id": "a"},
+        ):
+            with self.assertRaises(ValueError):
+                await s.evaluate_script(**arguments)
+        get_browser.assert_not_awaited()
+
     async def test_tool_timeouts_keep_details_and_unexpected_failures_stay_generic(
         self,
     ):

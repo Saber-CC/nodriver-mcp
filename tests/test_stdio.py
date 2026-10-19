@@ -339,6 +339,30 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Preview truncated", saved)
                         with open(output, encoding="utf-8") as file:
                             self.assertEqual(json.load(file)["rows"][-1], 499)
+                    with tempfile.TemporaryDirectory() as script_dir:
+                        source = Path(script_dir) / "client 脚本.js"
+                        source.write_text(
+                            '() => "source-file-client"', encoding="utf-8"
+                        )
+                        self.assertIn(
+                            "source-file-client",
+                            await call(
+                                session,
+                                "evaluate_script",
+                                source_path=str(source),
+                                wait_for_stable=False,
+                                page_id=a,
+                            ),
+                        )
+                        failure = await session.call_tool(
+                            "evaluate_script",
+                            {"function": "1", "source_path": str(source), "page_id": a},
+                        )
+                        self.assertTrue(failure.is_error)
+                        self.assertIn(
+                            "exactly one",
+                            "".join(getattr(c, "text", "") for c in failure.content),
+                        )
                     await call(
                         session,
                         "emulate",
