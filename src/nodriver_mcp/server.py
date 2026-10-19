@@ -27,6 +27,7 @@ from mcp.types import CallToolResult, InputRequiredResult
 from pydantic import ValidationError
 
 from .launch import LaunchOptions, ProfileLease
+from .keyboard import dispatch_shortcut, parse_shortcut
 from .protocol import json_value
 
 logging.basicConfig(
@@ -667,9 +668,6 @@ _COLLAPSE_ROLES: set[str] = {
     "tooltip",
 }
 
-# Modifier keys for press_key combo support
-_MODIFIER_KEYS = {"Control", "Shift", "Alt", "Meta"}
-
 
 def _preserve_on_navigation(tab: uc.Tab) -> None:
     page_id = _page_key(tab)
@@ -843,6 +841,21 @@ async def _get_box_model(tab: uc.Tab, uid: str) -> tuple[float, float]:
     model = await connection.send(uc.cdp.dom.get_box_model(backend_node_id=backend))
     quad = model.content
     return sum(quad[::2]) / 4, sum(quad[1::2]) / 4
+
+
+async def _dispatch_mouse_click(tab: uc.Tab, x: float, y: float, double: bool) -> None:
+    for count in range(1, 3 if double else 2):
+        for event in ("mousePressed", "mouseReleased"):
+            await tab.send(
+                uc.cdp.input_.dispatch_mouse_event(
+                    event,
+                    x=x,
+                    y=y,
+                    button=uc.cdp.input_.MouseButton.LEFT,
+                    buttons=1 if event == "mousePressed" else 0,
+                    click_count=count,
+                )
+            )
 
 
 async def _maybe_snapshot(include_snapshot: bool) -> str:
@@ -1296,18 +1309,7 @@ async def click(
     try:
         connection = await _tab_for_uid(uid)
         x, y = await _get_box_model(connection, uid)
-        for count in range(1, 3 if dbl_click else 2):
-            for event in ("mousePressed", "mouseReleased"):
-                await connection.send(
-                    uc.cdp.input_.dispatch_mouse_event(
-                        event,
-                        x=x,
-                        y=y,
-                        button=uc.cdp.input_.MouseButton.LEFT,
-                        buttons=1 if event == "mousePressed" else 0,
-                        click_count=count,
-                    )
-                )
+        await _dispatch_mouse_click(connection, x, y, dbl_click)
         return f"Clicked uid={uid}" + await _maybe_snapshot(include_snapshot)
     except Exception as exc:
         return f"Error clicking uid={uid}: {exc}"
@@ -1326,9 +1328,7 @@ async def click_at(
         include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
-    await tab.mouse_click(x, y)
-    if dbl_click:
-        await tab.mouse_click(x, y)
+    await _dispatch_mouse_click(tab, x, y, dbl_click)
     result = f"Clicked at ({x}, {y})"
     result += await _maybe_snapshot(include_snapshot)
     return result
@@ -1970,32 +1970,13 @@ async def press_key(key: str, include_snapshot: bool = False) -> str:
     """Press a key or key combination.
 
     Args:
-        key: A key or combination (e.g. "Enter", "Control+A", "Control+Shift+R").
+        key: A key or combination (e.g. "Enter", "Control+A", "Control++", "Control+Shift+R").
             Modifiers: Control, Shift, Alt, Meta.
         include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
+    tokens = parse_shortcut(key)
     tab = await _active_tab()
-    import nodriver.cdp.input_ as cdp_input
-
-    parts = key.split("+")
-    modifiers = []
-    target_key = parts[-1]
-
-    for p in parts[:-1]:
-        if p in _MODIFIER_KEYS:
-            modifiers.append(p)
-
-    # Press modifiers down
-    for mod in modifiers:
-        await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=mod))
-
-    # Press the target key
-    await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=target_key))
-    await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=target_key))
-
-    # Release modifiers in reverse
-    for mod in reversed(modifiers):
-        await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=mod))
+    await dispatch_shortcut(tab, tokens)
 
     result = f"Pressed {key}"
     result += await _maybe_snapshot(include_snapshot)
