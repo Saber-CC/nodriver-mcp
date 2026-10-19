@@ -2424,7 +2424,8 @@ async def performance_start_trace(
                     )
                 except BaseException:
                     logger.debug("Trace cleanup failed", exc_info=True)
-            _tracing_active, _trace_tab, _trace_metadata = False, None, {}
+            if _trace_metadata is state:
+                _tracing_active, _trace_tab, _trace_metadata = False, None, {}
         raise
 
 
