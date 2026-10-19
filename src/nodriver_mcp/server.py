@@ -36,7 +36,7 @@ from .dialogs import DialogInterrupted, DialogRegistry
 from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
-from .protocol import json_value
+from .network import NetworkCollector, request_details
 from .scripts import execute_script, script_error as _script_error, script_result
 from .uploads import FileUploads, upload_paths
 
@@ -364,7 +364,7 @@ _frame_connections: dict[tuple[str, str], uc.Tab] = {}
 _frame_loaders: dict[tuple[str, str], str] = {}
 _frame_discovery_locks: dict[str, asyncio.Lock] = {}
 _console_callbacks: dict[int, ConsoleCollector] = {}
-_network_callbacks: dict[int, list[tuple[type, Any]]] = {}
+_network_callbacks: dict[int, NetworkCollector] = {}
 _uid_owners: dict[str, tuple[str, uc.Tab, str]] = {}
 _request_ids = itertools.count()
 _message_ids = itertools.count()
@@ -413,9 +413,15 @@ def _clear_collection_state(tab: uc.Tab) -> None:
     if collector is not None:
         collector.remove()
     _console_collection_enabled_tabs.discard(key)
-    for event, callback in _network_callbacks.pop(key, []):
-        tab.remove_handler(event, callback)
+    network = _network_callbacks.pop(key, None)
+    if network is not None:
+        network.remove()
     _network_collection_enabled_tabs.discard(key)
+    for record in [
+        r for batch in _preserved_network_requests for r in batch
+    ] + _network_requests:
+        if record["connection"] is tab:
+            record["connection_active"] = False
 
 
 async def _forget_page_state(tab: uc.Tab) -> None:
@@ -920,70 +926,20 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
     key = _tab_key(tab)
     if key in _network_collection_enabled_tabs:
         return
-    net = uc.cdp.network
 
-    def request(event):
-        _network_requests.append(
-            {
-                "reqid": next(_request_ids),
-                "id": str(event.request_id),
-                "page_id": _page_key(tab),
-                "connection": tab,
-                "url": event.request.url,
-                "method": event.request.method,
-                "headers": json_value(event.request.headers),
-                "post_data": event.request.post_data,
-                "timestamp": float(event.timestamp),
-                "type": event.type_.value if event.type_ else "unknown",
-                "finished": False,
-            }
-        )
-        del _network_requests[:-1000]
+    def collect(record):
+        record.update(reqid=next(_request_ids), page_id=_page_key(tab), connection=tab)
+        _network_requests.append(record)
+        own = [r for r in _network_requests if r["page_id"] == record["page_id"]]
+        expired = {r["reqid"] for r in own[:-1000]}
+        if expired:
+            _network_requests[:] = [
+                r for r in _network_requests if r["reqid"] not in expired
+            ]
 
-    def find(request_id):
-        return next(
-            (
-                r
-                for r in reversed(_network_requests)
-                if r["connection"] is tab and r["id"] == str(request_id)
-            ),
-            None,
-        )
-
-    def response(event):
-        record = find(event.request_id)
-        if record is not None:
-            record.update(
-                status=event.response.status,
-                response_headers=json_value(event.response.headers),
-                mime_type=event.response.mime_type,
-            )
-
-    def finished(event):
-        record = find(event.request_id)
-        if record is not None:
-            record.update(finished=True, encoded_data_length=event.encoded_data_length)
-
-    def failed(event):
-        record = find(event.request_id)
-        if record is not None:
-            record.update(finished=True, error=event.error_text)
-
-    callbacks = [
-        (net.RequestWillBeSent, request),
-        (net.ResponseReceived, response),
-        (net.LoadingFinished, finished),
-        (net.LoadingFailed, failed),
-    ]
-    for event, callback in callbacks:
-        tab.add_handler(event, callback)
-    try:
-        await tab.send(net.enable())
-    except BaseException:
-        for event, callback in callbacks:
-            tab.remove_handler(event, callback)
-        raise
-    _network_callbacks[key] = callbacks
+    collector = NetworkCollector(tab, collect)
+    await collector.enable()
+    _network_callbacks[key] = collector
     _network_collection_enabled_tabs.add(key)
 
 
@@ -2038,9 +1994,17 @@ async def get_network_request(
     request_file_path: str = "",
     response_file_path: str = "",
     *,
+    include_body: bool = True,
+    max_body_chars: int = 5000,
     page_id: int | str | None = None,
 ) -> str:
-    """Read a stable request ID using its originating page/frame connection."""
+    """Read headers, redirect hops and body states using the originating connection.
+
+    include_body skips body lookups unless exporting; max_body_chars bounds each
+    inline preview. File exports always retain the complete body.
+    """
+    if max_body_chars < 1:
+        raise ValueError("max_body_chars must be positive.")
     page_id = _page_key(await _page_tab())
     records = [
         r for batch in _preserved_network_requests for r in batch
@@ -2053,44 +2017,13 @@ async def get_network_request(
     )
     if req is None:
         return "Error: No matching request for this page."
-    tab = req["connection"]
-    lines = [
-        json.dumps(
-            {k: v for k, v in req.items() if k != "connection"},
-            ensure_ascii=False,
-            indent=2,
-        )
-    ]
-    try:
-        body = req.get("post_data")
-        if body is None:
-            body = await tab.send(
-                uc.cdp.network.get_request_post_data(
-                    uc.cdp.network.RequestId(req["id"])
-                )
-            )
-        if request_file_path:
-            Path(request_file_path).write_text(body or "", encoding="utf-8")
-        elif body:
-            lines.append("Request body: " + body[:5000])
-    except uc.ProtocolException:
-        pass
-    try:
-        body, encoded = await tab.send(
-            uc.cdp.network.get_response_body(uc.cdp.network.RequestId(req["id"]))
-        )
-        if response_file_path:
-            Path(response_file_path).write_bytes(
-                base64.b64decode(body) if encoded else body.encode("utf-8")
-            )
-            lines.append(f"Response body saved to {response_file_path}")
-        else:
-            lines.append(
-                f"Response body{' (base64)' if encoded else ''}: {body[:5000]}"
-            )
-    except Exception as exc:
-        lines.append(f"Response body unavailable: {exc}")
-    return "\n".join(lines)
+    return await request_details(
+        req,
+        request_file_path,
+        response_file_path,
+        include_body=include_body,
+        max_body_chars=max_body_chars,
+    )
 
 
 @_page_tool()
@@ -2232,7 +2165,7 @@ async def list_network_requests(
             raise ValueError("page_size must be positive and page_idx nonnegative.")
         records = records[page_idx * page_size : (page_idx + 1) * page_size]
     return f"Network requests ({len(records)} of {total}):\n" + "\n".join(
-        f"  [{r['reqid']}] {r['method']} {r['url'][:150]} ({r['type']}, status={r.get('status', 'pending')})"
+        f"  [{r['reqid']}] {r['method']} {r['url'][:150]} ({r['type']}, status={r.get('status', r.get('error', 'pending'))})"
         for r in records
     )
 

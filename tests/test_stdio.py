@@ -335,6 +335,39 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Preview truncated", saved)
                         with open(output, encoding="utf-8") as file:
                             self.assertEqual(json.load(file)["rows"][-1], 499)
+                    await call(
+                        session,
+                        "evaluate_script",
+                        function="fetch('/body-probe').then(r=>r.text())",
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    requests = await call(
+                        session,
+                        "list_network_requests",
+                        url_filter="/body-probe",
+                        page_id=a,
+                    )
+                    reqid = int(re.search(r"\[(\d+)\]", requests).group(1))
+                    detail = await call(
+                        session,
+                        "get_network_request",
+                        reqid=reqid,
+                        max_body_chars=10,
+                        page_id=a,
+                    )
+                    self.assertIn("preview truncated", detail)
+                    self.assertIn('"response_body_state": "available"', detail)
+                    self.assertIn(
+                        "not_requested",
+                        await call(
+                            session,
+                            "get_network_request",
+                            reqid=reqid,
+                            include_body=False,
+                            page_id=a,
+                        ),
+                    )
                     raw = await call(
                         session,
                         "evaluate_script",

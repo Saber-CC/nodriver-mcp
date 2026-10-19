@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 126 regression/integration tests: **125 passed, 1 skipped** (MCP version 1.5.8).
+- 132 regression/integration tests: **131 passed, 1 skipped** (MCP version 1.5.9).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -201,6 +201,11 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   A real stdio client verified formats and read back complete saved JSON.
 - Native image responses passed both direct calls and MCP content conversion;
   full-page output was checked against a 2400-pixel document.
+- Redirect hops retained stable independent IDs and Cookie/Set-Cookie extra-info,
+  including events arriving out of order and cache hops without extra events.
+  Real Chrome and stdio clients verified bounded previews and full Unicode body
+  exports; fault injection covered binary/empty exports, evicted/unavailable/
+  protocol-error states and skipping pending/failed/retired connections.
 - Network filtering/body retrieval, explicit console cleanup and nonempty trace
   stream export passed.
 - Console and network collection resumed after a site-isolated iframe navigated

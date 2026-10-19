@@ -22,7 +22,7 @@
 - [x] REQ-04：补齐脚本执行时的弹窗处理策略。1.5.6。
 - [x] OPT-02：优化长文本输入和批量表单填充。1.5.7。
 - [x] OPT-03：优化脚本超时和大结果输出。1.5.8。
-- [ ] OPT-04：完善网络请求诊断和正文可用状态。
+- [x] OPT-04：完善网络请求诊断和正文可用状态。1.5.9。
 - [ ] OPT-05：增加截图返回尺寸限制。
 - [ ] OPT-06：完整保留性能 trace 并返回录制信息。
 
@@ -190,6 +190,16 @@ textarea/contenteditable、约束保护和三类中断；stdio 客户端覆盖�
 从文件加载脚本另见 ADV-03。
 
 ### OPT-04：网络诊断
+
+已完成于 1.5.9。参考 upstream PageCollector 与 NetworkFormatter 的逐跳链和正文
+预览，按官方 CDP 的 redirect_has_extra_info/has_extra_info 关联早到或晚到的额外
+请求/响应头；保留原始头、实际 wire status 和 Cookie 信息。每跳独立稳定 reqid，
+支持前后跳及完整前序链。正文区分 pending/redirect/failed/connection_retired/
+evicted/unavailable/protocol_error，不向退役连接发请求，也不把最终正文当成重定向正文。
+新增 include_body 和 max_body_chars，移除元数据内重复的无限长 post_data；
+预览明确截断，文件保留完整字节。当前记录按页面保留 1000 条，避免其他页面挤占。
+真实 Chrome 验证多跳 Cookie、额外头、Unicode POST/响应完整导出；故障注入覆盖
+缓存重定向、额外事件乱序、正文状态、空正文、二进制文件与退役连接。
 
 涉及 `list_network_requests`、`get_network_request`。补齐重定向链，
 关联额外请求/响应头事件，完善正文可用状态和输出长度控制。
