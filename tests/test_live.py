@@ -35,6 +35,39 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path.startswith("/mapped.js.map"):
+            headers = getattr(self.server, "source_map_headers", [])
+            headers.append(dict(self.headers))
+            self.server.source_map_headers = headers
+            if "map_access=yes" not in self.headers.get("Cookie", ""):
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            data = json.dumps(
+                {
+                    "version": 3,
+                    "sources": ["original.ts"],
+                    "sourceRoot": "/src/",
+                    "names": ["originalLogger"],
+                    "mappings": "AAIEA",
+                    "sourcesContent": ['1\n2\n3\n4\n  console.error("original line");'],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path.startswith("/mapped.js"):
+            data = b"function deployedCrash(){console.error('mapped-console-marker');setTimeout(function minifiedAsync(){throw new Error('mapped-exception-marker')},10)}\n//# sourceMappingURL=/mapped.js.map"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path.startswith("/net-redirect"):
             destination = (
                 "/net-final" if "second" in self.path else "/net-redirect?second"
@@ -1368,6 +1401,52 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                             tab, "JSON.parse(sessionStorage.getItem('batchEvents'))"
                         ),
                     )
+
+    async def test_source_maps_use_browser_credentials_and_symbolize_async_stacks(self):
+        tab = await s._active_tab()
+        self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))
+        await s.set_cookie("map_access", "yes", "127.0.0.1")
+        await s.enable_console_collection(source_maps=True)
+        await s.evaluate_script(
+            "() => new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='/mapped.js';script.onload=resolve;script.onerror=reject;document.head.append(script);})",
+            wait_for_stable=False,
+        )
+        await s.evaluate_script("deployedCrash()", wait_for_stable=False)
+        async with asyncio.timeout(5):
+            while not any(
+                m["source"] == "exception" and "mapped-exception-marker" in m["text"]
+                for m in s._console_messages
+            ):
+                await asyncio.sleep(0.02)
+        records = [
+            m
+            for m in s._console_messages
+            if "mapped-" in m["text"] and m["connection"] is tab
+        ]
+        self.assertEqual(len(records), 2)
+        for message in records:
+            detail = await s.get_console_message(message["msgid"])
+            self.assertIn("/src/original.ts:5:3", detail)
+            self.assertIn("originalLogger", detail)
+            self.assertIn("generated:", detail)
+            self.assertIn("mapped.js", detail)
+            native = await s.get_console_message(
+                message["msgid"], resolve_source_maps=False
+            )
+            self.assertNotIn("originalLogger", native)
+        listed = await s.list_console_messages(include_stack_traces=True)
+        self.assertIn("originalLogger", listed)
+        self.assertTrue(
+            any(
+                "map_access=yes" in h.get("Cookie", "")
+                for h in self.http.source_map_headers
+            )
+        )
+        await s.enable_console_collection(source_maps=False)
+        self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))
+        await s.disable_console_collection()
+        self.assertFalse(tab.handlers.get(uc.cdp.runtime.ConsoleAPICalled))
+        self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptFailedToParse))
 
     async def test_script_files_support_formats_elements_and_output_paths(self):
         source = Path(self.directory.name) / "源 文件.js"

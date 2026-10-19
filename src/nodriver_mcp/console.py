@@ -5,6 +5,7 @@ import json
 from nodriver import cdp
 
 from .protocol import json_value
+from .source_maps import SourceMaps
 
 
 def stack_location(stack):
@@ -26,11 +27,19 @@ def format_stack(stack, limit=50):
         if stack.get("description"):
             lines.append("  --- " + stack["description"] + " ---")
         for frame in stack.get("callFrames", []):
+            original = frame.get("originalLocation")
+            generated = frame
+            frame = original or frame
             url = frame.get("url") or "script:" + str(frame.get("scriptId", "unknown"))
             lines.append(
-                f"  at {frame.get('functionName') or '<anonymous>'} "
+                f"  at {frame.get('functionName') or generated.get('functionName') or '<anonymous>'} "
                 f"({url}:{frame.get('lineNumber', 0) + 1}:{frame.get('columnNumber', 0) + 1})"
             )
+            if original:
+                lines[-1] += (
+                    f" [generated: {generated.get('url') or 'script:' + str(generated.get('scriptId'))}:"
+                    f"{generated.get('lineNumber', 0) + 1}:{generated.get('columnNumber', 0) + 1}]"
+                )
             if len(lines) >= limit:
                 break
         stack = stack.get("parent")
@@ -51,6 +60,8 @@ def format_message(message, *, include_stack_traces=True, detailed=True):
                 "exception_id",
                 "revoked",
                 "revocation_reason",
+                "mapped_location",
+                "source_map_errors",
             )
             if message.get(key) is not None
         }
@@ -66,6 +77,7 @@ def format_message(message, *, include_stack_traces=True, detailed=True):
 class ConsoleCollector:
     def __init__(self, connection, collect, records):
         self.connection, self.collect, self.records = connection, collect, records
+        self.source_maps = SourceMaps(connection)
         self.callbacks = [
             (cdp.runtime.ConsoleAPICalled, self.console),
             (cdp.runtime.ExceptionThrown, self.thrown),
@@ -82,8 +94,13 @@ class ConsoleCollector:
             raise
 
     def remove(self):
+        self.source_maps.retire()
         for event, callback in self.callbacks:
             self.connection.remove_handler(event, callback)
+
+    def emit(self, message):
+        message["_source_maps"] = self.source_maps
+        self.collect(message)
 
     def console(self, event):
         parts = [
@@ -91,7 +108,7 @@ class ConsoleCollector:
             for a in event.args
         ]
         stack = json_value(event.stack_trace)
-        self.collect(
+        self.emit(
             {
                 "source": "console",
                 "type": event.type_,
@@ -123,7 +140,7 @@ class ConsoleCollector:
             location["url"] = details.url
         if details.script_id is not None:
             location["script_id"] = str(details.script_id)
-        self.collect(
+        self.emit(
             {
                 "source": "exception",
                 "type": "error",

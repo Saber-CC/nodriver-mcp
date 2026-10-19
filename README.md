@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.14 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.15 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -273,7 +273,13 @@ Once enabled, it captures `console.*`, uncaught JavaScript errors and unhandled
 Promise rejections. `list_console_messages(include_stack_traces=true)` includes
 native stacks; `get_console_message` shows stack and source/context metadata by
 default. Disabling or retiring a connection removes all managed console/error
-callbacks. Full source-map symbolization is tracked separately in the roadmap.
+callbacks. Use `enable_console_collection(source_maps=true)` to opt into Debugger
+metadata and async stacks. Console details and requested list stacks then resolve
+source-map v3 original functions/locations/source lines while retaining generated
+positions. External maps load through Chrome with its proxy and cookies; inline
+and indexed maps are supported. Failed or slow maps retain raw positions and a
+diagnostic. `resolve_source_maps=false` skips resolution; `source_maps=false`
+disables owned Debugger collection. Ordinary browsing keeps these domains disabled.
 
 ### Cookies, storage and sessions
 

@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 143 regression/integration tests: **142 passed, 1 skipped** (MCP version 1.5.14).
+- 148 regression/integration tests: **147 passed, 1 skipped** (MCP version 1.5.15).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -209,6 +209,13 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   Real Chrome and stdio clients verified bounded previews and full Unicode body
   exports; fault injection covered binary/empty exports, evicted/unavailable/
   protocol-error states and skipping pending/failed/retired connections.
+- Opt-in source-map symbolization passed external Cookie-gated browser loading,
+  console calls, async exceptions, data/base64/percent maps, indexed and external
+  sections, source roots/names/lines, unmapped regions and script offsets. Generated
+  locations remained available after bad maps, disabling and retirement; async
+  parent stacks resolved without reopening retired transports. A real stdio client
+  retrieved an original TypeScript location from an inline map. Debugger callbacks
+  were removed on disable, while ordinary browsing remained opt-in.
 - Local script sources passed UTF-8/BOM, absolute/relative/file URL handling,
   function/script/auto execution, element arguments and separate output files.
   Conflicting/missing sources failed before browser resolution, even with page_id.
