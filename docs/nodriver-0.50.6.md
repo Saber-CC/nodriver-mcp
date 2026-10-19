@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 101 regression/integration tests: **100 passed, 1 skipped** (MCP version 1.5.4).
+- 105 regression/integration tests: **104 passed, 1 skipped** (MCP version 1.5.5).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -172,6 +172,12 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   upstream multi-agent page initialization. Both pages retained `document.hasFocus()`
   across selection changes, navigation and emulation resets. Failed initialization
   remained retryable and connection retirement removed its preparation cache.
+- Explicit console collection captured uncaught asynchronous exceptions and
+  unhandled Promise rejections with source URL, line/column, execution context and
+  native stack traces. Compact/verbose listing, detailed retrieval, navigation
+  retention and disabling passed. Recreated iframe connections received fresh
+  exception/revocation callbacks and produced new exception records; retired
+  connections retained none. A real stdio client retrieved an uncaught error.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;

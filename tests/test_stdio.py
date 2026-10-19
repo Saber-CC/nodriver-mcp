@@ -224,6 +224,30 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                                 page_id=a,
                             ),
                         )
+                    await call(session, "enable_console_collection", page_id=a)
+                    await call(
+                        session,
+                        "evaluate_script",
+                        function="() => {setTimeout(() => {throw new Error('client-uncaught')},0); return true;}",
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    messages = await call(
+                        session,
+                        "list_console_messages",
+                        types=["error"],
+                        include_stack_traces=True,
+                        page_id=a,
+                    )
+                    message = re.search(
+                        r"\[(\d+)\] \[error\].*client-uncaught", messages
+                    ).group(1)
+                    details = await call(
+                        session, "get_console_message", msgid=int(message), page_id=a
+                    )
+                    self.assertIn("Stack trace", details)
+                    self.assertIn('"source": "exception"', details)
+                    await call(session, "disable_console_collection", page_id=a)
                     self.assertIn(
                         "client-alpha",
                         await call(

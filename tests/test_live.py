@@ -158,6 +158,21 @@ class Handler(BaseHTTPRequestHandler):
                 ),
                 "text/html",
             )
+        elif self.path.startswith("/errors.js"):
+            data, content_type = (
+                b"""window.emitErrors = function emitErrors() {
+                  console.warn('stack-marker');
+                  setTimeout(function asyncCrash() { throw new Error('async-exception-marker'); }, 10);
+                  Promise.reject(new Error('promise-exception-marker'));
+                  return 'scheduled';
+                };""",
+                "application/javascript",
+            )
+        elif self.path.startswith("/console-errors"):
+            data, content_type = (
+                b"<title>Console stack</title><script src='/errors.js'></script><p>Exception test</p>",
+                "text/html",
+            )
         else:
             html = """<title>Native integration</title>
             <input aria-label="Main input"><select aria-label="Choice"><option value="a">A</option><option value="b">B</option></select>
@@ -847,6 +862,52 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         for connection in (page, connection):
             self.assertFalse(connection.handlers.get(uc.cdp.page.FileChooserOpened))
 
+    async def test_console_collects_uncaught_errors_promise_rejections_and_stacks(self):
+        await s.new_page(self.url + "console-errors")
+        page = await s._page_tab()
+        self.assertFalse(page.handlers.get(uc.cdp.runtime.ExceptionThrown))
+        await s.enable_console_collection()
+        self.assertIn(
+            "scheduled",
+            await s.evaluate_script("window.emitErrors()", wait_for_stable=False),
+        )
+        async with asyncio.timeout(5):
+            while not all(
+                any(marker in m["text"] for m in s._console_messages)
+                for marker in ("async-exception-marker", "promise-exception-marker")
+            ):
+                await asyncio.sleep(0.02)
+        compact = await s.list_console_messages(types=["error"])
+        self.assertIn("async-exception-marker", compact)
+        self.assertIn("promise-exception-marker", compact)
+        self.assertNotIn("stack-marker", compact)
+        self.assertNotIn("at asyncCrash", compact)
+        verbose = await s.list_console_messages(include_stack_traces=True)
+        self.assertIn("errors.js:", verbose)
+        self.assertIn("emitErrors", verbose)
+        errors = [m for m in s._console_messages if m.get("source") == "exception"]
+        for error in errors:
+            self.assertEqual(error["location"]["url"], self.url + "errors.js")
+            self.assertIsInstance(error["location"]["line_number"], int)
+            self.assertIsNotNone(error["execution_context_id"])
+            self.assertIn("Stack trace", await s.get_console_message(error["msgid"]))
+            self.assertNotIn(
+                "Stack trace",
+                await s.get_console_message(error["msgid"], include_stack_traces=False),
+            )
+        await s.navigate_page(url=self.url + "interaction")
+        self.assertIn(
+            "async-exception-marker",
+            await s.list_console_messages(include_preserved_messages=True),
+        )
+        self.assertIn("errors.js", await s.get_console_message(errors[0]["msgid"]))
+        await s.disable_console_collection()
+        count = len(s._console_messages)
+        await s.evaluate_script("console.warn('after-disable')", wait_for_stable=False)
+        self.assertEqual(len(s._console_messages), count)
+        self.assertFalse(page.handlers.get(uc.cdp.runtime.ExceptionThrown))
+        self.assertFalse(page.handlers.get(uc.cdp.runtime.ExceptionRevoked))
+
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")
         snapshot = await s.take_snapshot()
@@ -990,6 +1051,21 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 len(connection.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1
             )
+            self.assertEqual(
+                len(connection.handlers[uc.cdp.runtime.ExceptionThrown]), 1
+            )
+            self.assertEqual(
+                len(connection.handlers[uc.cdp.runtime.ExceptionRevoked]), 1
+            )
+            await s._evaluate(
+                connection, "setTimeout(() => {throw new Error('iframe-uncaught')}, 0)"
+            )
+            async with asyncio.timeout(5):
+                while not any(
+                    "iframe-uncaught" in m["text"] and m["connection"] is connection
+                    for m in s._console_messages
+                ):
+                    await asyncio.sleep(0.01)
             for event in (
                 uc.cdp.network.RequestWillBeSent,
                 uc.cdp.network.ResponseReceived,
@@ -1031,6 +1107,8 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(s._tab_key(old), s._console_callbacks)
         self.assertNotIn(s._tab_key(old), s._network_callbacks)
         self.assertFalse(old.handlers.get(uc.cdp.runtime.ConsoleAPICalled))
+        self.assertFalse(old.handlers.get(uc.cdp.runtime.ExceptionThrown))
+        self.assertFalse(old.handlers.get(uc.cdp.runtime.ExceptionRevoked))
         self.assertFalse(old.handlers.get(uc.cdp.network.RequestWillBeSent))
 
     async def test_default_temporary_session_restarts_clean_and_removes_profile(self):
