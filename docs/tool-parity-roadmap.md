@@ -23,7 +23,7 @@
 - [x] OPT-02：优化长文本输入和批量表单填充。1.5.7。
 - [x] OPT-03：优化脚本超时和大结果输出。1.5.8。
 - [x] OPT-04：完善网络请求诊断和正文可用状态。1.5.9。
-- [ ] OPT-05：增加截图返回尺寸限制。
+- [x] OPT-05：增加截图返回尺寸限制。1.5.10。
 - [ ] OPT-06：完整保留性能 trace 并返回录制信息。
 
 ## 已完成的正确性修复
@@ -209,6 +209,13 @@ evicted/unavailable/protocol_error，不向退役连接发请求，也不把最�
 文件导出和 iframe 连接重建回归继续通过。
 
 ### OPT-05：截图尺寸
+
+已完成于 1.5.10。参考 upstream screenshot 的 source box 与 downscale clip，
+通过官方 Page.captureScreenshot 的 clip.scale 按物理像素计算宽高上限，
+新增 max_width/max_height，不放大图片；普通无限制 PNG/JPEG 仍委托原生
+Tab.save_screenshot(as_base64=True)。元素裁剪计入滚动偏移并允许视口外捕获。
+真实 Chrome 覆盖 DPR=2 的视口/整页/滚动后元素、PNG/JPEG/WebP、双尺寸限制、
+单尺寸限制、文件保存和无放大；真实 stdio 验证限尺寸 WebP 的 MCP 图片及实际像素。
 
 涉及 `take_screenshot`。增加可选最大宽高，按比例限制返回图片尺寸。
 

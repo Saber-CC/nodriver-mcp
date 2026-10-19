@@ -1659,6 +1659,59 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s._selected_target_id, selected)
         self.assertIn("Main input", await s.take_snapshot())
 
+    async def test_screenshot_limits_cover_viewport_full_page_and_scrolled_element(
+        self,
+    ):
+        await s.emulate(viewport="800x600x2")
+        await s.evaluate_script("""() => { document.body.innerHTML='<button style="position:absolute;left:20px;top:1100px;width:400px;height:200px;border:0;padding:0;background:rgb(17,34,51)">Crop target</button>';
+            document.body.style.margin='0'; document.body.style.height='2400px';return true; }""")
+        uid = re.search(
+            r'uid=(\S+) button "Crop target"', await s.take_snapshot()
+        ).group(1)
+        for format in ("png", "jpeg", "webp"):
+            for full in (False, True):
+                original = PillowImage.open(
+                    io.BytesIO(
+                        (await s.take_screenshot(full_page=full, format=format)).data
+                    )
+                )
+                shot = await s.take_screenshot(
+                    full_page=full, format=format, max_width=320, max_height=240
+                )
+                image = PillowImage.open(io.BytesIO(shot.data))
+                self.assertLessEqual(image.width, 320)
+                self.assertLessEqual(image.height, 240)
+                self.assertAlmostEqual(
+                    image.width / image.height,
+                    original.width / original.height,
+                    delta=0.02,
+                )
+                self.assertEqual(image.format.lower(), format)
+            await s.evaluate_script("scrollTo(0,1000)", wait_for_stable=False)
+            crop = PillowImage.open(
+                io.BytesIO(
+                    (
+                        await s.take_screenshot(
+                            uid=uid, format=format, max_width=240, max_height=100
+                        )
+                    ).data
+                )
+            ).convert("RGB")
+            self.assertEqual(crop.size, (200, 100))
+            self.assertTrue(
+                all(abs(a - b) < 5 for a, b in zip(crop.getpixel((5, 5)), (17, 34, 51)))
+            )
+        saved = Path(self.directory.name) / "limited.png"
+        await s.take_screenshot(file_path=str(saved), max_width=300)
+        with PillowImage.open(saved) as saved_image:
+            self.assertLessEqual(saved_image.width, 300)
+        small = PillowImage.open(
+            io.BytesIO((await s.take_screenshot(uid=uid, max_width=5000)).data)
+        )
+        self.assertEqual(small.size, (800, 400))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            await s.take_screenshot(max_height=0)
+
     async def test_native_element_cookie_screenshot_and_page_selection(self):
         snapshot = await s.take_snapshot()
         uid = re.search(r'uid=(\S+) textbox "Main input"', snapshot).group(1)

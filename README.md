@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.9 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.10 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -247,6 +247,11 @@ Use text snapshots for reading pages. Ordinary PNG/JPEG screenshots delegate to
 save a file when `file_path` is supplied. Element crops, WebP and explicit
 quality use the official generated CDP screenshot command because those
 arguments are not exposed by the native helper.
+
+`take_screenshot(max_width=1280, max_height=720)` limits physical output pixels
+proportionally for viewport, full-page and element captures, including high DPI.
+Limits use native CDP scaling and never upscale. Both inline images and saved
+files honor the limits; omitting them retains the original resolution.
 
 Console collection is opt-in and does not enable `Runtime` during ordinary
 browsing. Explicit console/event tools can enable it when needed.
