@@ -26,8 +26,31 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_POST(self):
+        data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
-        if self.path.startswith("/api"):
+        if self.path.startswith("/net-redirect"):
+            destination = (
+                "/net-final" if "second" in self.path else "/net-redirect?second"
+            )
+            self.send_response(302)
+            self.send_header("Location", destination)
+            self.send_header(
+                "Set-Cookie",
+                "hop=" + ("second" if "second" in self.path else "first") + "; Path=/",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path.startswith("/net-final"):
+            data, content_type = b"redirect-complete", "text/plain"
+        elif self.path.startswith("/api"):
             data, content_type = (
                 b'{"ok":true,"source":"local-test"}',
                 "application/json",
@@ -1709,6 +1732,77 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("main_only", await s.get_cookies())
         await s.set_cookie("isolated_only", "yes", "127.0.0.1")
         self.assertIn("isolated_only", await s.get_cookies())
+
+    async def test_network_redirect_extra_headers_and_body_exports(self):
+        tab = await s._active_tab()
+        await s.evaluate_script(
+            "() => fetch('/net-redirect').then(r => r.text())", wait_for_stable=False
+        )
+        async with asyncio.timeout(5):
+            while True:
+                records = [
+                    r
+                    for r in s._network_requests
+                    if r["connection"] is tab and "/net-" in r["url"]
+                ]
+                if (
+                    len(records) == 3
+                    and records[-1].get("finished")
+                    and all(r.get("response_extra_info") for r in records)
+                ):
+                    break
+                await asyncio.sleep(0.02)
+        first, second, final = records
+        self.assertEqual([r["status"] for r in records], [302, 302, 200])
+        self.assertEqual(
+            [r["reqid"] for r in final["redirect_chain"]],
+            [first["reqid"], second["reqid"]],
+        )
+        self.assertIn("hop=first", json.dumps(second["headers"]))
+        self.assertIn("hop=second", json.dumps(final["headers"]))
+        self.assertIn("Set-Cookie", json.dumps(first["response_headers"]))
+        self.assertIn(
+            '"response_body_state": "redirect"',
+            await s.get_network_request(first["reqid"]),
+        )
+        self.assertIn("redirect-complete", await s.get_network_request(final["reqid"]))
+        payload = "请求正文🙂" * 1000
+        await s.evaluate_script(
+            "() => fetch('/net-post',{method:'POST',body:"
+            + json.dumps(payload)
+            + "}).then(r=>r.text())",
+            wait_for_stable=False,
+            max_output_chars=20,
+        )
+        async with asyncio.timeout(5):
+            while True:
+                posted = next(
+                    (
+                        r
+                        for r in reversed(s._network_requests)
+                        if "/net-post" in r["url"]
+                    ),
+                    None,
+                )
+                if posted and posted.get("finished"):
+                    break
+                await asyncio.sleep(0.02)
+        detail = await s.get_network_request(posted["reqid"], max_body_chars=40)
+        self.assertNotIn(payload, detail)
+        self.assertIn("preview truncated", detail)
+        post, result = (
+            Path(self.directory.name) / "post.txt",
+            Path(self.directory.name) / "response.txt",
+        )
+        await s.get_network_request(
+            posted["reqid"], str(post), str(result), max_body_chars=10
+        )
+        self.assertEqual(post.read_text(), payload)
+        self.assertEqual(result.read_text(), payload)
+        self.assertIn(
+            "not_requested",
+            await s.get_network_request(posted["reqid"], include_body=False),
+        )
 
     async def test_network_console_and_trace(self):
         await s.evaluate_script("() => fetch('/api').then(r => r.json())")

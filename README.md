@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.8 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.9 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -281,6 +281,13 @@ Network collection starts before a new page's first request. Request IDs remain
 stable under filtering and pagination; body retrieval uses the connection that
 originated the request. `configure_network_capture` configures the new native
 durable-message API for response bodies across process changes.
+Request details retain independent redirect hops, preceding-chain IDs and extra
+request/response headers, including wire status. `get_network_request` reports
+body availability and accepts `include_body=false` and `max_body_chars` (5000 by
+default). Previews are labeled when truncated; file exports retain complete data.
+Intermediate redirects and retired connections never query a later request's body.
+Current network records are limited to 1000 per page.
+
 Console and network collectors follow the connection instance. Re-enabling them
 after an iframe connection is recreated initializes the new connection, even
 when Chrome reuses its target ID.
