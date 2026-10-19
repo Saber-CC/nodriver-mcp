@@ -1,0 +1,162 @@
+"""Native script execution, bounded protocol resources and complete JSON output."""
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from uuid import uuid4
+
+import nodriver as uc
+
+from .artifacts import artifact_path
+from .protocol import json_value
+
+logger = logging.getLogger(__name__)
+
+
+def script_error(error) -> Exception:
+    details = json_value(error)
+    if isinstance(details, dict) and "text" in details:
+        remote = details.get("exception") or {}
+        reason = remote.get("description") or details["text"]
+        if not remote.get("description") and "value" in remote:
+            reason += ": " + json.dumps(remote["value"], ensure_ascii=False)
+        url = details.get("url") or "script:" + str(details.get("scriptId", "unknown"))
+        return ValueError(
+            f"JavaScript exception: {reason}\nat {url}:{details.get('lineNumber', 0) + 1}:{details.get('columnNumber', 0) + 1}"
+        )
+    return uc.ProtocolException(details)
+
+
+def script_value(result):
+    kind = getattr(result, "type_", None)
+    if kind in {"bigint", "symbol", "function"}:
+        raise ValueError(
+            f"JavaScript {kind} is not JSON serializable; convert it to a string or JSON value."
+        )
+    raw = getattr(result, "unserializable_value", None)
+    if raw is not None:
+        return 0 if str(raw) == "-0" else None
+    return result.value
+
+
+async def execute_script(
+    tab, source, args, *, format="auto", timeout=0, context_id=None, resolve_uid=None
+):
+    runtime = uc.cdp.runtime
+    group = "nodriver-mcp-script-" + uuid4().hex
+    try:
+        if args:
+            objects = [await resolve_uid(uid, group) for uid in args]
+            result, error = await tab.send(
+                runtime.call_function_on(
+                    function_declaration=source,
+                    object_id=objects[0].object_id,
+                    arguments=[
+                        runtime.CallArgument(object_id=o.object_id) for o in objects
+                    ],
+                    return_by_value=True,
+                    await_promise=True,
+                    user_gesture=True,
+                    object_group=group,
+                )
+            )
+        else:
+            expression = source
+            if format in {"auto", "function"}:
+                candidate = source.rstrip().removesuffix(";")
+                if format == "function":
+                    expression = "(\n" + candidate + "\n)()"
+                else:
+                    # Evaluate the source as an argument, outside the wrapper's
+                    # lexical scope. IIFEs and comma expressions execute once.
+                    wrapped = (
+                        "((value) => typeof value === 'function' ? value() : value)((\n"
+                        + candidate
+                        + "\n))"
+                    )
+                    # compileScript requires Runtime.enable. A Function
+                    # constructor parses without running the source and works
+                    # under evaluate's explicit CSP bypass without enabling it.
+                    probe = (
+                        "(() => {try { (function(){}).constructor("
+                        + json.dumps("return (\n" + candidate + "\n);")
+                        + "); return true; } catch(error) { if(error.name === 'SyntaxError') return false; throw error; }})()"
+                    )
+                    parsed, parse_error = await tab.send(
+                        runtime.evaluate(
+                            probe,
+                            context_id=context_id,
+                            object_group=group,
+                            return_by_value=True,
+                            await_promise=False,
+                            timeout=runtime.TimeDelta(timeout) if timeout else None,
+                            allow_unsafe_eval_blocked_by_csp=True,
+                        )
+                    )
+                    if parse_error is not None:
+                        raise script_error(parse_error)
+                    if parsed.value:
+                        expression = wrapped
+            result, error = await tab.send(
+                runtime.evaluate(
+                    expression,
+                    context_id=context_id,
+                    object_group=group,
+                    return_by_value=True,
+                    await_promise=True,
+                    user_gesture=True,
+                    timeout=runtime.TimeDelta(timeout) if timeout else None,
+                )
+            )
+        if error:
+            if timeout and error.text.lower() in {
+                "execution was terminated",
+                "execution timed out",
+            }:
+                raise TimeoutError(f"Script execution exceeded {timeout}ms.")
+            raise script_error(error)
+        return script_value(result)
+    except uc.ProtocolException as exc:
+        if timeout and any(
+            text in str(exc).lower()
+            for text in ("execution was terminated", "execution timed out")
+        ):
+            raise TimeoutError(f"Script execution exceeded {timeout}ms.") from exc
+        raise
+    finally:
+        try:
+            await asyncio.wait_for(tab.send(runtime.release_object_group(group)), 0.5)
+        except Exception:
+            logger.debug("Script object-group cleanup failed", exc_info=True)
+
+
+async def script_result(
+    value, file_path: str = "", max_output_chars: int = 20000
+) -> str:
+    encoded = await asyncio.to_thread(
+        json.dumps, json_value(value), ensure_ascii=False, allow_nan=False
+    )
+    if not file_path and len(encoded) <= max_output_chars:
+        return "```json\n" + encoded + "\n```\nStatus: completed"
+    path = (
+        Path(file_path).expanduser().resolve()
+        if file_path
+        else artifact_path("scripts", ".json")
+    )
+    try:
+        await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(path.write_text, encoded, encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Cannot save script output to {path}: {exc}") from exc
+    truncated = len(encoded) > max_output_chars
+    label = "text" if truncated else "json"
+    return (
+        f"Output file: {json.dumps(str(path), ensure_ascii=False)}\nCharacters: {len(encoded)}\n"
+        + (
+            "Preview truncated; the file contains the complete JSON result.\n"
+            if truncated
+            else ""
+        )
+        + f"```{label}\n{encoded[:max_output_chars]}\n```\nStatus: completed"
+    )

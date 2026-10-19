@@ -205,6 +205,10 @@ class Handler(BaseHTTPRequestHandler):
             data, content_type = html.encode(), "text/html"
         self.send_response(200)
         self.send_header("Content-Type", content_type + "; charset=utf-8")
+        if self.path.startswith("/strict-csp"):
+            self.send_header(
+                "Content-Security-Policy", "default-src 'none'; script-src 'none'"
+            )
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -236,6 +240,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_HEADLESS": "true",
                 "NODRIVER_USER_DATA_DIR": self.directory.name,
                 "NODRIVER_EXTENSIONS": "[]",
+                "NODRIVER_ARTIFACTS_DIR": str(Path(self.directory.name) / "artifacts"),
                 "NODRIVER_PROXY": "",
                 "NODRIVER_BROWSER_ARGS": '["--enable-blink-features=WebMCPSupport,WebMCPTesting"]'
                 if "webmcp" in self._testMethodName
@@ -1195,6 +1200,151 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                             tab, "JSON.parse(sessionStorage.getItem('batchEvents'))"
                         ),
                     )
+
+    async def test_script_formats_execute_functions_iifes_and_statements_once(self):
+        await s.evaluate_script(
+            "window.value=9", format="script", wait_for_stable=False
+        )
+        self.assertEqual(
+            json.loads(
+                (await s.evaluate_script("value", wait_for_stable=False)).splitlines()[
+                    1
+                ]
+            ),
+            9,
+        )
+        result = await s.evaluate_script(
+            "(() => {window.executionCount=(window.executionCount||0)+1;return {count:window.executionCount};})()",
+            wait_for_stable=False,
+        )
+        self.assertEqual(json.loads(result.splitlines()[1]), {"count": 1})
+        result = await s.evaluate_script(
+            "(window.executionCount++,42)", wait_for_stable=False
+        )
+        self.assertEqual(json.loads(result.splitlines()[1]), 42)
+        self.assertEqual(
+            json.loads(
+                (
+                    await s.evaluate_script(
+                        "window.executionCount", wait_for_stable=False
+                    )
+                ).splitlines()[1]
+            ),
+            2,
+        )
+        for source, mode in (
+            ("() => 42", "function"),
+            ("var statementResult=6*7; statementResult", "script"),
+            ("var autoResult=21*2; autoResult", "auto"),
+        ):
+            result = await s.evaluate_script(source, format=mode, wait_for_stable=False)
+            self.assertIn("Status: completed", result)
+            self.assertEqual(json.loads(result.splitlines()[1]), 42)
+        result = await s.evaluate_script("123n", wait_for_stable=False)
+        self.assertIn("Status: failed", result)
+        self.assertIn("bigint", result)
+        result = await s.evaluate_script(
+            "(() => {window.executionCount++;throw new SyntaxError('runtime syntax marker');})()",
+            wait_for_stable=False,
+        )
+        self.assertIn("Status: failed", result)
+        self.assertEqual(
+            json.loads(
+                (
+                    await s.evaluate_script(
+                        "window.executionCount", wait_for_stable=False
+                    )
+                ).splitlines()[1]
+            ),
+            3,
+        )
+        await s.evaluate_script(
+            "window.Function=() => {throw new Error('patched global Function');}",
+            format="script",
+            wait_for_stable=False,
+        )
+        self.assertEqual(
+            json.loads(
+                (
+                    await s.evaluate_script("() => 42", wait_for_stable=False)
+                ).splitlines()[1]
+            ),
+            42,
+        )
+        await s.new_page(self.url + "strict-csp")
+        self.assertEqual(
+            json.loads(
+                (
+                    await s.evaluate_script("() => 42", wait_for_stable=False)
+                ).splitlines()[1]
+            ),
+            42,
+        )
+        self.assertNotIn(
+            s._tab_key(await s._page_tab()), s._console_collection_enabled_tabs
+        )
+
+    async def test_script_native_deadline_stops_busy_execution_and_later_calls_work(
+        self,
+    ):
+        page = await s._page_tab()
+        result = await asyncio.wait_for(
+            s.evaluate_script(
+                "() => {while(true){}}", timeout=100, wait_for_stable=False
+            ),
+            5,
+        )
+        self.assertIn("Status: timed_out", result)
+        self.assertEqual(
+            json.loads(
+                (await s.evaluate_script("42", wait_for_stable=False)).splitlines()[1]
+            ),
+            42,
+        )
+        snapshot = await s.take_snapshot()
+        uid = re.search(r'uid=(\S+) textbox "Main input"', snapshot).group(1)
+        result = await asyncio.wait_for(
+            s.evaluate_script(
+                "async el => {await new Promise(() => {});return el.value;}",
+                [uid],
+                timeout=100,
+                wait_for_stable=False,
+            ),
+            5,
+        )
+        self.assertIn("Status: timed_out", result)
+        self.assertEqual(
+            json.loads(
+                (await s.evaluate_script("42", wait_for_stable=False)).splitlines()[1]
+            ),
+            42,
+        )
+        self.assertFalse(page._mapper)
+
+    async def test_script_large_results_save_complete_json_and_keep_bounded_previews(
+        self,
+    ):
+        result = await s.evaluate_script(
+            "() => ({rows:Array.from({length:500}, (_,i)=>({i,text:'中文🙂'.repeat(10)}))})",
+            max_output_chars=200,
+            wait_for_stable=False,
+        )
+        path = Path(json.loads(result.splitlines()[0].partition(": ")[2]))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(len(value["rows"]), 500)
+        self.assertEqual(value["rows"][-1]["i"], 499)
+        self.assertIn("Preview truncated", result)
+        self.assertLess(len(result), 1500)
+        explicit = Path(self.directory.name) / "requested" / "result 中文.json"
+        result = await s.evaluate_script(
+            "() => ({ok:false,n:0})", file_path=str(explicit), wait_for_stable=False
+        )
+        self.assertEqual(
+            json.loads(explicit.read_text(encoding="utf-8")), {"ok": False, "n": 0}
+        )
+        await s.close_browser()
+        self.assertTrue(path.exists())
+        self.assertTrue(explicit.exists())
 
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")

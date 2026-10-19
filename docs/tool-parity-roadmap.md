@@ -21,7 +21,7 @@
 - [x] REQ-03：补齐未捕获 JavaScript 异常和基础调用栈。1.5.5。
 - [x] REQ-04：补齐脚本执行时的弹窗处理策略。1.5.6。
 - [x] OPT-02：优化长文本输入和批量表单填充。1.5.7。
-- [ ] OPT-03：优化脚本超时和大结果输出。
+- [x] OPT-03：优化脚本超时和大结果输出。1.5.8。
 - [ ] OPT-04：完善网络请求诊断和正文可用状态。
 - [ ] OPT-05：增加截图返回尺寸限制。
 - [ ] OPT-06：完整保留性能 trace 并返回录制信息。
@@ -173,6 +173,15 @@ textarea/contenteditable、约束保护和三类中断；stdio 客户端覆盖�
 出现导航、失效 UID 或弹窗时及时停止并报告已完成项目，不继续静默填充。
 
 ### OPT-03：脚本超时与大结果
+
+已完成于 1.5.8。参考 `chrome-devtools-mcp/src/tools/script.ts` 的格式及文件输出，
+保留兼容的 auto 格式，另可显式指定 function/script。auto 先只解析源码，再执行一次，
+避免 IIFE 重复调用和副作用重试；无需启用 Runtime 域。官方 Runtime.evaluate 的
+原生 deadline 配合工具等待超时，所有退出路径释放临时对象组；不对普通 Promise 超时
+无条件终止整个 renderer。新增 file_path 和 max_output_chars，完整 JSON 可显式保存，
+大结果自动保存到持久 artifacts/scripts 目录，返回路径、总长度及明确标注的预览。
+真实 Chrome 覆盖同步循环、Promise 超时后重用、脚本格式、一次副作用、CSP 与文件输出；
+真实 stdio 客户端覆盖新参数和完整文件读取。
 
 涉及 `evaluate_script`。增加执行超时、结果文件输出和明确的截断说明。
 

@@ -22,7 +22,7 @@ from contextvars import ContextVar
 from functools import wraps
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import nodriver as uc
 from mcp.server.mcpserver import Context, Image, MCPServer
@@ -37,6 +37,7 @@ from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .protocol import json_value
+from .scripts import execute_script, script_error as _script_error, script_result
 from .uploads import FileUploads, upload_paths
 
 logging.basicConfig(
@@ -523,21 +524,6 @@ async def _shutdown_browser() -> None:
     _tracing_active = False
     _trace_stopping = False
     _trace_tab = None
-
-
-def _script_error(error) -> Exception:
-    details = json_value(error)
-    if isinstance(details, dict) and "text" in details:
-        remote = details.get("exception") or {}
-        reason = remote.get("description") or details["text"]
-        if not remote.get("description") and "value" in remote:
-            reason += ": " + json.dumps(remote["value"], ensure_ascii=False)
-        url = details.get("url") or "script:" + str(details.get("scriptId", "unknown"))
-        return ValueError(
-            f"JavaScript exception: {reason}\n"
-            f"at {url}:{details.get('lineNumber', 0) + 1}:{details.get('columnNumber', 0) + 1}"
-        )
-    return uc.ProtocolException(details)
 
 
 async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) -> Any:
@@ -1042,11 +1028,14 @@ async def _disable_console_collection(tab: uc.Tab) -> bool:
 # ---------------------------------------------------------------------------
 # UID resolution: uid -> DOM element operations
 # ---------------------------------------------------------------------------
-async def _resolve_uid(tab: uc.Tab, uid: str) -> Any:
+async def _resolve_uid(
+    tab: uc.Tab, uid: str, *, object_group: str | None = None
+) -> Any:
     connection = await _tab_for_uid(uid)
     result = await connection.send(
         uc.cdp.dom.resolve_node(
-            backend_node_id=uc.cdp.dom.BackendNodeId(_uid_to_backend_node_id[uid])
+            backend_node_id=uc.cdp.dom.BackendNodeId(_uid_to_backend_node_id[uid]),
+            object_group=object_group,
         )
     )
     if result is None:
@@ -1758,28 +1747,27 @@ async def emulate_device(
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
-async def _evaluate_script_value(tab, function: str, args: list[str] | None):
-    if args:
-        objects = [await _resolve_uid(tab, uid) for uid in args]
-        result, error = await tab.send(
-            uc.cdp.runtime.call_function_on(
-                function_declaration=function,
-                object_id=objects[0].object_id,
-                arguments=[
-                    uc.cdp.runtime.CallArgument(object_id=o.object_id) for o in objects
-                ],
-                return_by_value=True,
-                await_promise=True,
-                user_gesture=True,
+async def _evaluate_script_value(
+    tab, function: str, args: list[str] | None, *, format="auto", timeout=0
+):
+    context = None
+    frame_id = _selected_frame_id(tab)
+    if not args and frame_id and str(tab.target_id) == _page_key(tab):
+        context = await tab.send(
+            uc.cdp.page.create_isolated_world(
+                uc.cdp.page.FrameId(frame_id),
+                world_name="nodriver-mcp",
             )
         )
-        if error:
-            raise _script_error(error)
-        return result.value
-    expression = function.strip()
-    if expression.startswith(("(", "function", "async")):
-        expression = f"({expression})()"
-    return await _evaluate(tab, expression)
+    return await execute_script(
+        tab,
+        function,
+        args,
+        format=format,
+        timeout=timeout,
+        context_id=context,
+        resolve_uid=lambda uid, group: _resolve_uid(tab, uid, object_group=group),
+    )
 
 
 @_page_tool()
@@ -1791,6 +1779,9 @@ async def evaluate_script(
     dialog_action: str = "accept",
     prompt_text: str = "",
     timeout: int = 30000,
+    format: Literal["auto", "function", "script"] = "auto",
+    file_path: str = "",
+    max_output_chars: int = 20000,
     page_id: int | str | None = None,
 ) -> str:
     """Evaluate JavaScript with explicit dialog policy and execution status.
@@ -1799,12 +1790,21 @@ async def evaluate_script(
     dialog_action is accept (default), dismiss, or manual; prompt_text supplies
     accepted prompt content. timeout bounds execution in milliseconds; 0 disables it.
     Results report completed, interrupted, failed, or timed_out.
+    format=auto invokes a function result or evaluates an expression/script once;
+    function/script choose explicitly. file_path saves complete JSON. Oversized
+    inline output is saved automatically; max_output_chars bounds its preview.
     """
     try:
         if dialog_action not in {"accept", "dismiss", "manual"}:
             raise ValueError("dialog_action must be accept, dismiss or manual.")
         if timeout < 0:
             raise ValueError("timeout must be nonnegative.")
+        if format not in {"auto", "function", "script"}:
+            raise ValueError("format must be auto, function or script.")
+        if format == "script" and args:
+            raise ValueError("Element args require auto or function format.")
+        if max_output_chars < 1:
+            raise ValueError("max_output_chars must be positive.")
         page = await _page_tab()
         existing = _dialog_state.current.get(str(page.target_id))
         if existing is not None:
@@ -1827,17 +1827,17 @@ async def evaluate_script(
         value = await _perform_action(
             tab,
             lambda: _await_with_timeout(
-                _evaluate_script_value(tab, function, args), timeout, "Script execution"
+                _evaluate_script_value(
+                    tab, function, args, format=format, timeout=timeout
+                ),
+                timeout,
+                "Script execution",
             ),
             wait_for_stable=wait_for_stable,
             dialog_action=dialog_action,
             prompt_text=prompt_text,
         )
-        return (
-            "```json\n"
-            + json.dumps(json_value(value), ensure_ascii=False)
-            + "\n```\nStatus: completed"
-        )
+        return await script_result(value, file_path, max_output_chars)
     except DialogInterrupted as exc:
         status = "failed" if exc.record.error else "interrupted"
         return f"Status: {status}\n{exc}\nDialog: " + json.dumps(

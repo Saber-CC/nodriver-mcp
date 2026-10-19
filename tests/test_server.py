@@ -188,10 +188,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         seen = set()
 
         def sender(name):
+            evaluations = 0
+
             async def send(command):
+                nonlocal evaluations
                 message = next(command)
                 if message["method"] != "Runtime.evaluate":
                     return None
+                evaluations += 1
+                if evaluations == 1:
+                    return uc.cdp.runtime.RemoteObject(
+                        type_="boolean", value=True
+                    ), None
                 seen.add(name)
                 if len(seen) == 2:
                     entered.set()

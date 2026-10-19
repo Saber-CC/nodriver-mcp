@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.7 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.8 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -179,6 +179,14 @@ prompt content. Script results report `completed`, `interrupted`, `failed` or
 `timed_out`; the JSON value remains in its code block. `timeout` bounds script
 execution (30000 ms by default, 0 to disable). Open dialogs are tracked per page,
 so blocked interactions fail promptly while diagnostic tools remain usable.
+
+Script `format` can be `auto` (default), `function` or `script`. Auto evaluates
+expressions and statements once, invoking a returned function when appropriate.
+The native execution deadline also bounds synchronous loops. Temporary element
+handles are released after execution. `file_path` saves the complete JSON result;
+`max_output_chars` limits inline output (default 20000). Larger results are saved
+automatically under `~/.nodriver-mcp/artifacts/scripts`, with a clearly labeled
+preview and the full file path. Set `NODRIVER_ARTIFACTS_DIR` to change this root.
 
 ### Native frames and element search
 
