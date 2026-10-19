@@ -321,6 +321,29 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                     await call(
                         session, "fill", uid=field, value="client-alpha", page_id=a
                     )
+                    with tempfile.TemporaryDirectory() as result_dir:
+                        output = os.path.join(result_dir, "result 文件.json")
+                        saved = await call(
+                            session,
+                            "evaluate_script",
+                            function="(() => ({rows:Array.from({length:500},(_,i)=>i)}))()",
+                            file_path=output,
+                            max_output_chars=100,
+                            wait_for_stable=False,
+                            page_id=a,
+                        )
+                        self.assertIn("Preview truncated", saved)
+                        with open(output, encoding="utf-8") as file:
+                            self.assertEqual(json.load(file)["rows"][-1], 499)
+                    raw = await call(
+                        session,
+                        "evaluate_script",
+                        function="var cliFormatResult=42;cliFormatResult",
+                        format="script",
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    self.assertEqual(json.loads(raw.splitlines()[1]), 42)
                     self.assertIn(
                         "client-alpha",
                         await call(
