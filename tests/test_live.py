@@ -90,6 +90,22 @@ class Handler(BaseHTTPRequestHandler):
                 </script>""",
                 "text/html",
             )
+        elif self.path.startswith("/actions/destination"):
+            data, content_type = (
+                b"<title>Destination</title><p id='ready'>Loading</p>"
+                b"<script>setTimeout(() => ready.textContent='Destination ready', 60)</script>",
+                "text/html",
+            )
+        elif self.path.startswith("/actions"):
+            data, content_type = (
+                b"""<title>Action waits</title><p id='result'>Original</p>
+                <button onclick="setTimeout(() => result.textContent='Async ready', 40)">Async update</button>
+                <a href='/actions/destination'>Navigate now</a>
+                <button onclick="window.open('/actions/destination')">Open popup</button>
+                <button onclick="window.busy=setInterval(() => result.textContent=String(Date.now()), 20)">Busy DOM</button>
+                <button onclick="alert('manual dialog probe')">Open dialog</button>""",
+                "text/html",
+            )
         else:
             html = """<title>Native integration</title>
             <input aria-label="Main input"><select aria-label="Choice"><option value="a">A</option><option value="b">B</option></select>
@@ -514,6 +530,58 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await s.evaluate_script("console.log('beta-still-active')", page_id=b)
         self.assertIn("beta-still-active", await s.list_console_messages(page_id=b))
         self.assertEqual(s._selected_target_id, a)
+
+    async def test_action_waiter_observes_async_dom_navigation_and_popups(self):
+        await s.new_page(self.url + "actions")
+        page = s._selected_target_id
+        snapshot = await s.take_snapshot()
+        uid = re.search(r'uid=(\S+) button "Async update"', snapshot).group(1)
+        result = await s.click(uid, include_snapshot=True)
+        self.assertIn("Async ready", result)
+        uid = re.search(r'uid=(\S+) button "Open popup"', result).group(1)
+        result = await s.click(uid)
+        popup = re.search(r"Opened page_ids: (\w+)", result).group(1)
+        self.assertNotEqual(popup, page)
+        self.assertEqual(s._selected_target_id, page)
+        self.assertIn("Destination ready", await s.take_snapshot(page_id=popup))
+        snapshot = await s.take_snapshot(page_id=page)
+        uid = re.search(r'uid=(\S+) link "Navigate now"', snapshot).group(1)
+        result = await s.click(uid, include_snapshot=True, page_id=page)
+        self.assertIn("Destination ready", result)
+        self.assertIn("Navigation observed", result)
+        self.assertNotIn("Original", result)
+        self.assertIn("stale", await s.click(uid, page_id=page))
+
+    async def test_action_waiter_bounds_busy_dom_and_cleans_dialog_interruption(self):
+        await s.new_page(self.url + "actions")
+        page = await s._page_tab()
+        events = (
+            uc.cdp.page.FrameStartedNavigating,
+            uc.cdp.page.FrameRequestedNavigation,
+            uc.cdp.page.FrameNavigated,
+            uc.cdp.page.FrameStoppedLoading,
+            uc.cdp.page.JavascriptDialogOpening,
+        )
+        counts = {event: len(page.handlers.get(event, [])) for event in events}
+        snapshot = await s.take_snapshot()
+        uid = re.search(r'uid=(\S+) button "Busy DOM"', snapshot).group(1)
+        start = asyncio.get_running_loop().time()
+        result = await s.click(uid)
+        self.assertIn("DOM stability wait reached", result)
+        self.assertLess(asyncio.get_running_loop().time() - start, 6)
+        await s.evaluate_script("clearInterval(window.busy)", wait_for_stable=False)
+        snapshot = await s.take_snapshot()
+        uid = re.search(r'uid=(\S+) button "Open dialog"', snapshot).group(1)
+        result = await asyncio.wait_for(s.click(uid), 5)
+        self.assertIn("interrupted by alert", result)
+        await s.handle_dialog(action="dismiss")
+        self.assertIn(
+            "Action waits",
+            await s.evaluate_script("document.title", wait_for_stable=False),
+        )
+        self.assertEqual(
+            {event: len(page.handlers.get(event, [])) for event in events}, counts
+        )
 
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")

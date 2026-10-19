@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 78 regression/integration tests: **77 passed, 1 skipped** (MCP version 1.5.0).
+- 85 regression/integration tests: **84 passed, 1 skipped** (MCP version 1.5.1).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -153,6 +153,11 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   did not block another page. Closing an earlier tab preserved stable IDs;
   closed IDs failed without falling back. A real stdio client discovered the
   new parameters, filled two pages concurrently and verified independent values.
+- Action observation is installed before trusted input, then waits for bounded
+  navigation/DOM settling before appended snapshots. Real Chrome verified delayed
+  updates, click navigation, popup IDs, busy-DOM time limits and dialog
+  interruption/cleanup. Script callers may skip DOM settling for read-only work.
+  Cancellation, setup failure and stalled-observer cleanup passed fault injection.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
