@@ -1,109 +1,211 @@
 # nodriver-mcp
 
-An undetected alternative to [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp). Powered by [nodriver](https://github.com/ultrafunkamsterdam/nodriver) to bypass anti-bot detection while providing the same MCP browser automation tools for AI coding agents.
-
-## Why?
-
-`chrome-devtools-mcp` uses Puppeteer under the hood, which exposes CDP/WebDriver fingerprints that are easily detected by anti-bot systems (Cloudflare, hCaptcha, etc.).
-
-`nodriver` is the successor of `undetected-chromedriver`. It communicates directly via the CDP protocol without relying on a ChromeDriver binary or injecting Selenium/WebDriver markers, significantly reducing the chance of detection.
+A Python MCP server for Chromium automation using official **nodriver 0.50.6**.
+It exposes 72 MCP tools for page interaction, native cookies and screenshots,
+frames, network inspection, website WebMCP tools and the complete generated CDP API.
 
 ## Installation
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended):
+Python 3.12+ and Chrome/Chromium are required. Use an isolated tool environment:
 
 ```bash
-# Install as an isolated tool (won't affect your global Python environment)
 uv tool install "nodriver-mcp @ git+https://github.com/Saber-CC/nodriver-mcp.git@main"
-```
-
-> ⚠️ Avoid using `pip install` — this project depends on a [patched fork of nodriver](https://github.com/Saber-CC/nodriver/commit/ec323db) that fixes Chrome 146 compatibility (`sameParty` removed from Cookie, `privateNetworkRequestPolicy` renamed to `localNetworkAccessRequestPolicy`). Using `pip install` will overwrite the original nodriver in your global Python environment. `uv tool install` keeps it isolated.
-
-## Upgrade
-
-```bash
 uv tool upgrade nodriver-mcp
 ```
 
-## One-command MCP Client Setup
+The official dependency is pinned to `nodriver==0.50.6`. A patched fork is no
+longer required for Chrome 146's removed `sameParty` and renamed
+`localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
+virtual environment also provides isolation.
+
+For a source checkout:
 
 ```bash
-# Interactive client selector (terminal TUI)
-nodriver-mcp install
-
-# Install to specific clients
-nodriver-mcp install claude,cursor,kiro
-
-# Uninstall
-nodriver-mcp uninstall claude
-
-# List all supported clients
-nodriver-mcp --list-clients
-
-# Print MCP config JSON (for manual setup)
-nodriver-mcp --config
-
-# Project-level config (writes to .cursor/mcp.json, etc.)
-nodriver-mcp install --scope project
+uv sync
+uv run nodriver-mcp
 ```
 
-Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Copilot CLI, Kiro, VS Code, Cline, Roo Code, Amazon Q, Warp, Opencode, Trae.
+The Cloudflare image-template helper additionally requires the optional vision dependency:
 
-## Environment Variables
+```bash
+uv sync --extra vision
+```
+
+## Configure MCP clients
+
+```bash
+nodriver-mcp install
+nodriver-mcp install claude,cursor,kiro
+nodriver-mcp install --scope project
+nodriver-mcp uninstall claude
+nodriver-mcp --list-clients
+nodriver-mcp --config
+```
+
+The installer supports JSON and TOML client configurations. `--list-clients`
+shows the available clients on the current platform.
+
+## Browser configuration
+
+The browser starts on the first browser tool call. Discovery of CDP bindings
+can run without launching Chrome. The server uses stdio transport.
 
 | Variable | Description | Default |
-|----------|-------------|---------|
-| `NODRIVER_HEADLESS` | Headless mode (`true`/`false`) | `false` |
-| `NODRIVER_USER_DATA_DIR` | Chrome user data directory | Auto-created temp dir |
-| `NODRIVER_BROWSER_PATH` | Chrome executable path | Auto-detected |
-| `NODRIVER_PROXY` | Proxy server address | None |
+| --- | --- | --- |
+| `NODRIVER_HEADLESS` | Run without a visible window | `false` |
+| `NODRIVER_USER_DATA_DIR` | Persistent profile directory | `~/.nodriver-mcp/chrome-profile` |
+| `NODRIVER_BROWSER_PATH` | Browser executable | Native auto-detection |
+| `NODRIVER_PROXY` | Browser proxy address | Unset |
+| `NODRIVER_BROWSER_ARGS` | JSON array of extra native browser arguments | `[]` |
+| `NODRIVER_EXTENSIONS` | JSON array of extension directories/CRX paths, loaded with native Config.add_extension | `[]` |
 
-## Tools (42)
+`create_browser_context` supports per-context proxies through the native
+`Browser.create_context`, including nodriver's HTTP/SOCKS authentication forwarder.
+Named contexts can also be reused with `new_page(isolated_context="name")`.
+Cookies and storage tools operate in the selected context.
 
-Network collection is enabled automatically on each tab.
-Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` and `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
-For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_page(...)` so the first real request already carries mobile signals. The manual `about:blank -> emulate_device/emulate -> navigate_page` flow still works when you want finer control.
+## Tools
 
-### Input Automation (10)
-`click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog`
+### Input and navigation
 
-### Navigation (7)
-`navigate_page` · `new_page` · `close_page` · `list_pages` · `select_page` · `wait_for` · `scroll_page`
+`click`, `click_at`, `hover`, `fill`, `fill_form`, `type_text`, `press_key`, `drag`,
+`upload_file`, `handle_dialog`, `navigate_page`, `new_page`, `close_page`,
+`list_pages`, `select_page`, `wait_for`, `scroll_page`.
 
-### Screenshots & Debugging (7)
-`take_screenshot` · `take_snapshot` · `evaluate_script` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message`
+`select_page` persists the selected page for subsequent tools. A background page
+preserves that selection. `navigate_page` and `new_page` accept a device preset
+before the first real navigation request.
 
-### Network Monitoring (2)
-`list_network_requests` · `get_network_request`
+### Native frames and element search
 
-### Device Emulation (4)
-`emulate` · `emulate_device` · `reset_emulation` · `resize_page`
+`list_frames`, `select_frame`, `find_elements`.
 
-### Performance (3)
-`performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot`
+`list_frames` combines native `Tab.get_frames()` with the page frame tree.
+`select_frame(frame_id="")` returns to the main page. Snapshots and scripts
+respect the selected frame; `take_snapshot(include_frames=true)` includes child
+frames. Element UIDs retain their page/frame connection, so an old UID cannot
+silently operate on another page.
 
-### Cookies & Storage (4)
-`get_cookies` · `set_cookie` · `get_local_storage` · `set_local_storage`
+`find_elements` uses native text, CSS or XPath search and returns actionable UIDs:
 
-### Session Management (3)
-`save_session` · `load_session` · `list_sessions`
+```text
+find_elements(selector="input[type=email]")
+find_elements(text="Continue")
+find_elements(text="Continue", best_match=true)
+find_elements(xpath="//button[contains(., 'Continue')]")
+```
 
-### Anti-Detection Helpers (2)
-`cf_verify` · `bypass_insecure_warning`
+### Screenshots and debugging
 
-## Comparison with chrome-devtools-mcp
+`take_screenshot`, `take_snapshot`, `evaluate_script`, `enable_console_collection`,
+`disable_console_collection`, `list_console_messages`, `get_console_message`,
+`get_browser_info`, `get_connection_history`.
 
-| Feature | chrome-devtools-mcp | nodriver-mcp |
-|---------|-----|-----|
-| Browser backend | Puppeteer (ChromeDriver) | nodriver (direct CDP) |
-| WebDriver fingerprint | ✗ Exposed | ✓ None |
-| navigator.webdriver | ✗ true | ✓ undefined |
-| Cloudflare bypass | ✗ | ✓ Built-in cf_verify |
-| Install method | npx | uv tool install |
-| Language | TypeScript / Node.js | Python |
-| Core tool coverage | 29 tools | 40 tools |
+Use text snapshots for reading pages. Ordinary PNG/JPEG screenshots delegate to
+`Tab.save_screenshot(as_base64=True)` and return native MCP image content, or
+save a file when `file_path` is supplied. Element crops, WebP and explicit
+quality use the official generated CDP screenshot command because those
+arguments are not exposed by the native helper.
 
-Tools not implemented: `performance_analyze_insight` (requires DevTools frontend trace parser), `lighthouse_audit` (requires Lighthouse Node API), `screencast_start/stop` (requires ffmpeg + Puppeteer), extension management (experimental).
+Console collection is opt-in and does not enable `Runtime` during ordinary
+browsing. Explicit console/event tools can enable it when needed.
+
+### Cookies, storage and sessions
+
+`get_cookies`, `set_cookie`, `set_cookies`, `clear_cookies`, `save_cookies`,
+`load_cookies`, `get_local_storage`, `set_local_storage`, `save_session`,
+`load_session`, `list_sessions`.
+
+Cookie tools directly use the official `CookieJar` methods. `set_cookies`
+accepts a list of CDP cookie objects, including `expires`, `sameSite`,
+`httpOnly` and `partitionKey`; snake_case top-level fields also work.
+
+`save_cookies` and `load_cookies` use nodriver's native pickle format for locally
+created cookie files. `save_session` retains the JSON format and also stores
+localStorage and page URLs. Legacy JSON sessions can still be loaded, with
+cookie expiry converted into the official typed value before a native batch set.
+
+### Network, emulation and performance
+
+`list_network_requests`, `get_network_request`, `configure_network_capture`,
+`emulate`, `emulate_device`, `reset_emulation`, `resize_page`,
+`performance_start_trace`, `performance_stop_trace`, `take_memory_snapshot`.
+
+Network collection starts before a new page's first request. Request IDs remain
+stable under filtering and pagination; body retrieval uses the connection that
+originated the request. `configure_network_capture` configures the new native
+durable-message API for response bodies across process changes.
+
+Trace export consumes the native `TracingComplete.stream` using `IO.read` and
+`IO.close`. Stopping a trace uses its original connection even after selecting
+another page.
+
+### Website WebMCP tools
+
+`list_webmcp_tools`, `call_webmcp_tool`, `get_webmcp_invocation`,
+`cancel_webmcp_invocation`.
+
+These discover business tools explicitly registered by a website. They extend
+browser automation; sites without registered WebMCP tools continue to use
+snapshots, clicks and scripts.
+
+```text
+list_webmcp_tools()
+call_webmcp_tool(tool_name="search_products", input={"query": "keyboard"})
+```
+
+Pass `wait_for_result=false` to receive an invocation ID, then read its result
+or cancel it. Supply `frame_id` when the same tool name exists in multiple frames.
+The browser must expose the website's WebMCP registration API. A successful CDP
+`WebMCP.enable` call alone does not establish that this page API is available.
+Use `NODRIVER_BROWSER_ARGS` for feature flags required by a particular browser build.
+
+### Additional 0.50.6 browser capabilities
+
+`find_in_page`, `start_screen_recording`, `stop_screen_recording`,
+`get_annotated_page_content`, `list_extensions`, `trigger_extension_action`,
+`get_ad_info`, `get_crash_report_context`, `create_browser_context`,
+`close_browser_context`.
+
+Native screen recording writes Chrome's stream without a separate ffmpeg
+process. Annotated page content is a base64 protobuf, distinct from readable
+accessibility snapshots. These experimental capabilities depend on the browser
+build and enabled features; protocol failures are reported rather than simulated.
+
+### Complete official CDP coverage
+
+`list_cdp_commands`, `send_cdp_command`, `list_cdp_events`, `subscribe_cdp_events`,
+`get_cdp_events`, `unsubscribe_cdp_events`.
+
+All 675 generated official commands are discoverable, including every one of the
+58 commands added since the old 0.48.1 baseline. This covers specialized domains
+such as SmartCardEmulation, DigitalCredentials, new display/keyboard/CPU emulation,
+DOM/CSS changes, virtual cameras and device-bound sessions.
+
+```text
+list_cdp_commands(domain="Emulation", query="keyboard")
+send_cdp_command(domain="Emulation", command="setVirtualKeyboardGeometryOverride",
+                 parameters={"x": 0, "y": 600, "width": 412, "height": 315})
+subscribe_cdp_events(events=["SmartCardEmulation.establishContextRequested"])
+get_cdp_events(subscription_id="1")
+unsubscribe_cdp_events(subscription_id="1")
+```
+
+Use `scope="browser"` for browser-wide commands. Top-level command parameters
+accept Python snake_case or CDP camelCase; nested objects use CDP JSON names.
+Values are constructed with nodriver's generated enums, IDs and dataclasses.
+Discovering a binding does not imply that every Chrome version implements it.
+
+## Validation and upgrade notes
+
+```bash
+uv run python -m unittest discover -s tests -v
+NODRIVER_MCP_LIVE_TESTS=1 uv run python -m unittest discover -s tests -v
+```
+
+Live tests launch headless Chrome with temporary profiles and a local HTTP
+server. See [the upgrade coverage and implementation notes](docs/nodriver-0.50.6.md)
+for the complete added-command inventory and native API decisions.
 
 ## License
 
