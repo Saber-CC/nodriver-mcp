@@ -33,6 +33,7 @@ from pydantic import StrictBool, ValidationError
 from .actions import ActionResult, ActionWaiter
 from .console import ConsoleCollector, format_message, format_stack
 from .dialogs import DialogInterrupted, DialogRegistry
+from .emulation import EmulationOverrides, http_headers, media_updates
 from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
@@ -299,6 +300,7 @@ async def _page_tab() -> uc.Tab:
             tab = browser.tabs[-1]
             _selected_target_id = str(tab.target_id)
     await _prepare_page(tab)
+    await _emulation_overrides.sync(tab, str(tab.target_id))
     record = _dialog_state.current.get(str(tab.target_id))
     if record is not None and call is not None and call.blocked_by_dialog:
         raise DialogInterrupted(record)
@@ -376,6 +378,9 @@ _last_trace_path = ""
 _shutdown_callbacks: list[Any] = []
 _page_cleanup_callbacks: list[Any] = []
 _focused_pages: dict[int, Any] = {}
+_emulation_overrides = EmulationOverrides(
+    lambda tab: _auto_enable_network_collection(tab)
+)
 
 
 async def _prepare_page(tab: uc.Tab) -> None:
@@ -412,6 +417,7 @@ def _clear_collection_state(tab: uc.Tab) -> None:
     """Remove this connection's collectors before retiring its transport."""
     key = _tab_key(tab)
     _focused_pages.pop(key, None)
+    _emulation_overrides.retire(tab)
     _dialog_state.forget(tab)
     collector = _console_callbacks.pop(key, None)
     if collector is not None:
@@ -435,6 +441,7 @@ async def _forget_page_state(tab: uc.Tab) -> None:
     for cleanup in _page_cleanup_callbacks:
         await cleanup(key)
     _clear_collection_state(tab)
+    _emulation_overrides.forget(key)
     _selected_frames.pop(key, None)
     _frame_discovery_locks.pop(key, None)
     for pair, connection in list(_frame_connections.items()):
@@ -531,6 +538,7 @@ async def _shutdown_browser() -> None:
         state.clear()
     _selected_target_id = None
     _dialog_state.clear()
+    _emulation_overrides.clear()
     _tracing_active = False
     _trace_stopping = False
     _trace_tab = None
@@ -678,6 +686,7 @@ async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
         retired = {}
         for frame_id, (frame, connection) in discovered.items():
             _dialog_state.watch(connection, root_id)
+            await _emulation_overrides.sync(connection, root_id)
             key = (root_id, frame_id)
             previous = _frame_connections.get(key)
             loader = str(frame.loader_id)
@@ -1158,8 +1167,19 @@ async def _apply_emulation(
     accept_language: str = "",
     color_scheme: str = "",
     viewport: str = "",
+    forced_colors: str = "",
+    prefers_contrast: str = "",
+    prefers_reduced_motion: str = "",
+    extra_http_headers: dict[str, str] | str | None = None,
 ) -> list[str]:
     """Apply emulation settings and return a human-readable summary."""
+    updates = media_updates(
+        color_scheme=color_scheme,
+        forced_colors=forced_colors,
+        prefers_contrast=prefers_contrast,
+        prefers_reduced_motion=prefers_reduced_motion,
+    )
+    headers = http_headers(extra_http_headers)
     results = []
 
     if network_conditions:
@@ -1244,24 +1264,15 @@ async def _apply_emulation(
             await tab.send(cdp_net.set_user_agent_override(user_agent=""))
             results.append("user_agent reset")
 
-    if color_scheme and color_scheme != "auto":
-        import nodriver.cdp.emulation as cdp_emu
-
-        await tab.send(
-            cdp_emu.set_emulated_media(
-                features=[
-                    cdp_emu.MediaFeature(
-                        name="prefers-color-scheme", value=color_scheme
-                    )
-                ]
-            )
+    if updates or headers is not None:
+        page = await _page_tab()
+        frames = await _discover_frames(page)
+        await _emulation_overrides.update(
+            str(page.target_id), [page, *(c for _, c in frames)], updates, headers
         )
-        results.append(f"color_scheme={color_scheme}")
-    elif color_scheme == "auto":
-        import nodriver.cdp.emulation as cdp_emu
-
-        await tab.send(cdp_emu.set_emulated_media(features=[]))
-        results.append("color_scheme=auto (reset)")
+        results.extend(f"{name}={value or 'auto'}" for name, value in updates.items())
+        if headers is not None:
+            results.append(f"extra_http_headers={len(headers)}")
 
     if viewport:
         import nodriver.cdp.emulation as cdp_emu
@@ -1355,8 +1366,12 @@ async def _reset_emulation(tab: uc.Tab) -> list[str]:
     await tab.send(cdp_net.set_user_agent_override(user_agent=""))
     results.append("user_agent=reset")
 
-    await tab.send(cdp_emu.set_emulated_media(features=[]))
-    results.append("color_scheme=reset")
+    page = await _page_tab()
+    frames = await _discover_frames(page)
+    await _emulation_overrides.update(
+        str(page.target_id), [page, *(c for _, c in frames)], reset=True
+    )
+    results.append("media_and_headers=reset")
 
     await tab.send(cdp_emu.clear_device_metrics_override())
     results.append("viewport=reset")
@@ -1636,6 +1651,10 @@ async def emulate(
     color_scheme: str = "",
     viewport: str = "",
     *,
+    forced_colors: str = "",
+    prefers_contrast: str = "",
+    prefers_reduced_motion: str = "",
+    extra_http_headers: dict[str, str] | str | None = None,
     page_id: int | str | None = None,
 ) -> str:
     """Emulates various features on the selected page.
@@ -1646,9 +1665,13 @@ async def emulate(
         geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to leave unchanged, or set to "" to clear.
         user_agent: User agent string. Omit to leave unchanged, or set to "" to clear.
         color_scheme: "dark", "light", or "auto". Empty to skip.
+        forced_colors: active, none or auto (reset only this feature).
+        prefers_contrast: more, less, custom, no-preference or auto.
+        prefers_reduced_motion: reduce, no-preference or auto.
+        extra_http_headers: String-valued object (or JSON string); replaces headers, {} or empty string clears. Omit to preserve.
         viewport: Viewport as "widthxheightxdpr[,mobile][,touch][,landscape]" (e.g. "375x812x3,mobile,touch"). Empty to skip.
     """
-    tab = await _active_tab()
+    tab = await _page_tab()
     results = await _apply_emulation(
         tab,
         network_conditions=network_conditions,
@@ -1656,6 +1679,10 @@ async def emulate(
         geolocation=geolocation,
         user_agent=user_agent,
         color_scheme=color_scheme,
+        forced_colors=forced_colors,
+        prefers_contrast=prefers_contrast,
+        prefers_reduced_motion=prefers_reduced_motion,
+        extra_http_headers=extra_http_headers,
         viewport=viewport,
     )
 
@@ -1669,7 +1696,7 @@ async def emulate(
 @_page_tool()
 async def reset_emulation(*, page_id: int | str | None = None) -> str:
     """Reset emulation overrides on the selected page back to browser defaults."""
-    tab = await _active_tab()
+    tab = await _page_tab()
     results = await _reset_emulation(tab)
     return "Emulation reset: " + ", ".join(results)
 
@@ -1682,6 +1709,10 @@ async def emulate_device(
     cpu_throttling_rate: float = 0,
     geolocation: str | None = None,
     *,
+    forced_colors: str = "",
+    prefers_contrast: str = "",
+    prefers_reduced_motion: str = "",
+    extra_http_headers: dict[str, str] | str | None = None,
     page_id: int | str | None = None,
 ) -> str:
     """Apply a named mobile/tablet device preset to the current page.
@@ -1699,7 +1730,7 @@ async def emulate_device(
             f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
         )
 
-    tab = await _active_tab()
+    tab = await _page_tab()
     device_results = await _apply_device_preset(tab, device)
     extra_results = await _apply_emulation(
         tab,
@@ -1707,6 +1738,10 @@ async def emulate_device(
         cpu_throttling_rate=cpu_throttling_rate,
         geolocation=geolocation,
         color_scheme=color_scheme,
+        forced_colors=forced_colors,
+        prefers_contrast=prefers_contrast,
+        prefers_reduced_motion=prefers_reduced_motion,
+        extra_http_headers=extra_http_headers,
     )
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 

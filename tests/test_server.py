@@ -42,6 +42,7 @@ class FakeTab:
 class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         s._dialog_state.clear()
+        s._emulation_overrides.clear()
         self.addCleanup(s._dialog_state.clear)
         self.a, self.b = FakeTab("a"), FakeTab("b")
         self.browser = SimpleNamespace(
