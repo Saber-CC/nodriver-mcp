@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -86,6 +87,7 @@ async def _ensure_browser(
             config.add_extension(extension)
         await _browser.start()
         _selected_target_id = str(_browser.main_tab.target_id)
+        await _prepare_page(_browser.main_tab)
         await _auto_enable_network_collection(_browser.main_tab)
         logger.info(
             "Browser started (headless=%s, persistent=%s, profile=%s)",
@@ -258,6 +260,7 @@ async def _page_tab() -> uc.Tab:
                 raise ValueError("No open pages. Use new_page first.")
             tab = browser.tabs[-1]
             _selected_target_id = str(tab.target_id)
+    await _prepare_page(tab)
     if call is not None:
         call.page = tab
         call.frame_id = _selected_frames.get(str(tab.target_id))
@@ -325,6 +328,21 @@ _message_ids = itertools.count()
 _trace_tab: uc.Tab | None = None
 _shutdown_callbacks: list[Any] = []
 _page_cleanup_callbacks: list[Any] = []
+_focused_pages: dict[int, Any] = {}
+
+
+async def _prepare_page(tab: uc.Tab) -> None:
+    key = id(tab)
+    reference = _focused_pages.get(key)
+    if reference is not None and reference() is tab:
+        return
+    await tab.send(uc.cdp.emulation.set_focus_emulation_enabled(True))
+
+    def retired(reference):
+        if _focused_pages.get(key) is reference:
+            _focused_pages.pop(key, None)
+
+    _focused_pages[key] = weakref.ref(tab, retired)
 
 
 def _page_key(tab: uc.Tab) -> str:
@@ -345,6 +363,7 @@ def _tab_key(tab: uc.Tab) -> int:
 def _clear_collection_state(tab: uc.Tab) -> None:
     """Remove this connection's collectors before retiring its transport."""
     key = _tab_key(tab)
+    _focused_pages.pop(key, None)
     callback = _console_callbacks.pop(key, None)
     if callback is not None:
         tab.remove_handler(uc.cdp.runtime.ConsoleAPICalled, callback)
@@ -445,6 +464,7 @@ async def _shutdown_browser() -> None:
         _frame_discovery_locks,
         _console_callbacks,
         _network_callbacks,
+        _focused_pages,
         _uid_owners,
         _uid_to_backend_node_id,
         _unique_id_to_mcp_id,
@@ -1443,6 +1463,7 @@ async def start_browser(
                 pages[0],
             )
         _selected_target_id = str(tab.target_id)
+        await _prepare_page(tab)
         if url:
             _preserve_on_navigation(tab)
             _selected_frames.pop(_selected_target_id, None)
@@ -2162,6 +2183,7 @@ async def new_page(
             isolated_context=isolated_context,
             timeout=timeout,
         )
+        await _prepare_page(tab)
         await _auto_enable_network_collection(tab)
         if device:
             await _apply_device_preset(tab, device)
