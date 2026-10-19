@@ -89,6 +89,7 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                 body = (
                     "<title>Concurrent MCP</title><input aria-label='Field'>"
                     "<input type='checkbox' aria-label='Toggle'>"
+                    "<input id='upload' type='file' multiple aria-label='Upload'>"
                     f"<p>{self.path}</p>"
                 ).encode()
                 self.send_response(200)
@@ -196,6 +197,33 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         "fill", {"uid": toggle, "value": 1, "page_id": a}
                     )
                     self.assertTrue(invalid.is_error)
+                    with tempfile.TemporaryDirectory() as upload_dir:
+                        first = os.path.join(upload_dir, "client-one.txt")
+                        second = os.path.join(upload_dir, "client-two.txt")
+                        for path in (first, second):
+                            with open(path, "w", encoding="utf-8") as file:
+                                file.write("MCP file upload")
+                        snapshot = await call(session, "take_snapshot", page_id=a)
+                        upload = re.search(
+                            r'uid=(\S+) button "Upload"', snapshot
+                        ).group(1)
+                        await call(
+                            session,
+                            "upload_file",
+                            uid=upload,
+                            file_paths=[first, second],
+                            page_id=a,
+                        )
+                        self.assertIn(
+                            "2",
+                            await call(
+                                session,
+                                "evaluate_script",
+                                function="document.getElementById('upload').files.length",
+                                wait_for_stable=False,
+                                page_id=a,
+                            ),
+                        )
                     self.assertIn(
                         "client-alpha",
                         await call(

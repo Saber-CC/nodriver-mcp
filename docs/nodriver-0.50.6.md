@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 92 regression/integration tests: **91 passed, 1 skipped** (MCP version 1.5.2).
+- 99 regression/integration tests: **98 passed, 1 skipped** (MCP version 1.5.3).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -163,6 +163,11 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   radio groups, disabled/unresponsive controls and invalid values. Same-process
   and site-isolated iframe controls passed. A real MCP client accepted boolean
   values and rejected numbers without coercing them into checked states.
+- Native single/multiple file uploads, Unicode filenames and button-triggered
+  file choosers passed in real Chrome. File chooser routing passed same-process
+  and site-isolated iframe checks. Timeout and unsupported file counts left the
+  next upload usable; cancellation removed managed callbacks and interception.
+  A real stdio client uploaded multiple files through the new parameter.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
