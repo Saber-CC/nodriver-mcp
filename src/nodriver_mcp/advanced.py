@@ -35,8 +35,8 @@ def register_tools(mcp, s) -> None:
     """Register tools with the server's shared page/frame lifecycle services."""
     subscriptions: dict[str, dict] = {}
     subscription_ids = itertools.count(1)
-    web_states: dict[str, dict] = {}
-    recording: dict[str, Any] = {}
+    web_states: dict[int, dict] = {}
+    recordings: dict[str, dict] = {}
 
     async def connection(scope: str = "page"):
         if scope == "browser":
@@ -57,9 +57,26 @@ def register_tools(mcp, s) -> None:
                 if not future.done():
                     future.cancel()
         web_states.clear()
-        recording.clear()
+        recordings.clear()
+
+    async def cleanup_page(page_id):
+        for identifier, entry in list(subscriptions.items()):
+            if entry["page_id"] == page_id:
+                for event, callback in entry["callbacks"]:
+                    entry["connection"].remove_handler(event, callback)
+                del subscriptions[identifier]
+        for key, state in list(web_states.items()):
+            if s._page_key(state["connection"]) == page_id:
+                for event, callback in state["callbacks"]:
+                    state["connection"].remove_handler(event, callback)
+                for future in state["pending"].values():
+                    if not future.done():
+                        future.cancel()
+                del web_states[key]
+        recordings.pop(page_id, None)
 
     s._shutdown_callbacks.append(cleanup)
+    s._page_cleanup_callbacks.append(cleanup_page)
 
     @mcp.tool()
     async def get_browser_info(include_version_page: bool = False) -> dict:
@@ -78,14 +95,14 @@ def register_tools(mcp, s) -> None:
             result["version_page"] = await uc.util.get_browser_version_info(browser)
         return result
 
-    @mcp.tool(
+    @s._page_tool(
         description=(
             "Read native recent transactions (up to nodriver's 25 retained entries).\n\n"
             + _SERVICE_WORKER_ROUTER_NOTE
         )
     )
     async def get_connection_history(
-        limit: int = 10, scope: str = "page"
+        limit: int = 10, scope: str = "page", *, page_id: int | str | None = None
     ) -> list[dict]:
         """Read native recent transactions (up to nodriver's 25 retained entries)."""
         if not 1 <= limit <= 25:
@@ -103,8 +120,8 @@ def register_tools(mcp, s) -> None:
             for tx in tab.transactions[-limit:]
         ]
 
-    @mcp.tool()
-    async def list_frames() -> list[dict]:
+    @s._page_tool()
+    async def list_frames(*, page_id: int | str | None = None) -> list[dict]:
         """List same-process and connectable iframe sessions using native get_frames."""
         page = await s._page_tab()
         return [
@@ -114,31 +131,31 @@ def register_tools(mcp, s) -> None:
                 "url": frame.url,
                 "name": frame.name,
                 "separate_connection": tab is not page,
-                "selected": s._selected_frames.get(str(page.target_id))
-                == str(frame.id_),
+                "selected": s._selected_frame_id(page) == str(frame.id_),
             }
             for frame, tab in await s._discover_frames(page)
         ]
 
-    @mcp.tool()
-    async def select_frame(frame_id: str = "") -> str:
+    @s._page_tool()
+    async def select_frame(
+        frame_id: str = "", *, page_id: int | str | None = None
+    ) -> str:
         """Select a frame for snapshots/scripts, or pass empty to return to the main page."""
         page = await s._page_tab()
-        key = str(page.target_id)
         if not frame_id:
-            s._selected_frames.pop(key, None)
+            s._select_frame(page, None)
             return "Selected main frame."
         frames = await s._discover_frames(page)
         frame = next((frame for frame, _ in frames if str(frame.id_) == frame_id), None)
         if frame is None:
             raise ValueError("Unknown frame_id; use list_frames first.")
         if frame_id == str(frames[0][0].id_):
-            s._selected_frames.pop(key, None)
+            s._select_frame(page, None)
             return "Selected main frame."
-        s._selected_frames[key] = frame_id
+        s._select_frame(page, frame_id)
         return f"Selected frame {frame_id}."
 
-    @mcp.tool()
+    @s._page_tool()
     async def find_elements(
         text: str = "",
         selector: str = "",
@@ -146,6 +163,8 @@ def register_tools(mcp, s) -> None:
         timeout: float = 10,
         limit: int = 100,
         best_match: bool = False,
+        *,
+        page_id: int | str | None = None,
     ) -> list[dict]:
         """Use native find_all/select_all/xpath and return actionable element uids."""
         if sum(bool(value) for value in (text, selector, xpath)) != 1:
@@ -156,7 +175,7 @@ def register_tools(mcp, s) -> None:
             raise ValueError("best_match applies to text search.")
         tab = await s._active_tab()
         page = await s._page_tab()
-        frame_id = s._selected_frames.get(str(page.target_id))
+        frame_id = s._selected_frame_id(page)
         frame_element = (
             await s._frame_element(page, frame_id) if frame_id and tab is page else None
         )
@@ -203,17 +222,18 @@ def register_tools(mcp, s) -> None:
                     )
                 ]
         s._snapshot_id += 1
-        page_id = str((await s._page_tab()).target_id)
+        snapshot_id = s._snapshot_id
+        page_id = str(page.target_id)
         result = []
         for index, element in enumerate((elements or [])[:limit]):
             if element is None:
                 continue
-            uid = f"{s._snapshot_id}_find_{index}"
+            uid = f"{snapshot_id}_find_{index}"
             s._uid_to_backend_node_id[uid] = int(element.backend_node_id)
             s._uid_owners[uid] = (
                 page_id,
                 element.tab,
-                s._selected_frames.get(page_id, ""),
+                frame_id or "",
             )
             result.append(
                 {
@@ -254,13 +274,22 @@ def register_tools(mcp, s) -> None:
         if context is None:
             raise ValueError("Unknown context name.")
         browser = await s._get_browser()
+        await browser.update_targets()
+        pages = [
+            tab for tab in browser.tabs if tab.target.browser_context_id == context
+        ]
         await browser.send(uc.cdp.target.dispose_browser_context(context))
+        for page in pages:
+            await s._forget_page_state(page)
+            await page.aclose()
         del s._named_browser_contexts[name]
         await browser.update_targets()
         return f"Closed context '{name}'." + await s._format_pages()
 
-    @mcp.tool()
-    async def set_cookies(cookies: list[dict]) -> str:
+    @s._page_tool()
+    async def set_cookies(
+        cookies: list[dict], *, page_id: int | str | None = None
+    ) -> str:
         """Batch set cookies using native CookieJar.set_all and official CookieParam types.
 
         Entries accept CDP camelCase or Python snake_case fields, including
@@ -270,29 +299,33 @@ def register_tools(mcp, s) -> None:
         await (await s._cookie_jar()).set_all(typed)
         return f"Set {len(typed)} cookies in the selected context."
 
-    @mcp.tool()
-    async def clear_cookies() -> str:
+    @s._page_tool()
+    async def clear_cookies(*, page_id: int | str | None = None) -> str:
         """Clear the selected context's cookies through native CookieJar.clear."""
         await (await s._cookie_jar()).clear()
         return "Cookies cleared in the selected context."
 
-    @mcp.tool()
-    async def save_cookies(file_path: str) -> str:
+    @s._page_tool()
+    async def save_cookies(file_path: str, *, page_id: int | str | None = None) -> str:
         """Save context cookies with native CookieJar.save (nodriver pickle format)."""
         await (await s._cookie_jar()).save(file_path)
         return f"Native cookies saved to {file_path}."
 
-    @mcp.tool()
-    async def load_cookies(file_path: str, pattern: str = ".*") -> str:
+    @s._page_tool()
+    async def load_cookies(
+        file_path: str, pattern: str = ".*", *, page_id: int | str | None = None
+    ) -> str:
         """Load a locally created native cookie file through CookieJar.load."""
         await (await s._cookie_jar()).load(file_path, pattern=pattern)
         return f"Native cookies loaded from {file_path}."
 
-    @mcp.tool()
+    @s._page_tool()
     async def configure_network_capture(
         durable: bool = True,
         max_total_buffer_size: int = 20000000,
         max_resource_buffer_size: int = 5000000,
+        *,
+        page_id: int | str | None = None,
     ) -> str:
         """Configure native durable response bodies to survive cross-process navigation."""
         if max_total_buffer_size <= 0 or max_resource_buffer_size <= 0:
@@ -326,13 +359,15 @@ def register_tools(mcp, s) -> None:
             "commands": commands[offset : offset + limit],
         }
 
-    @mcp.tool()
+    @s._page_tool()
     async def send_cdp_command(
         domain: str,
         command: str,
         parameters: dict | None = None,
         scope: str = "page",
         timeout: int = 30000,
+        *,
+        page_id: int | str | None = None,
     ) -> Any:
         """Invoke an official generated command with JSON parameters and typed conversion.
 
@@ -361,7 +396,7 @@ def register_tools(mcp, s) -> None:
             result.append({"event": name, "description": description})
         return result
 
-    @mcp.tool(
+    @s._page_tool(
         description=(
             "Subscribe to official CDP events. Runtime is enabled only when requested here. "
             "Domains with a parameterless enable command are enabled automatically; "
@@ -374,6 +409,8 @@ def register_tools(mcp, s) -> None:
         scope: str = "page",
         enable_domain: bool = True,
         buffer_size: int = 200,
+        *,
+        page_id: int | str | None = None,
     ) -> str:
         """Subscribe to official CDP events. Runtime is enabled only when requested here.
 
@@ -386,6 +423,7 @@ def register_tools(mcp, s) -> None:
         target = await connection(scope)
         entry = {
             "connection": target,
+            "page_id": s._page_key(target) if scope == "page" else None,
             "callbacks": [],
             "events": deque(maxlen=buffer_size),
             "sequence": itertools.count(1),
@@ -430,30 +468,45 @@ def register_tools(mcp, s) -> None:
         subscriptions[identifier] = entry
         return identifier
 
-    @mcp.tool(
+    @s._page_tool(
         description=(
             "Read buffered events with stable per-subscription IDs.\n\n"
             + _SERVICE_WORKER_ROUTER_NOTE
         )
     )
     async def get_cdp_events(
-        subscription_id: str, after_id: int = 0, clear: bool = False
+        subscription_id: str,
+        after_id: int = 0,
+        clear: bool = False,
+        *,
+        page_id: int | str | None = None,
     ) -> list[dict]:
         """Read buffered events with stable per-subscription IDs."""
         entry = subscriptions.get(subscription_id)
         if entry is None:
             raise ValueError("Unknown subscription_id.")
+        if page_id is not None and entry["page_id"] != s._page_key(await s._page_tab()):
+            raise ValueError(
+                "Subscription belongs to a different page_id or browser scope."
+            )
         result = [event for event in entry["events"] if event["id"] > after_id]
         if clear:
             entry["events"].clear()
         return result
 
-    @mcp.tool()
-    async def unsubscribe_cdp_events(subscription_id: str) -> str:
+    @s._page_tool()
+    async def unsubscribe_cdp_events(
+        subscription_id: str, *, page_id: int | str | None = None
+    ) -> str:
         """Remove exactly this subscription's callbacks without disabling other consumers."""
-        entry = subscriptions.pop(subscription_id, None)
+        entry = subscriptions.get(subscription_id)
         if entry is None:
             raise ValueError("Unknown subscription_id.")
+        if page_id is not None and entry["page_id"] != s._page_key(await s._page_tab()):
+            raise ValueError(
+                "Subscription belongs to a different page_id or browser scope."
+            )
+        del subscriptions[subscription_id]
         for cls, callback in entry["callbacks"]:
             entry["connection"].remove_handler(cls, callback)
         return "Subscription removed."
@@ -503,19 +556,21 @@ def register_tools(mcp, s) -> None:
         web_states[key] = state
         return state
 
-    @mcp.tool()
-    async def list_webmcp_tools() -> list[dict]:
+    @s._page_tool()
+    async def list_webmcp_tools(*, page_id: int | str | None = None) -> list[dict]:
         """Discover business tools explicitly registered by the current website."""
         state = await web_state()
         return [tool.to_json() for tool in state["tools"].values()]
 
-    @mcp.tool()
+    @s._page_tool()
     async def call_webmcp_tool(
         tool_name: str,
         input: dict | None = None,
         frame_id: str = "",
         wait_for_result: bool = True,
         timeout: int = 30000,
+        *,
+        page_id: int | str | None = None,
     ) -> dict:
         """Invoke a website's WebMCP tool and return its result or invocation ID."""
         state = await web_state()
@@ -544,23 +599,29 @@ def register_tools(mcp, s) -> None:
         finally:
             state["pending"].pop(identifier, None)
 
-    @mcp.tool()
-    async def get_webmcp_invocation(invocation_id: str) -> dict:
+    @s._page_tool()
+    async def get_webmcp_invocation(
+        invocation_id: str, *, page_id: int | str | None = None
+    ) -> dict:
         """Read the result of an asynchronous website tool invocation."""
         state = await web_state()
         return state["results"].get(
             invocation_id, {"invocation_id": invocation_id, "status": "Pending"}
         )
 
-    @mcp.tool()
-    async def cancel_webmcp_invocation(invocation_id: str) -> str:
+    @s._page_tool()
+    async def cancel_webmcp_invocation(
+        invocation_id: str, *, page_id: int | str | None = None
+    ) -> str:
         """Cancel a pending website tool through the official WebMCP command."""
         state = await web_state()
         await state["connection"].send(uc.cdp.web_mcp.cancel_invocation(invocation_id))
         return f"Cancellation requested for {invocation_id}."
 
-    @mcp.tool()
-    async def find_in_page(query: str = "", action: str = "first") -> str:
+    @s._page_tool()
+    async def find_in_page(
+        query: str = "", action: str = "first", *, page_id: int | str | None = None
+    ) -> str:
         """Use native FindInPage search/highlighting: first, next, previous or stop."""
         commands = {
             "first": lambda: uc.cdp.find_in_page.find_first(query),
@@ -573,49 +634,73 @@ def register_tools(mcp, s) -> None:
         await (await s._active_tab()).send(commands[action]())
         return f"Page search: {action}."
 
-    @mcp.tool()
+    @s._page_tool()
     async def start_screen_recording(
         file_path: str,
         audio: bool = False,
         max_width: int = 0,
         max_height: int = 0,
         frame_rate: int = 0,
+        *,
+        page_id: int | str | None = None,
     ) -> str:
         """Start native Page screen recording; stop_screen_recording writes its stream."""
-        if recording:
-            raise ValueError("A recording is already active.")
         tab = await s._page_tab()
-        handle = await tab.send(
-            uc.cdp.page.start_screen_recording(
-                audio=audio,
-                max_width=max_width or None,
-                max_height=max_height or None,
-                frame_rate=frame_rate or None,
+        key = str(tab.target_id)
+        if key in recordings:
+            raise ValueError("A recording is already active on this page.")
+        recording = {"connection": tab, "file_path": file_path, "starting": True}
+        recordings[key] = recording
+        try:
+            recording["handle"] = await tab.send(
+                uc.cdp.page.start_screen_recording(
+                    audio=audio,
+                    max_width=max_width or None,
+                    max_height=max_height or None,
+                    frame_rate=frame_rate or None,
+                )
             )
-        )
-        recording.update(connection=tab, handle=handle, file_path=file_path)
+            recording["starting"] = False
+        except BaseException:
+            recordings.pop(key, None)
+            raise
         return "Screen recording started."
 
-    @mcp.tool()
-    async def stop_screen_recording(file_path: str = "") -> str:
+    @s._page_tool()
+    async def stop_screen_recording(
+        file_path: str = "", *, page_id: int | str | None = None
+    ) -> str:
         """Stop native screen recording and save bytes without requiring ffmpeg."""
-        if not recording:
+        if not recordings:
             raise ValueError("No recording is active.")
+        if page_id is None and len(recordings) == 1:
+            key = next(iter(recordings))
+        else:
+            key = str((await s._page_tab()).target_id)
+        recording = recordings.get(key)
+        if recording is None:
+            raise ValueError("No recording is active on this page.")
+        if recording["starting"] or recording.get("stopping"):
+            raise ValueError("This recording is still starting or already stopping.")
+        recording["stopping"] = True
         tab = recording["connection"]
-        handle = await tab.send(uc.cdp.page.stop_screen_recording())
         path = file_path or recording["file_path"]
         try:
+            handle = await tab.send(uc.cdp.page.stop_screen_recording())
             data = await s._read_stream(tab, handle)
             Path(path).write_bytes(data)
             if recording["handle"] != handle:
                 await tab.send(uc.cdp.io.close(recording["handle"]))
             return f"Recording saved to {path} ({len(data)} bytes)."
         finally:
-            recording.clear()
+            recordings.pop(key, None)
 
-    @mcp.tool()
+    @s._page_tool()
     async def get_annotated_page_content(
-        file_path: str = "", include_actionable_information: bool = True
+        file_path: str = "",
+        include_actionable_information: bool = True,
+        *,
+        page_id: int | str | None = None,
     ) -> dict:
         """Get Chrome's annotated content as base64 protobuf, or save its binary form.
 
@@ -644,8 +729,10 @@ def register_tools(mcp, s) -> None:
             await (await s._get_browser()).send(uc.cdp.extensions.get_extensions())
         )
 
-    @mcp.tool()
-    async def trigger_extension_action(extension_id: str) -> str:
+    @s._page_tool()
+    async def trigger_extension_action(
+        extension_id: str, *, page_id: int | str | None = None
+    ) -> str:
         """Trigger an extension's action for the selected page via official CDP."""
         page = await s._page_tab()
         await (await s._get_browser()).send(
@@ -655,8 +742,10 @@ def register_tools(mcp, s) -> None:
         )
         return "Extension action triggered."
 
-    @mcp.tool()
-    async def get_ad_info(include_scripts: bool = False) -> dict:
+    @s._page_tool()
+    async def get_ad_info(
+        include_scripts: bool = False, *, page_id: int | str | None = None
+    ) -> dict:
         """Read native ad metrics and optionally the page's ad script details."""
         tab = await s._active_tab()
         result = {"metrics": json_value(await tab.send(uc.cdp.ads.get_ad_metrics()))}
@@ -664,8 +753,8 @@ def register_tools(mcp, s) -> None:
             result["scripts"] = json_value(await tab.send(uc.cdp.ads.get_ad_scripts()))
         return result
 
-    @mcp.tool()
-    async def get_crash_report_context() -> Any:
+    @s._page_tool()
+    async def get_crash_report_context(*, page_id: int | str | None = None) -> Any:
         """Read context entries with the new CrashReportContext domain."""
         return json_value(
             await (await s._active_tab()).send(

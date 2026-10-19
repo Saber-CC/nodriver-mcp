@@ -2,7 +2,9 @@ import asyncio
 import base64
 import collections
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -47,11 +49,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        self.addAsyncCleanup(s._shutdown_callbacks[0])
         s._selected_target_id = "a"
         for value in (
             s._selected_frames,
+            s._closing_page_ids,
             s._frame_connections,
             s._frame_loaders,
+            s._frame_discovery_locks,
             s._uid_owners,
             s._unique_id_to_mcp_id,
             s._uid_to_backend_node_id,
@@ -66,6 +71,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ):
             value.clear()
         s._tracing_active = False
+        s._trace_stopping = False
         s._trace_tab = None
 
     async def test_tool_timeouts_keep_details_and_unexpected_failures_stay_generic(
@@ -120,6 +126,236 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await s.select_page(1, bring_to_front=False)
         self.assertIs(await s._active_tab(), self.b)
         self.b.activate.assert_not_awaited()
+
+    async def test_page_ids_are_exposed_in_tool_schemas(self):
+        for name in (
+            "take_snapshot",
+            "click",
+            "fill_form",
+            "press_key",
+            "take_screenshot",
+            "navigate_page",
+            "emulate",
+            "list_frames",
+            "find_elements",
+            "set_cookies",
+            "send_cdp_command",
+            "list_console_messages",
+            "get_network_request",
+            "start_screen_recording",
+        ):
+            with self.subTest(tool=name):
+                schema = s.mcp._tool_manager.get_tool(name).parameters
+                self.assertIn("page_id", schema["properties"])
+                self.assertNotIn("page_id", schema.get("required", []))
+                self.assertEqual(schema["properties"]["page_id"]["default"], None)
+
+    async def test_explicit_page_calls_overlap_without_changing_default_selection(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        seen = set()
+
+        def sender(name):
+            async def send(command):
+                message = next(command)
+                if message["method"] != "Runtime.evaluate":
+                    return None
+                seen.add(name)
+                if len(seen) == 2:
+                    entered.set()
+                await release.wait()
+                return uc.cdp.runtime.RemoteObject(type_="string", value=name), None
+
+            return send
+
+        self.a.send.side_effect = sender("a")
+        self.b.send.side_effect = sender("b")
+        tasks = [
+            asyncio.create_task(s.evaluate_script("location.href", page_id=page))
+            for page in ("a", "b")
+        ]
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            self.assertEqual(s._selected_target_id, "a")
+            await s.select_page("b", bring_to_front=False)
+        finally:
+            release.set()
+        results = await asyncio.gather(*tasks)
+        self.assertIn('"a"', results[0])
+        self.assertIn('"b"', results[1])
+        self.assertIsNone(s._page_call.get())
+        self.assertIs(await s._page_tab(), self.b)
+        self.a.activate.assert_not_awaited()
+        self.b.activate.assert_not_awaited()
+
+    async def test_default_page_is_pinned_through_nested_snapshot_work(self):
+        s._uid_owners["button"] = ("a", self.a, "")
+        observed = []
+
+        async def click(*_args):
+            s._selected_target_id = "b"
+            await asyncio.sleep(0)
+
+        async def snapshot():
+            observed.append(await s._page_tab())
+            return "pinned snapshot"
+
+        with (
+            patch.object(s, "_get_box_model", AsyncMock(return_value=(10, 20))),
+            patch.object(s, "_dispatch_mouse_click", click),
+            patch.object(s, "take_snapshot", snapshot),
+        ):
+            result = await s.click("button", include_snapshot=True)
+        self.assertIn("pinned snapshot", result)
+        self.assertEqual(observed, [self.a])
+        self.assertIs(await s._page_tab(), self.b)
+
+    async def test_stable_ids_survive_reordering_and_closed_ids_never_fall_back(self):
+        self.a.get_local_storage = AsyncMock(return_value={"owner": "page-a"})
+        self.b.get_local_storage = AsyncMock(return_value={"owner": "page-b"})
+        self.browser.tabs.reverse()
+        self.assertIn("page-a", await s.get_local_storage(page_id="a"))
+        self.assertIn("page-b", await s.get_local_storage(page_id=0))
+        self.assertEqual(s._selected_target_id, "a")
+        self.browser.tabs = [self.b]
+        for page_id in ("a", "missing", -1, 3):
+            with (
+                self.subTest(page_id=page_id),
+                self.assertRaisesRegex(ValueError, "page_id"),
+            ):
+                await s.get_local_storage(page_id=page_id)
+        self.assertEqual(self.b.get_local_storage.await_count, 1)
+        self.assertIsNone(s._page_call.get())
+
+    async def test_cancelled_explicit_call_restores_default_page_context(self):
+        async def send(command):
+            if next(command)["params"]["type"] != "keyUp":
+                raise asyncio.CancelledError()
+
+        self.b.send.side_effect = send
+        with self.assertRaises(asyncio.CancelledError):
+            await s.press_key("Control+A", page_id="b")
+        self.assertIsNone(s._page_call.get())
+        self.assertIs(await s._page_tab(), self.a)
+        s._uid_owners["foreign"] = ("b", self.b, "")
+        self.assertIn("stale", await s.click("foreign", page_id="a"))
+        self.a.send.assert_not_awaited()
+
+    async def test_preserved_navigation_history_is_retained_per_page(self):
+        for tab in (self.a, self.b, self.b, self.b, self.b):
+            marker = f"{tab.target_id}-{len(s._preserved_network_requests)}"
+            s._network_requests.append(
+                {
+                    "page_id": tab.target_id,
+                    "reqid": marker,
+                    "method": "GET",
+                    "type": "XHR",
+                    "url": marker,
+                }
+            )
+            s._preserve_on_navigation(tab)
+        a = await s.list_network_requests(include_preserved_requests=True, page_id="a")
+        b = await s.list_network_requests(include_preserved_requests=True, page_id="b")
+        self.assertIn("a-0", a)
+        self.assertNotIn("b-", a)
+        self.assertIn("3 of 3", b)
+        self.assertNotIn("a-", b)
+
+    async def test_event_subscriptions_validate_page_and_close_cleans_only_its_owner(
+        self,
+    ):
+        tool = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        first = await tool("subscribe_cdp_events")(
+            ["Runtime.consoleAPICalled"], enable_domain=False, page_id="a"
+        )
+        second = await tool("subscribe_cdp_events")(
+            ["Runtime.consoleAPICalled"], enable_domain=False, page_id="b"
+        )
+        for name in ("get_cdp_events", "unsubscribe_cdp_events"):
+            with self.assertRaisesRegex(ValueError, "different page_id"):
+                await tool(name)(first, page_id="b")
+        self.assertEqual(len(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+        await s._forget_page_state(self.a)
+        self.assertFalse(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled])
+        self.assertEqual(len(self.b.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+        self.assertEqual(await tool("get_cdp_events")(second, page_id="b"), [])
+        with self.assertRaisesRegex(ValueError, "Unknown subscription"):
+            await tool("get_cdp_events")(first)
+        with self.assertRaisesRegex(ValueError, "scope='page'"):
+            await tool("send_cdp_command")(
+                "Browser", "getVersion", scope="browser", page_id="a"
+            )
+
+    async def test_recordings_belong_to_each_page_and_default_stop_keeps_origin(self):
+        tool = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        self.a.send.return_value = "stream-a"
+        self.b.send.return_value = "stream-b"
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = Path(directory) / "a.webm", Path(directory) / "b.webm"
+            await asyncio.gather(
+                tool("start_screen_recording")(str(a), page_id="a"),
+                tool("start_screen_recording")(str(b), page_id="b"),
+            )
+            with self.assertRaisesRegex(ValueError, "already active"):
+                await tool("start_screen_recording")(str(a), page_id="a")
+
+            async def stream(tab, _handle):
+                return str(tab.target_id).encode()
+
+            with patch.object(s, "_read_stream", stream):
+                await tool("stop_screen_recording")(page_id="b")
+                self.assertFalse(a.exists())
+                self.assertEqual(b.read_bytes(), b"b")
+                s._selected_target_id = "b"
+                await tool("stop_screen_recording")()
+                self.assertEqual(a.read_bytes(), b"a")
+
+    async def test_trace_reserves_browser_wide_owner_before_first_send(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def send(command):
+            if next(command)["method"] == "Tracing.start":
+                entered.set()
+                await release.wait()
+
+        self.a.send.side_effect = send
+        first = asyncio.create_task(
+            s.performance_start_trace(reload=False, auto_stop=False, page_id="a")
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            self.assertIn(
+                "already running",
+                await s.performance_start_trace(
+                    reload=False, auto_stop=False, page_id="b"
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "different page_id"):
+                await s.performance_stop_trace(page_id="b")
+        finally:
+            release.set()
+        self.assertIn("Trace started", await first)
+        self.assertIs(s._trace_tab, self.a)
+        self.b.send.assert_not_awaited()
+
+    async def test_concurrent_closes_keep_one_page_open(self):
+        closed = []
+
+        def closer(tab):
+            async def close():
+                await asyncio.sleep(0)
+                closed.append(tab)
+                self.browser.tabs.remove(tab)
+
+            return close
+
+        for tab in (self.a, self.b):
+            tab.close = closer(tab)
+            tab.aclose = AsyncMock()
+        results = await asyncio.gather(s.close_page("a"), s.close_page("b"))
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(len(self.browser.tabs), 1)
+        self.assertTrue(any("last open page" in result for result in results))
+        self.assertFalse(s._closing_page_ids)
 
     async def test_shortcut_events_include_modifiers_and_physical_key_codes(self):
         events = []

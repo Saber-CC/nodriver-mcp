@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.4.3 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.0 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -144,6 +144,31 @@ are released after errors or cancellation. On macOS, use `Meta+A` to select all;
 native editing commands accompany the trusted keyboard events.
 
 ### Native frames and element search
+
+Page tools accept optional `page_id` for concurrent work on multiple tabs.
+Use the stable string ID shown by `list_pages`, returned in `start_browser`,
+or printed by `new_page`:
+
+```json
+{"function": "document.title", "page_id": "CHROME_TARGET_ID"}
+```
+
+This `evaluate_script` call targets that page without selecting or bringing it
+to the front. The same parameter is available on snapshots, input, navigation,
+screenshots, frames, emulation, cookies, console/network tools and page CDP calls.
+Nested work such as `fill_form` and `include_snapshot` stays on the same page,
+even if another call changes `select_page`. A closed/unknown ID fails explicitly.
+Omitting `page_id` keeps the selected-page workflow. Numeric list indexes remain
+accepted for compatibility; prefer string IDs because indexes move as tabs close.
+
+Frame selection and collected records belong to each page. Cookies remain shared
+by pages in the same browser context, as in Chrome; use `isolated_context` for
+separate cookie jars. Window resizing affects the shared Chrome window; use
+viewport emulation for independent page dimensions. Screen recording is tracked
+per page. Chrome permits one browser-wide performance trace at a time; an
+explicit `page_id` on trace stop must match its originating page. Browser/session
+startup and shutdown affect all pages. Concurrent actions on the same page can
+still interfere with each other's focus or navigation.
 
 `list_frames`, `select_frame`, `find_elements`.
 

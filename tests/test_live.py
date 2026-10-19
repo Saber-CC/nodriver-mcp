@@ -331,6 +331,190 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             await s._evaluate(tab, "document.activeElement.id"), "event-textarea"
         )
 
+    async def test_parallel_pages_keep_input_uids_snapshots_and_images_separate(self):
+        result = await s.new_page(self.url + "interaction")
+        a = re.search(r"page_id=(\w+)", result).group(1)
+        result = await s.new_page(self.url + "interaction", background=True)
+        b = re.search(r"page_id=(\w+)", result).group(1)
+        self.assertNotEqual(a, b)
+        self.assertEqual(s._selected_target_id, a)
+        await asyncio.gather(
+            s.evaluate_script(
+                "document.documentElement.style.background='rgb(255,0,0)'", page_id=a
+            ),
+            s.evaluate_script(
+                "document.documentElement.style.background='rgb(0,0,255)'", page_id=b
+            ),
+        )
+        snapshots = await asyncio.gather(
+            s.take_snapshot(page_id=a), s.take_snapshot(page_id=b)
+        )
+        uids = [
+            re.search(r'uid=(\S+) textbox "Event input"', text).group(1)
+            for text in snapshots
+        ]
+        self.assertNotEqual(*uids)
+        filled = await asyncio.gather(
+            s.fill_form(
+                [{"uid": uids[0], "value": "alpha"}], include_snapshot=True, page_id=a
+            ),
+            s.fill_form(
+                [{"uid": uids[1], "value": "beta"}], include_snapshot=True, page_id=b
+            ),
+        )
+        self.assertIn('value="alpha"', filled[0])
+        self.assertNotIn('value="beta"', filled[0])
+        self.assertIn('value="beta"', filled[1])
+        self.assertNotIn('value="alpha"', filled[1])
+        self.assertIn("stale", await s.fill(uids[0], "wrong-page", page_id=b))
+        await asyncio.gather(
+            s.type_text("!", submit_key="Tab", page_id=a),
+            s.type_text("?", submit_key="Tab", page_id=b),
+        )
+        values = await asyncio.gather(
+            *(
+                s.evaluate_script(
+                    "[document.getElementById('event-input').value,document.activeElement.id]",
+                    page_id=page,
+                )
+                for page in (a, b)
+            )
+        )
+        self.assertIn('"alpha!", "event-textarea"', values[0])
+        self.assertIn('"beta?", "event-textarea"', values[1])
+        images = await asyncio.gather(
+            s.take_screenshot(page_id=a), s.take_screenshot(page_id=b)
+        )
+        colors = [
+            PillowImage.open(io.BytesIO(img.data)).convert("RGB").getpixel((1, 1))
+            for img in images
+        ]
+        self.assertEqual(colors, [(255, 0, 0), (0, 0, 255)])
+        self.assertEqual(s._selected_target_id, a)
+
+        pending = asyncio.create_task(
+            s.evaluate_script(
+                "new Promise(resolve => {window.finishConcurrent=resolve;})", page_id=a
+            )
+        )
+        try:
+            async with asyncio.timeout(5):
+                while "function" not in await s.evaluate_script(
+                    "typeof window.finishConcurrent", page_id=a
+                ):
+                    await asyncio.sleep(0.02)
+            other = await asyncio.wait_for(
+                s.evaluate_script(
+                    "document.getElementById('event-input').value", page_id=b
+                ),
+                5,
+            )
+            self.assertIn("beta?", other)
+            self.assertFalse(pending.done())
+            await s.evaluate_script("window.finishConcurrent('completed-a')", page_id=a)
+            self.assertIn("completed-a", await asyncio.wait_for(pending, 5))
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+        victim = str(self.browser.tabs[0].target_id)
+        self.assertNotIn(victim, (a, b))
+        self.assertIn("Page closed", await s.close_page(victim))
+        self.assertIn(
+            "alpha!",
+            await s.evaluate_script(
+                "document.getElementById('event-input').value", page_id=a
+            ),
+        )
+        self.assertIn("Page closed", await s.close_page(a))
+        with self.assertRaisesRegex(ValueError, "closed page_id"):
+            await s.take_snapshot(page_id=a)
+        self.assertIn(
+            "beta?",
+            await s.evaluate_script(
+                "document.getElementById('event-input').value", page_id=b
+            ),
+        )
+
+    async def test_parallel_pages_isolate_frames_navigation_and_emulation(self):
+        a = s._selected_target_id
+        result = await s.new_page(self.url, background=True)
+        b = re.search(r"page_id=(\w+)", result).group(1)
+        frames = await self.tool("list_frames", page_id=a)
+        child = next(frame["frame_id"] for frame in frames if frame["parent_id"])
+        await self.tool("select_frame", frame_id=child, page_id=a)
+        snapshots = await asyncio.gather(
+            s.take_snapshot(page_id=a), s.take_snapshot(page_id=b)
+        )
+        self.assertIn("Frame input", snapshots[0])
+        self.assertNotIn("Main input", snapshots[0])
+        self.assertIn("Main input", snapshots[1])
+        found = await self.tool("find_elements", selector="input", page_id=a)
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("Error", await s.fill(found[0]["uid"], "frame-a", page_id=a))
+        await s.navigate_page(url=self.url + "interaction", page_id=b)
+        self.assertEqual(s._selected_frames[a], child)
+        self.assertIn("frame-a", await s.take_snapshot(page_id=a))
+        await self.tool("select_frame", page_id=a)
+        await asyncio.gather(
+            s.emulate(viewport="420x720x1", page_id=a),
+            s.emulate(viewport="800x600x1", page_id=b),
+        )
+        widths = await asyncio.gather(
+            s.evaluate_script("innerWidth", page_id=a),
+            s.evaluate_script("innerWidth", page_id=b),
+        )
+        self.assertIn("420", widths[0])
+        self.assertIn("800", widths[1])
+        self.assertEqual(s._selected_target_id, a)
+
+    async def test_parallel_pages_keep_console_and_network_records_separate(self):
+        a = s._selected_target_id
+        result = await s.new_page(self.url, background=True)
+        b = re.search(r"page_id=(\w+)", result).group(1)
+        await asyncio.gather(
+            s.enable_console_collection(page_id=a),
+            s.enable_console_collection(page_id=b),
+        )
+        await asyncio.gather(
+            *(
+                s.evaluate_script(
+                    f"(async () => {{console.log('owner-{label}'); await fetch('/api?owner={label}');}})()",
+                    page_id=page,
+                )
+                for page, label in ((a, "alpha"), (b, "beta"))
+            )
+        )
+        async with asyncio.timeout(5):
+            while not all(
+                any(
+                    r["page_id"] == page and r["finished"] and "owner=" in r["url"]
+                    for r in s._network_requests
+                )
+                for page in (a, b)
+            ):
+                await asyncio.sleep(0.02)
+        for page, own, other in ((a, "alpha", "beta"), (b, "beta", "alpha")):
+            console = await s.list_console_messages(page_id=page)
+            network = await s.list_network_requests(url_filter="owner=", page_id=page)
+            self.assertIn("owner-" + own, console)
+            self.assertNotIn("owner-" + other, console)
+            self.assertIn("owner=" + own, network)
+            self.assertNotIn("owner=" + other, network)
+            reqid = int(re.search(r"\[(\d+)\]", network).group(1))
+            self.assertIn(
+                "local-test", await s.get_network_request(reqid, page_id=page)
+            )
+            foreign = b if page == a else a
+            self.assertIn(
+                "No matching", await s.get_network_request(reqid, page_id=foreign)
+            )
+        await s.disable_console_collection(page_id=a)
+        await s.evaluate_script("console.log('beta-still-active')", page_id=b)
+        self.assertIn("beta-still-active", await s.list_console_messages(page_id=b))
+        self.assertEqual(s._selected_target_id, a)
+
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")
         snapshot = await s.take_snapshot()
