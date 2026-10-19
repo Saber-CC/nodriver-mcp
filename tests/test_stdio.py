@@ -3,6 +3,7 @@ import base64
 import json
 import io
 import os
+from pathlib import Path
 import re
 import sys
 import tempfile
@@ -338,6 +339,24 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Preview truncated", saved)
                         with open(output, encoding="utf-8") as file:
                             self.assertEqual(json.load(file)["rows"][-1], 499)
+                    with tempfile.TemporaryDirectory() as trace_dir:
+                        trace_path = os.path.join(trace_dir, "client-trace.json")
+                        report = await call(
+                            session,
+                            "performance_start_trace",
+                            reload=False,
+                            duration_ms=50,
+                            file_path=trace_path,
+                            page_id=a,
+                        )
+                        info = json.loads(report.partition("\n")[2])
+                        self.assertEqual(
+                            Path(info["file_path"]), Path(trace_path).resolve()
+                        )
+                        with open(trace_path) as file:
+                            self.assertEqual(
+                                info["event_count"], len(json.load(file)["traceEvents"])
+                            )
                     await call(
                         session,
                         "evaluate_script",

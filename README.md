@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.10 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.11 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -298,8 +298,14 @@ after an iframe connection is recreated initializes the new connection, even
 when Chrome reuses its target ID.
 
 Trace export consumes the native `TracingComplete.stream` using `IO.read` and
-`IO.close`. Stopping a trace uses its original connection even after selecting
-another page.
+`IO.close`. Every stopped trace is saved in full, by default under
+`~/.nodriver-mcp/artifacts/traces`; a path passed at start is retained for manual
+stop. JSON and `.gz` outputs are supported. The response reports the absolute
+path, event count, duration, categories/config and Chrome's data-loss flag.
+`duration_ms` controls automatic recording (default 5000), `categories` can
+replace DevTools defaults and `ignore_cache` applies during reload. Stopping
+uses the original connection after page switches. Cancellation and failure
+release recording state; closing its page/browser first finishes the trace.
 
 ### Website WebMCP tools
 

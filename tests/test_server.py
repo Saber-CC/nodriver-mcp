@@ -2,6 +2,7 @@ import asyncio
 import base64
 import collections
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -87,6 +88,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         s._tracing_active = False
         s._trace_stopping = False
         s._trace_tab = None
+        s._trace_metadata = {}
+        directory = tempfile.TemporaryDirectory(prefix="nodriver-trace-unit-")
+        self.addCleanup(directory.cleanup)
+        artifacts = patch.dict(os.environ, {"NODRIVER_ARTIFACTS_DIR": directory.name})
+        artifacts.start()
+        self.addCleanup(artifacts.stop)
 
     async def test_tool_timeouts_keep_details_and_unexpected_failures_stay_generic(
         self,
@@ -766,6 +773,50 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 events", result)
         self.assertEqual(self.a.handlers[uc.cdp.tracing.TracingComplete], [])
         self.b.send.assert_not_awaited()
+
+    async def test_trace_auto_stop_cancel_and_export_failure_clear_owned_state(self):
+        started = asyncio.Event()
+        trace = b'{"traceEvents":[{"name":"auto-test"}]}'
+
+        async def send(command):
+            method = next(command)["method"]
+            if method == "Tracing.start":
+                started.set()
+            if method == "Tracing.end":
+                for callback in list(self.a.handlers[uc.cdp.tracing.TracingComplete]):
+                    callback(SimpleNamespace(stream="handle", data_loss_occurred=True))
+
+        self.a.send.side_effect = send
+        with patch.object(s, "_read_stream", AsyncMock(return_value=trace)):
+            result = await s.performance_start_trace(
+                reload=False, duration_ms=10, categories=["blink.user_timing"]
+            )
+            info = json.loads(result.partition("\n")[2])
+            self.assertEqual(Path(info["file_path"]).read_bytes(), trace)
+            self.assertTrue(info["data_loss_occurred"])
+            self.assertGreater(info["duration_ms"], 0)
+            self.assertEqual(info["config"]["categories"], ["blink.user_timing"])
+            self.assertFalse(s._tracing_active)
+            started.clear()
+            task = asyncio.create_task(
+                s.performance_start_trace(reload=False, duration_ms=10000)
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(s._tracing_active)
+            self.assertFalse(self.a.handlers[uc.cdp.tracing.TracingComplete])
+            await s.performance_start_trace(reload=False, auto_stop=False)
+            with patch.object(
+                s, "save_trace", AsyncMock(side_effect=ValueError("disk full"))
+            ):
+                with self.assertRaisesRegex(ValueError, "disk full"):
+                    await s.performance_stop_trace()
+            self.assertFalse(s._tracing_active)
+            self.assertFalse(s._trace_stopping)
+            self.assertEqual(s._trace_metadata, {})
+            self.assertFalse(self.a.handlers[uc.cdp.tracing.TracingComplete])
 
     async def test_event_subscription_is_removed_without_touching_other_callbacks(self):
         def existing(event):

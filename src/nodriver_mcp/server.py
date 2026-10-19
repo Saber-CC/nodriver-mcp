@@ -39,6 +39,7 @@ from .keyboard import dispatch_shortcut, parse_shortcut
 from .network import NetworkCollector, request_details
 from .screenshots import screenshot_clip
 from .scripts import execute_script, script_error as _script_error, script_result
+from .traces import TRACE_CATEGORIES, save_trace
 from .uploads import FileUploads, upload_paths
 
 logging.basicConfig(
@@ -370,6 +371,8 @@ _uid_owners: dict[str, tuple[str, uc.Tab, str]] = {}
 _request_ids = itertools.count()
 _message_ids = itertools.count()
 _trace_tab: uc.Tab | None = None
+_trace_metadata: dict = {}
+_last_trace_path = ""
 _shutdown_callbacks: list[Any] = []
 _page_cleanup_callbacks: list[Any] = []
 _focused_pages: dict[int, Any] = {}
@@ -458,7 +461,7 @@ async def _forget_page_state(tab: uc.Tab) -> None:
 
 async def _shutdown_browser() -> None:
     global _browser, _selected_target_id, _tracing_active, _trace_tab, _trace_stopping
-    global _launch_options, _profile_lease
+    global _launch_options, _profile_lease, _trace_metadata
     for callback in _shutdown_callbacks:
         try:
             await callback()
@@ -531,6 +534,7 @@ async def _shutdown_browser() -> None:
     _tracing_active = False
     _trace_stopping = False
     _trace_tab = None
+    _trace_metadata = {}
 
 
 async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) -> Any:
@@ -1580,13 +1584,16 @@ async def close_page(page_id: int | str | None = None) -> str:
         return "Error: Cannot close the last open page."
     _closing_page_ids.add(key)
     try:
+        trace_info = ""
+        if _tracing_active and _trace_tab is tab:
+            trace_info = "\n" + await performance_stop_trace()
         await tab.close()
         await _forget_page_state(tab)
         await tab.aclose()
         await browser.update_targets()
     finally:
         _closing_page_ids.discard(key)
-    return "Page closed." + await _format_pages()
+    return "Page closed." + await _format_pages() + trace_info
 
 
 @_page_tool()
@@ -2303,41 +2310,95 @@ async def performance_start_trace(
     auto_stop: bool = True,
     file_path: str = "",
     *,
+    duration_ms: int = 5000,
+    categories: list[str] | None = None,
+    ignore_cache: bool = False,
     page_id: int | str | None = None,
 ) -> str:
-    """Start an official CDP trace; retain its connection when pages are switched."""
-    global _tracing_active, _trace_tab
+    """Record a native trace, always preserving its complete raw file on stop.
+
+    auto_stop records for duration_ms (default 5000). categories overrides native
+    DevTools defaults. ignore_cache applies to reload. Manual stop retains the
+    startup file_path when no replacement path is supplied. JSON/gzip are supported.
+    """
+    global _tracing_active, _trace_tab, _trace_metadata
+    if (
+        duration_ms < 1
+        or categories == []
+        or (categories and any(not c.strip() for c in categories))
+    ):
+        raise ValueError(
+            "duration_ms must be positive and categories must be nonempty."
+        )
     tab = await _page_tab()
     if _tracing_active:
         return "Error: A browser-wide trace is already running."
-    _tracing_active, _trace_tab = True, tab
+    state = {
+        "started": time.monotonic(),
+        "file_path": file_path,
+        "config": {
+            "page_id": str(tab.target_id),
+            "url": tab.target.url,
+            "categories": list(categories or TRACE_CATEGORIES),
+            "reload": reload,
+            "auto_stop": auto_stop,
+            "duration_ms": duration_ms,
+            "ignore_cache": ignore_cache,
+        },
+    }
+    _tracing_active, _trace_tab, _trace_metadata = True, tab, state
+    started = False
     try:
         await tab.send(
             uc.cdp.tracing.start(
-                categories="devtools.timeline,blink.user_timing,v8",
+                categories=",".join(state["config"]["categories"]),
                 transfer_mode="ReturnAsStream",
             )
         )
+        started = True
+        if reload:
+            await tab.send(uc.cdp.page.reload(ignore_cache=ignore_cache))
+        if auto_stop:
+            await asyncio.sleep(duration_ms / 1000)
+            if state.get("result"):
+                return state["result"]
+            if _trace_metadata is not state:
+                raise ValueError("This recording is no longer active.")
+            return await performance_stop_trace(file_path)
+        return "Trace started. Use performance_stop_trace to stop.\n" + json.dumps(
+            state["config"], ensure_ascii=False
+        )
     except BaseException:
-        _tracing_active, _trace_tab = False, None
+        if _trace_metadata is state:
+            if started and not _trace_stopping:
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(performance_stop_trace(file_path), 35)
+                    )
+                except BaseException:
+                    logger.debug("Trace cleanup failed", exc_info=True)
+            _tracing_active, _trace_tab, _trace_metadata = False, None, {}
         raise
-    if reload:
-        await tab.reload()
-    if auto_stop:
-        await tab.sleep(5)
-        return await performance_stop_trace(file_path)
-    return "Trace started. Use performance_stop_trace to stop."
 
 
 @_page_tool()
 async def performance_stop_trace(
     file_path: str = "", *, page_id: int | str | None = None
 ) -> str:
-    """Finish the trace and consume its official IO stream."""
-    global _tracing_active, _trace_tab, _trace_stopping
+    """Finish via the original connection and save all raw events to JSON or gzip.
+
+    Returns absolute file_path, recording duration, categories/config and Chrome's
+    data-loss flag. An omitted path uses the start path or persistent artifacts/traces.
+    """
+    global \
+        _tracing_active, \
+        _trace_tab, \
+        _trace_stopping, \
+        _trace_metadata, \
+        _last_trace_path
     if not _tracing_active or _trace_tab is None:
         return "Error: No trace is running."
-    tab = _trace_tab
+    tab, state = _trace_tab, _trace_metadata
     if page_id is not None and tab is not await _page_tab():
         raise ValueError("The active trace belongs to a different page_id.")
     if _trace_stopping:
@@ -2353,20 +2414,35 @@ async def performance_stop_trace(
     try:
         await tab.send(uc.cdp.tracing.end())
         event = await asyncio.wait_for(done, 30)
+        elapsed = (time.monotonic() - state.get("started", time.monotonic())) * 1000
         if event.stream is None:
             raise ValueError("Chrome did not return a trace stream.")
         data = await _read_stream(tab, event.stream)
-        parsed = json.loads(data)
-        count = len(parsed.get("traceEvents", []))
-        if file_path:
-            Path(file_path).write_bytes(data)
-        return f"Trace stopped. {count} events collected." + (
-            f" Saved to {file_path}" if file_path else ""
+        result = await save_trace(
+            data,
+            file_path or state.get("file_path", ""),
+            max(0, elapsed),
+            state.get("config", {}),
+            getattr(event, "data_loss_occurred", False),
         )
+        _last_trace_path = result["file_path"]
+        report = (
+            f"Trace stopped. {result['event_count']} events collected.\n"
+            + json.dumps(result, ensure_ascii=False, indent=2)
+        )
+        state["result"] = report
+        return report
     finally:
         tab.remove_handler(uc.cdp.tracing.TracingComplete, complete)
-        _tracing_active, _trace_tab = False, None
+        if not done.done():
+            done.cancel()
+        _tracing_active, _trace_tab, _trace_metadata = False, None, {}
         _trace_stopping = False
+
+
+async def _cleanup_trace():
+    if _tracing_active and not _trace_stopping:
+        await asyncio.wait_for(performance_stop_trace(), 35)
 
 
 @_page_tool()
@@ -3031,6 +3107,7 @@ def main():
 from .advanced import register_tools
 
 register_tools(mcp, sys.modules[__name__])
+_shutdown_callbacks.append(_cleanup_trace)
 
 
 if __name__ == "__main__":
