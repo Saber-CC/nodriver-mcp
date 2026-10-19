@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 132 regression/integration tests: **131 passed, 1 skipped** (MCP version 1.5.9).
+- 133 regression/integration tests: **132 passed, 1 skipped** (MCP version 1.5.10).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -199,6 +199,9 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   and automatic file output preserved complete Unicode JSON while previews stayed
   bounded and labeled. Temporary object groups were released after failures.
   A real stdio client verified formats and read back complete saved JSON.
+- Native CDP screenshot size limits passed at DPR=2 for PNG/JPEG/WebP,
+  viewport/full-page/scrolled elements, single and dual bounds, file output and
+  no upscaling. A real MCP client received correctly sized WebP image content.
 - Native image responses passed both direct calls and MCP content conversion;
   full-page output was checked against a 2400-pixel document.
 - Redirect hops retained stable independent IDs and Cookie/Set-Cookie extra-info,

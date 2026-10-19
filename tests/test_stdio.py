@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import io
 import os
 import re
 import sys
@@ -8,6 +9,8 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from PIL import Image as PillowImage
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client import Client
@@ -455,6 +458,20 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                                 b"\x89PNG\r\n\x1a\n"
                             )
                         )
+                        limited = await session.call_tool(
+                            "take_screenshot",
+                            {"format": "webp", "max_width": 137, "max_height": 97},
+                        )
+                        self.assertFalse(limited.is_error, str(limited))
+                        image = next(
+                            item for item in limited.content if item.type == "image"
+                        )
+                        self.assertEqual(image.mime_type, "image/webp")
+                        decoded = PillowImage.open(
+                            io.BytesIO(base64.b64decode(image.data))
+                        )
+                        self.assertLessEqual(decoded.width, 137)
+                        self.assertLessEqual(decoded.height, 97)
                         await call(
                             session,
                             "set_cookies",

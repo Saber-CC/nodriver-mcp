@@ -37,6 +37,7 @@ from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .network import NetworkCollector, request_details
+from .screenshots import screenshot_clip
 from .scripts import execute_script, script_error as _script_error, script_result
 from .uploads import FileUploads, upload_paths
 
@@ -2502,20 +2503,26 @@ async def take_screenshot(
     uid: str = "",
     file_path: str = "",
     *,
+    max_width: int | None = None,
+    max_height: int | None = None,
     page_id: int | str | None = None,
 ) -> Any:
     """Capture an MCP image or save a file. Ordinary PNG/JPEG uses native as_base64.
 
     Element crops, WebP and explicit quality use official CDP because the native
-    screenshot helper does not expose those arguments.
+    screenshot helper does not expose those arguments. max_width/max_height bound
+    physical output pixels proportionally, without upscaling.
     """
     if uid and full_page:
         raise ValueError("Cannot combine uid and full_page.")
     if format not in {"png", "jpeg", "jpg", "webp"} or not 0 <= quality <= 100:
         raise ValueError("Invalid format or quality.")
+    if any(v is not None and v < 1 for v in (max_width, max_height)):
+        raise ValueError("max_width and max_height must be positive when specified.")
+    limited = max_width is not None or max_height is not None
     format = "jpeg" if format == "jpg" else format
     tab = await _tab_for_uid(uid) if uid else await _active_tab()
-    if not uid and format in {"png", "jpeg"} and not quality:
+    if not limited and not uid and format in {"png", "jpeg"} and not quality:
         if file_path:
             saved = await tab.save_screenshot(
                 filename=file_path, format=format, full_page=full_page
@@ -2528,18 +2535,15 @@ async def take_screenshot(
         kwargs = {"format_": format, "capture_beyond_viewport": full_page}
         if quality and format in {"jpeg", "webp"}:
             kwargs["quality"] = quality
-        if uid:
-            model = await tab.send(
-                uc.cdp.dom.get_box_model(
-                    backend_node_id=uc.cdp.dom.BackendNodeId(
-                        _uid_to_backend_node_id[uid]
-                    )
-                )
+        if uid or limited:
+            kwargs["clip"] = await screenshot_clip(
+                tab,
+                _uid_to_backend_node_id[uid] if uid else None,
+                full_page,
+                max_width,
+                max_height,
             )
-            xs, ys = model.content[::2], model.content[1::2]
-            kwargs["clip"] = uc.cdp.page.Viewport(
-                min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys), 1
-            )
+            kwargs["capture_beyond_viewport"] = True
         encoded = await tab.send(uc.cdp.page.capture_screenshot(**kwargs))
         if file_path:
             Path(file_path).write_bytes(base64.b64decode(encoded))
