@@ -50,7 +50,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         for value in (
             s._selected_frames,
             s._frame_connections,
+            s._frame_loaders,
             s._uid_owners,
+            s._unique_id_to_mcp_id,
             s._uid_to_backend_node_id,
             s._console_callbacks,
             s._network_callbacks,
@@ -89,6 +91,27 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(UnexpectedToolError) as raised:
             await s.mcp.call_tool("invalid_output_probe", {})
         self.assertIsInstance(raised.exception.__cause__, ValidationError)
+
+    async def test_chrome_protocol_failures_keep_their_code_and_reason(self):
+        for code, message in (
+            (-32000, "No node with given id found"),
+            (-32601, "Experimental command was not found"),
+        ):
+            with self.subTest(code=code):
+                self.a.send.side_effect = uc.ProtocolException(
+                    {"code": code, "message": message}
+                )
+                with self.assertRaises(ToolError) as raised:
+                    await s.mcp.call_tool(
+                        "send_cdp_command",
+                        {
+                            "domain": "DOM",
+                            "command": "describeNode",
+                            "parameters": {"backendNodeId": 404},
+                        },
+                    )
+                self.assertIn(message, str(raised.exception))
+                self.assertIn(str(code), str(raised.exception))
 
     async def test_selected_page_persists_for_subsequent_tools(self):
         await s.select_page(0)

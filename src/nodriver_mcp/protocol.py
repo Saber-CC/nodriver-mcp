@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import enum
 import inspect
@@ -9,6 +10,7 @@ import re
 import types
 import typing
 from collections.abc import Mapping
+from functools import cache
 
 from nodriver import cdp
 
@@ -43,6 +45,26 @@ def wire_name(name: str) -> str:
     return parts[0] + "".join(part.title() for part in parts[1:])
 
 
+def _identifier(name: str) -> str:
+    """Match Python and CDP names without guessing acronym capitalization."""
+    return name.replace("_", "").lower()
+
+
+@cache
+def _parameter_wire_names(fn: typing.Callable) -> dict[str, str]:
+    """Read exact JSON keys from the official generated serializer."""
+    tree = ast.parse(inspect.getsource(inspect.unwrap(fn)))
+    return {
+        _identifier(node.slice.value): node.slice.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "params"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    }
+
+
 def domain_module(domain: str) -> types.ModuleType:
     normalized = re.sub(r"[^a-z0-9]", "", domain.lower())
     for name, module in vars(cdp).items():
@@ -67,9 +89,9 @@ def command_functions(module: types.ModuleType) -> dict[str, typing.Callable]:
 
 def command_function(domain: str, command: str) -> typing.Callable:
     module = domain_module(domain)
-    normalized = command.rsplit(".", 1)[-1]
+    normalized = _identifier(command.rsplit(".", 1)[-1])
     for name, fn in command_functions(module).items():
-        if normalized in (name, wire_name(name)):
+        if normalized == _identifier(name):
             return fn
     raise ValueError(f"Unknown command {domain}.{command}; use list_cdp_commands.")
 
@@ -121,10 +143,10 @@ def build_command(domain: str, command: str, parameters: dict | None = None):
     fn = command_function(domain, command)
     signature = inspect.signature(fn)
     annotations = typing.get_type_hints(fn)
-    names = {wire_name(name): name for name in signature.parameters}
+    names = {_identifier(name): name for name in signature.parameters}
     kwargs = {}
     for name, value in (parameters or {}).items():
-        python_name = name if name in signature.parameters else names.get(name)
+        python_name = names.get(_identifier(name))
         if python_name is None:
             raise ValueError(f"Unknown parameter '{name}' for {domain}.{command}")
         if python_name in kwargs:
@@ -161,7 +183,9 @@ def describe_commands(domain: str = "", query: str = "") -> list[dict]:
                     "parameters": [
                         {
                             "name": p.name,
-                            "cdp_name": wire_name(p.name),
+                            "cdp_name": _parameter_wire_names(fn).get(
+                                _identifier(p.name), wire_name(p.name)
+                            ),
                             "type": str(p.annotation),
                             "required": p.default is p.empty,
                             **(

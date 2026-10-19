@@ -9,6 +9,44 @@ from nodriver_mcp.protocol import (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_standard_cdp_acronyms_in_commands_and_parameters(self):
+        for domain, command, parameters in (
+            ("DOM", "getOuterHTML", {"nodeId": 1}),
+            ("Network", "setExtraHTTPHeaders", {"headers": {"X-Probe": "ok"}}),
+            ("Page", "setBypassCSP", {"enabled": True}),
+            (
+                "Runtime",
+                "evaluate",
+                {"expression": "1", "allowUnsafeEvalBlockedByCSP": True},
+            ),
+        ):
+            with self.subTest(command=command):
+                generator = build_command(domain, command, parameters)
+                self.addCleanup(generator.close)
+                payload = next(generator)
+                self.assertEqual(payload["method"], f"{domain}.{command}")
+                self.assertEqual(payload["params"], parameters)
+
+    def test_discovery_preserves_official_cdp_parameter_acronyms(self):
+        for domain, command, parameter, cdp_name in (
+            ("DOM", "get_outer_html", "include_shadow_dom", "includeShadowDOM"),
+            (
+                "Runtime",
+                "evaluate",
+                "allow_unsafe_eval_blocked_by_csp",
+                "allowUnsafeEvalBlockedByCSP",
+            ),
+        ):
+            with self.subTest(parameter=parameter):
+                commands = describe_commands(domain)
+                entry = next(
+                    entry
+                    for entry in commands
+                    if entry["command"].endswith("." + command)
+                )
+                fields = {p["name"]: p["cdp_name"] for p in entry["parameters"]}
+                self.assertEqual(fields[parameter], cdp_name)
+
     def test_typed_cookie_expiration_and_enum_are_serialized(self):
         command = build_command(
             "Network",

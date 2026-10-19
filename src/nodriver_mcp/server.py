@@ -108,7 +108,7 @@ def _browser_launch_info() -> dict:
 # MCP Server
 # ---------------------------------------------------------------------------
 class BrowserMCPServer(MCPServer):
-    """Report browser input and timeout errors through the SDK's ToolError API."""
+    """Report expected browser failures through the SDK's ToolError API."""
 
     async def call_tool(
         self,
@@ -120,9 +120,9 @@ class BrowserMCPServer(MCPServer):
             return await super().call_tool(name, arguments, context)
         except UnexpectedToolError as exc:
             cause = exc.__cause__
-            if isinstance(cause, (ValueError, TimeoutError)) and not isinstance(
-                cause, ValidationError
-            ):
+            if isinstance(
+                cause, (ValueError, TimeoutError, uc.ProtocolException)
+            ) and not isinstance(cause, ValidationError):
                 raise ToolError(str(cause)) from cause
             raise
 
@@ -174,8 +174,17 @@ async def _page_tab() -> uc.Tab:
 
 async def _active_tab() -> uc.Tab:
     page = await _page_tab()
-    frame_id = _selected_frames.get(str(page.target_id))
-    return _frame_connections.get((str(page.target_id), frame_id), page)
+    page_id = str(page.target_id)
+    frame_id = _selected_frames.get(page_id)
+    if not frame_id:
+        return page
+    await _discover_frames(page)
+    connection = _frame_connections.get((page_id, frame_id))
+    if connection is None:
+        raise ValueError(
+            "Selected frame no longer exists; use select_frame or list_frames."
+        )
+    return connection
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +203,8 @@ _named_browser_contexts: dict[
 _selected_target_id: str | None = None
 _selected_frames: dict[str, str] = {}
 _frame_connections: dict[tuple[str, str], uc.Tab] = {}
+_frame_loaders: dict[tuple[str, str], str] = {}
+_frame_discovery_lock = asyncio.Lock()
 _console_callbacks: dict[str, Any] = {}
 _network_callbacks: dict[str, list[tuple[type, Any]]] = {}
 _uid_owners: dict[str, tuple[str, uc.Tab, str]] = {}
@@ -271,6 +282,7 @@ async def _shutdown_browser() -> None:
         _named_browser_contexts,
         _selected_frames,
         _frame_connections,
+        _frame_loaders,
         _console_callbacks,
         _network_callbacks,
         _uid_owners,
@@ -324,6 +336,9 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
 async def _tab_for_uid(uid: str) -> uc.Tab:
     owner = _uid_owners.get(uid)
     page = await _page_tab()
+    if owner is not None and owner[0] == str(page.target_id) and owner[2]:
+        await _discover_frames(page)
+        owner = _uid_owners.get(uid)
     if owner is None or owner[0] != str(page.target_id):
         raise ValueError(
             f"Unknown or stale uid '{uid}' for this page. Take a new snapshot."
@@ -387,26 +402,77 @@ async def _cookie_jar():
 
 async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
     """Combine official get_frames connections with the complete CDP frame tree."""
-    root_id = str(page.target_id)
-    tree = await page.get_frame_tree()
-    native = await page.get_frames()
-    by_id = {str(connection.target_id): connection for connection in native}
-    result = []
-    for frame in uc.util.flatten_frame_tree(tree):
-        key = (root_id, str(frame.id_))
-        connection = _frame_connections.get(key)
-        if connection is None:
-            connection = by_id.get(str(frame.id_), page)
+    async with _frame_discovery_lock:
+        root_id = str(page.target_id)
+        tree = await page.get_frame_tree()
+        discovered = {
+            str(frame.id_): (frame, page) for frame in uc.util.flatten_frame_tree(tree)
+        }
+        for native in await page.get_frames():
+            frame_id = str(native.target_id)
+            cached = _frame_connections.get((root_id, frame_id))
+            # get_frames creates new wrappers on every call. Reuse a connection
+            # only while the frame still has its own current target; a former
+            # same-process frame must switch from the page to the native iframe.
+            connection = (
+                cached
+                if cached is not None
+                and cached is not page
+                and cached.target
+                and str(cached.target_id) == frame_id
+                else native
+            )
+            connection.target = native.target
+            try:
+                subtree = await connection.get_frame_tree()
+            except Exception:
+                if connection is native:
+                    await connection.aclose()
+                raise
+            frame = subtree.frame
+            if frame.parent_id is None:
+                frame = dataclasses.replace(
+                    frame, parent_id=native.target.parent_frame_id
+                )
+            discovered[str(frame.id_)] = (frame, connection)
+
+        retired = {}
+        for frame_id, (frame, connection) in discovered.items():
+            key = (root_id, frame_id)
+            previous = _frame_connections.get(key)
+            loader = str(frame.loader_id)
+            if previous is not None and (
+                previous is not connection or _frame_loaders.get(key) != loader
+            ):
+                _invalidate_frame_uids(root_id, frame_id)
+                if previous is not page:
+                    retired[id(previous)] = previous
             _frame_connections[key] = connection
-        result.append((frame, connection))
-    known = {str(frame.id_) for frame, _ in result}
-    for connection in native:
-        if str(connection.target_id) not in known:
-            frame = (await connection.get_frame_tree()).frame
-            key = (root_id, str(frame.id_))
-            cached = _frame_connections.setdefault(key, connection)
-            result.append((frame, cached))
-    return result
+            _frame_loaders[key] = loader
+
+        for key in list(_frame_connections):
+            if key[0] == root_id and key[1] not in discovered:
+                _invalidate_frame_uids(*key)
+                previous = _frame_connections.pop(key)
+                _frame_loaders.pop(key, None)
+                if previous is not page:
+                    retired[id(previous)] = previous
+        live = {id(connection) for connection in _frame_connections.values()}
+        for connection_id, connection in retired.items():
+            if connection_id not in live:
+                await connection.aclose()
+        return list(discovered.values())
+
+
+def _invalidate_frame_uids(page_id: str, frame_id: str) -> None:
+    for uid, owner in list(_uid_owners.items()):
+        if owner[0] == page_id and owner[2] == frame_id:
+            _uid_owners.pop(uid, None)
+            _uid_to_backend_node_id.pop(uid, None)
+    prefix = f"{page_id}:{frame_id}_"
+    for key in list(_unique_id_to_mcp_id):
+        if key.startswith(prefix):
+            del _unique_id_to_mcp_id[key]
 
 
 async def _frame_element(page: uc.Tab, frame_id: str) -> uc.Element:
@@ -610,6 +676,7 @@ def _preserve_on_navigation(tab: uc.Tab) -> None:
             if connection is not tab:
                 asyncio.create_task(connection.aclose())
             del _frame_connections[key]
+            _frame_loaders.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1208,12 +1275,11 @@ async def cf_verify() -> str:
 async def click(
     uid: str, dbl_click: bool = False, include_snapshot: bool = False
 ) -> str:
-    """Click a snapshot element using the official Element helper."""
+    """Click a snapshot element with trusted CDP mouse events."""
     try:
-        element = await _element_for_uid(uid)
-        if dbl_click:
-            connection = await _tab_for_uid(uid)
-            x, y = await _get_box_model(connection, uid)
+        connection = await _tab_for_uid(uid)
+        x, y = await _get_box_model(connection, uid)
+        for count in range(1, 3 if dbl_click else 2):
             for event in ("mousePressed", "mouseReleased"):
                 await connection.send(
                     uc.cdp.input_.dispatch_mouse_event(
@@ -1222,11 +1288,9 @@ async def click(
                         y=y,
                         button=uc.cdp.input_.MouseButton.LEFT,
                         buttons=1 if event == "mousePressed" else 0,
-                        click_count=2,
+                        click_count=count,
                     )
                 )
-        else:
-            await element.click()
         return f"Clicked uid={uid}" + await _maybe_snapshot(include_snapshot)
     except Exception as exc:
         return f"Error clicking uid={uid}: {exc}"
@@ -1276,6 +1340,7 @@ async def close_page(page_id: int = -1) -> str:
             if connection is not tab:
                 await connection.aclose()
             del _frame_connections[pair]
+            _frame_loaders.pop(pair, None)
     for uid, owner in list(_uid_owners.items()):
         if owner[0] == key:
             _uid_owners.pop(uid, None)
@@ -1430,7 +1495,7 @@ async def evaluate_script(function: str, args: list[str] | None = None) -> str:
 
 @mcp.tool()
 async def fill(uid: str, value: str, include_snapshot: bool = False) -> str:
-    """Fill an input or select using official Element.apply/clear_input/send_keys."""
+    """Fill an input or select and notify the page when clearing its value."""
     try:
         element = await _element_for_uid(uid)
         tag = await element.apply("(el) => el.tagName.toLowerCase()")
@@ -1441,9 +1506,25 @@ async def fill(uid: str, value: str, include_snapshot: bool = False) -> str:
                 + "; el.dispatchEvent(new Event('input', {bubbles:true})); "
                 "el.dispatchEvent(new Event('change', {bubbles:true})); }"
             )
-        else:
+        elif value:
             await element.clear_input()
             await element.send_keys(value)
+        else:
+            # Native clear_input does not emit input/change; send_keys("") also
+            # emits nothing. Use the prototype setter to notify controlled inputs
+            # whose own value setter tracks programmatic assignments.
+            await element.apply(
+                """(el) => {
+                    el.focus();
+                    const setter = Object.getOwnPropertyDescriptor(
+                        Object.getPrototypeOf(el), 'value'
+                    )?.set;
+                    if (setter) setter.call(el, '');
+                    else el.value = '';
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                }"""
+            )
         return f"Filled uid={uid}" + await _maybe_snapshot(include_snapshot)
     except Exception as exc:
         return f"Error filling uid={uid}: {exc}"

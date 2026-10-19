@@ -129,8 +129,12 @@ def register_tools(mcp, s) -> None:
             s._selected_frames.pop(key, None)
             return "Selected main frame."
         frames = await s._discover_frames(page)
-        if not any(str(frame.id_) == frame_id for frame, _ in frames):
+        frame = next((frame for frame, _ in frames if str(frame.id_) == frame_id), None)
+        if frame is None:
             raise ValueError("Unknown frame_id; use list_frames first.")
+        if frame_id == str(frames[0][0].id_):
+            s._selected_frames.pop(key, None)
+            return "Selected main frame."
         s._selected_frames[key] = frame_id
         return f"Selected frame {frame_id}."
 
