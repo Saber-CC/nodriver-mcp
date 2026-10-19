@@ -1,0 +1,292 @@
+import base64
+import collections
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import nodriver as uc
+from mcp.server.fastmcp import Image
+
+from nodriver_mcp import server as s
+
+
+class FakeTab:
+    def __init__(self, name):
+        self.target = SimpleNamespace(
+            target_id=name,
+            url=f"https://{name}.test",
+            title=name,
+            browser_context_id=None,
+        )
+        self.target_id = name
+        self.parent = None
+        self.handlers = collections.defaultdict(list)
+        self.activate = AsyncMock()
+        self.send = AsyncMock(return_value=None)
+
+    def add_handler(self, event, callback):
+        if callback not in self.handlers[event]:
+            self.handlers[event].append(callback)
+
+    def remove_handler(self, event, callback):
+        self.handlers[event].remove(callback)
+
+
+class ServerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.a, self.b = FakeTab("a"), FakeTab("b")
+        self.browser = SimpleNamespace(
+            tabs=[self.a, self.b], update_targets=AsyncMock()
+        )
+        self.patch = patch.object(
+            s, "_get_browser", AsyncMock(return_value=self.browser)
+        )
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        s._selected_target_id = "a"
+        for value in (
+            s._selected_frames,
+            s._frame_connections,
+            s._uid_owners,
+            s._uid_to_backend_node_id,
+            s._console_callbacks,
+            s._network_callbacks,
+            s._network_collection_enabled_tabs,
+            s._console_collection_enabled_tabs,
+            s._network_requests,
+            s._console_messages,
+            s._preserved_network_requests,
+            s._preserved_console_messages,
+        ):
+            value.clear()
+        s._tracing_active = False
+        s._trace_tab = None
+
+    async def test_selected_page_persists_for_subsequent_tools(self):
+        await s.select_page(0)
+        self.assertIs(await s._active_tab(), self.a)
+        await s.select_page(1, bring_to_front=False)
+        self.assertIs(await s._active_tab(), self.b)
+        self.b.activate.assert_not_awaited()
+
+    async def test_disable_console_removes_exact_callback_and_does_not_accumulate(self):
+        for _ in range(2):
+            await s._enable_console_collection(self.a)
+            self.assertEqual(len(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+            await s._disable_console_collection(self.a)
+            self.assertEqual(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled], [])
+
+    async def test_failed_network_enable_can_be_retried(self):
+        self.a.send.side_effect = RuntimeError("disconnected")
+        with self.assertRaises(RuntimeError):
+            await s._auto_enable_network_collection(self.a)
+        self.assertNotIn("a", s._network_collection_enabled_tabs)
+        self.assertFalse(any(self.a.handlers.values()))
+        self.a.send.side_effect = None
+        await s._auto_enable_network_collection(self.a)
+        self.assertIn("a", s._network_collection_enabled_tabs)
+
+    async def test_request_ids_survive_filters_and_do_not_cross_pages(self):
+        for rid, tab, resource in [
+            (51, self.a, "Document"),
+            (72, self.a, "XHR"),
+            (90, self.b, "XHR"),
+        ]:
+            s._network_requests.append(
+                {
+                    "reqid": rid,
+                    "id": str(rid),
+                    "page_id": tab.target_id,
+                    "connection": tab,
+                    "type": resource,
+                    "url": tab.target.url + f"/{rid}",
+                    "method": "GET",
+                    "post_data": "",
+                }
+            )
+        listing = await s.list_network_requests(resource_types=["xhr"])
+        self.assertIn("[72]", listing)
+        self.assertNotIn("[90]", listing)
+        self.a.send.return_value = ("response", False)
+        result = await s.get_network_request(72)
+        self.assertIn("/72", result)
+        self.b.send.assert_not_awaited()
+
+    async def test_wrong_page_uid_is_rejected(self):
+        s._uid_owners["old"] = ("b", self.b, "")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            await s._tab_for_uid("old")
+
+    async def test_fill_form_preserves_failure(self):
+        with patch.object(
+            s, "fill", AsyncMock(return_value="Error filling uid=missing: stale")
+        ):
+            result = await s.fill_form([{"uid": "missing", "value": "x"}])
+        self.assertIn("Error", result)
+        self.assertNotIn(": filled", result)
+
+    async def test_element_script_unpacks_result_and_reports_js_errors(self):
+        s._uid_owners["el"] = ("a", self.a, "")
+        with patch.object(
+            s, "_resolve_uid", AsyncMock(return_value=SimpleNamespace(object_id="obj"))
+        ):
+            self.a.send.return_value = (SimpleNamespace(value=0), None)
+            self.assertIn(
+                "\\n0\\n".replace("\\n", "\n"),
+                await s.evaluate_script("el => 0", ["el"]),
+            )
+
+    async def test_native_evaluation_preserves_false_and_normal_json_objects(self):
+        self.a.send.return_value = (
+            uc.cdp.runtime.RemoteObject(type_="boolean", value=False),
+            None,
+        )
+        self.assertIs(await s._evaluate(self.a, "false"), False)
+        self.a.send.return_value = (
+            uc.cdp.runtime.RemoteObject(type_="object", value={"ok": True}),
+            None,
+        )
+        self.assertEqual(await s._evaluate(self.a, "({ok:true})"), {"ok": True})
+
+    async def test_native_screenshot_returns_mcp_image_without_writing_file(self):
+        self.a.save_screenshot = AsyncMock(
+            return_value=base64.b64encode(b"png-bytes").decode()
+        )
+        result = await s.take_screenshot()
+        self.assertIsInstance(result, Image)
+        self.a.save_screenshot.assert_awaited_once_with(
+            format="png", full_page=False, as_base64=True
+        )
+
+    async def test_official_cookiejar_uses_selected_context(self):
+        from nodriver.core.browser import CookieJar
+
+        jar = await s._cookie_jar()
+        self.assertIsInstance(jar, CookieJar)
+        self.a.send.return_value = []
+        await jar.get_all()
+        generator = self.a.send.call_args.args[0]
+        self.assertEqual(next(generator)["method"], "Storage.getCookies")
+        self.b.send.assert_not_awaited()
+
+    async def test_session_cookie_expiry_uses_official_type(self):
+        cookie = s._cookie_param(
+            {
+                "name": "test",
+                "value": "x",
+                "expires": 1900000000.0,
+                "sameSite": "Lax",
+                "httpOnly": True,
+            }
+        )
+        self.assertIsInstance(cookie.expires, uc.cdp.network.TimeSinceEpoch)
+        self.assertEqual(cookie.to_json()["expires"], 1900000000.0)
+        self.assertNotIn(
+            "expires",
+            s._cookie_param({"name": "s", "value": "v", "expires": -1}).to_json(),
+        )
+
+    async def test_isolated_native_cookiejar_passes_context_to_official_storage(self):
+        self.a.target.browser_context_id = uc.cdp.browser.BrowserContextID("isolated")
+        self.browser.send = AsyncMock(return_value=[])
+        jar = await s._cookie_jar()
+        await jar.get_all()
+        command = self.browser.send.call_args.args[0]
+        self.assertEqual(
+            next(command),
+            {
+                "method": "Storage.getCookies",
+                "params": {"browserContextId": "isolated"},
+            },
+        )
+        self.a.send.assert_not_awaited()
+
+    async def test_navigation_keeps_existing_session(self):
+        self.a.send.return_value = ("frame", "loader", None, None)
+        await s._navigate_url(self.a, "https://example.test")
+        command = self.a.send.call_args.args[0]
+        self.assertEqual(next(command)["method"], "Page.navigate")
+        self.assertFalse(hasattr(self.a, "attach"))
+
+    async def test_webmcp_result_arriving_before_waiter_is_preserved(self):
+        def dispatch(event):
+            for callback in self.a.handlers[type(event)]:
+                callback(event)
+
+        async def send(command):
+            message = next(command)
+            if message["method"] == "WebMCP.enable":
+                dispatch(
+                    uc.cdp.web_mcp.ToolsAdded(
+                        [
+                            uc.cdp.web_mcp.Tool.from_json(
+                                {
+                                    "name": "echo",
+                                    "description": "Echo",
+                                    "frameId": "frame",
+                                }
+                            )
+                        ]
+                    )
+                )
+            if message["method"] == "WebMCP.invokeTool":
+                dispatch(
+                    uc.cdp.web_mcp.ToolResponded.from_json(
+                        {
+                            "invocationId": "completed",
+                            "status": "Completed",
+                            "output": {"ok": True},
+                        }
+                    )
+                )
+                return "completed"
+
+        self.a.send.side_effect = send
+        invoke = s.mcp._tool_manager.get_tool("call_webmcp_tool").fn
+        result = await invoke("echo", {"message": "probe"})
+        self.assertEqual(result["output"], {"ok": True})
+        await s._shutdown_callbacks[0]()
+
+    async def test_trace_consumes_stream_and_keeps_originating_connection(self):
+        trace = json.dumps({"traceEvents": [{"name": "probe"}]}).encode()
+
+        async def send(generator):
+            message = next(generator)
+            if message["method"] == "Tracing.end":
+                event = SimpleNamespace(stream="stream")
+                for callback in self.a.handlers[uc.cdp.tracing.TracingComplete]:
+                    callback(event)
+            return None
+
+        self.a.send.side_effect = send
+        s._tracing_active, s._trace_tab, s._selected_target_id = True, self.a, "b"
+        with patch.object(s, "_read_stream", AsyncMock(return_value=trace)):
+            result = await s.performance_stop_trace()
+        self.assertIn("1 events", result)
+        self.assertEqual(self.a.handlers[uc.cdp.tracing.TracingComplete], [])
+        self.b.send.assert_not_awaited()
+
+    async def test_event_subscription_is_removed_without_touching_other_callbacks(self):
+        def existing(event):
+            pass
+
+        self.a.add_handler(uc.cdp.runtime.ConsoleAPICalled, existing)
+        tool = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        identifier = await tool("subscribe_cdp_events")(
+            ["Runtime.consoleAPICalled"], enable_domain=False
+        )
+        event = uc.cdp.runtime.ConsoleAPICalled(
+            "log",
+            [],
+            uc.cdp.runtime.ExecutionContextId(1),
+            uc.cdp.runtime.Timestamp(1),
+            None,
+            None,
+        )
+        for callback in list(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled]):
+            callback(event)
+        records = await tool("get_cdp_events")(identifier)
+        self.assertEqual(records[0]["method"], "Runtime.consoleAPICalled")
+        await tool("unsubscribe_cdp_events")(identifier)
+        self.assertEqual(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled], [existing])
