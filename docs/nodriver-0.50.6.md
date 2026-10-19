@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 105 regression/integration tests: **104 passed, 1 skipped** (MCP version 1.5.5).
+- 114 regression/integration tests: **113 passed, 1 skipped** (MCP version 1.5.6).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -178,6 +178,13 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   retention and disabling passed. Recreated iframe connections received fresh
   exception/revocation callbacks and produced new exception records; retired
   connections retained none. A real stdio client retrieved an uncaught error.
+- Script dialog policies accepted/dismissed sync, async and repeated identical
+  dialogs, supplied prompt content and returned immediately for manual handling.
+  A blocked page failed interactions promptly while another page and iframe
+  diagnostics remained usable. Script success, failure and timeout states stayed
+  distinct; the original JSON code-block layout was retained. Timeout removed
+  local native protocol waiters and later evaluations succeeded. Same policies
+  passed the real stdio client and site-isolated iframe tests.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;

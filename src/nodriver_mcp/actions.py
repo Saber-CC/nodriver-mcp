@@ -10,9 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from nodriver import cdp
 
-
-class ActionInterrupted(ValueError):
-    """An action is waiting for a dialog that the caller must handle."""
+from .dialogs import DialogInterrupted as ActionInterrupted, DialogRegistry
 
 
 @dataclass
@@ -20,6 +18,7 @@ class ActionResult:
     url: str = ""
     opened_pages: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    dialogs: list[Any] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = []
@@ -27,6 +26,15 @@ class ActionResult:
             lines.append(f"Navigation observed: {self.url}")
         if self.opened_pages:
             lines.append("Opened page_ids: " + ", ".join(self.opened_pages))
+        for record in self.dialogs:
+            data = record.data()
+            outcome = data["action"] or (
+                "closed externally" if data["closed"] else "manual handling required"
+            )
+            lines.append(
+                f"Dialog {data['type']}: {outcome}."
+                + (f" {data['error']}" if data["error"] else "")
+            )
         return "\n".join(lines + self.warnings)
 
 
@@ -53,6 +61,9 @@ class ActionWaiter:
         dom_timeout: float = 3,
         quiet: float = 0.1,
         ignored_dialogs: frozenset[str] = frozenset(),
+        dialogs: DialogRegistry | None = None,
+        dialog_action: str | None = None,
+        prompt_text: str = "",
     ):
         self.tab, self.page, self.browser = tab, page, browser
         self.evaluate, self.on_navigation = evaluate, on_navigation
@@ -60,6 +71,11 @@ class ActionWaiter:
         self.probe, self.navigation_timeout = probe, navigation_timeout
         self.dom_timeout, self.quiet = dom_timeout, quiet
         self.ignored_dialogs = ignored_dialogs
+        self.dialogs = dialogs or DialogRegistry()
+        self.owns_dialogs = dialogs is None
+        self.dialog_action, self.prompt_text = dialog_action, prompt_text
+        self.handled_dialogs = set()
+        self.dialog_tasks = set()
         self.result = ActionResult()
         self.navigating, self.loaded = asyncio.Event(), asyncio.Event()
         self.dialog = asyncio.get_running_loop().create_future()
@@ -109,11 +125,33 @@ class ActionWaiter:
             self.loaded.set()
             self.result.url = event.url
 
-    def dialog_opened(self, event):
+    def dialog_opened(self, event, connection=None):
         if getattr(event.type_, "value", event.type_) in self.ignored_dialogs:
             return
-        if not self.dialog.done():
-            self.dialog.set_result(event)
+        record = self.dialogs.opened(
+            str(self.page.target_id), connection or self.page, event
+        )
+        if record.id in self.handled_dialogs:
+            return
+        self.handled_dialogs.add(record.id)
+        self.result.dialogs.append(record)
+        if self.dialog_action in {None, "manual"}:
+            if not self.dialog.done():
+                self.dialog.set_result(record)
+            return
+        task = asyncio.create_task(self.handle_dialog(record))
+        self.dialog_tasks.add(task)
+        task.add_done_callback(self.dialog_tasks.discard)
+
+    async def handle_dialog(self, record):
+        try:
+            await self.dialogs.handle(
+                record, self.dialog_action, self.prompt_text, self.page
+            )
+        except Exception as exc:
+            record.error = str(exc)
+            if not self.dialog.done():
+                self.dialog.set_result(record)
 
     def popup(self, event):
         info = event.target_info
@@ -149,6 +187,7 @@ class ActionWaiter:
 
     async def start(self):
         for connection in {id(t): t for t in (self.page, self.tab)}.values():
+            self.dialogs.watch(connection, str(self.page.target_id))
             for event, callback in (
                 (cdp.page.FrameStartedNavigating, self.started),
                 (cdp.page.FrameRequestedNavigation, self.started),
@@ -159,8 +198,8 @@ class ActionWaiter:
                 (cdp.page.WindowOpen, self.window_opened),
             ):
                 self.listen(connection, event, callback)
-            await asyncio.wait_for(connection.send(cdp.page.enable()), 2)
-            tree = await asyncio.wait_for(connection.get_frame_tree(), 2)
+            await self.guarded(connection.send(cdp.page.enable()), 2)
+            tree = await self.guarded(connection.get_frame_tree(), 2)
             self.frame_ids.add(str(tree.frame.id_))
             if connection is self.page:
                 self.root_frame_id = str(tree.frame.id_)
@@ -177,12 +216,7 @@ class ActionWaiter:
             if task in done:
                 return task.result()
             if self.dialog in done:
-                event = self.dialog.result()
-                kind = getattr(event.type_, "value", event.type_)
-                raise ActionInterrupted(
-                    f"Action interrupted by {kind} dialog: {event.message}. "
-                    "Use handle_dialog on the same page_id."
-                )
+                raise ActionInterrupted(self.dialog.result())
             raise TimeoutError("Action observation timed out.")
         finally:
             if not task.done():
@@ -251,6 +285,13 @@ class ActionWaiter:
             for connection, event, callback in reversed(self.callbacks):
                 connection.remove_handler(event, callback)
             self.callbacks.clear()
+            if self.dialog_tasks:
+                _, pending = await asyncio.wait(self.dialog_tasks, timeout=1)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            if self.owns_dialogs:
+                self.dialogs.clear()
             if self.observing:
                 try:
                     await asyncio.wait_for(

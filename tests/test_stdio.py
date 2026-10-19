@@ -248,6 +248,37 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("Stack trace", details)
                     self.assertIn('"source": "exception"', details)
                     await call(session, "disable_console_collection", page_id=a)
+                    prompt = await call(
+                        session,
+                        "evaluate_script",
+                        function="() => prompt('client prompt')",
+                        prompt_text="client-text",
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    self.assertIn("Status: completed", prompt)
+                    self.assertIn("client-text", prompt)
+                    manual = await call(
+                        session,
+                        "evaluate_script",
+                        function="() => confirm('client manual')",
+                        dialog_action="manual",
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    self.assertIn("Status: interrupted", manual)
+                    blocked = await session.call_tool("take_snapshot", {"page_id": a})
+                    self.assertTrue(blocked.is_error)
+                    await call(session, "handle_dialog", action="dismiss", page_id=a)
+                    timed_out = await call(
+                        session,
+                        "evaluate_script",
+                        function="new Promise(() => {})",
+                        timeout=100,
+                        wait_for_stable=False,
+                        page_id=a,
+                    )
+                    self.assertIn("Status: timed_out", timed_out)
                     self.assertIn(
                         "client-alpha",
                         await call(

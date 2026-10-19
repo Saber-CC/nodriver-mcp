@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.5 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.6 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -163,6 +163,14 @@ a time-limit notice; long-lived network requests do not hold up the tool.
 An unhandled dialog interrupts the action with its type/message and a reminder
 to use `handle_dialog` on the same page. Temporary listeners and DOM observers
 are removed after success, errors and cancellation.
+
+`evaluate_script` handles dialogs with `dialog_action="accept"` by default.
+Use `"dismiss"` to reject them, or `"manual"` to return immediately with the
+dialog details and finish via `handle_dialog`. `prompt_text` supplies accepted
+prompt content. Script results report `completed`, `interrupted`, `failed` or
+`timed_out`; the JSON value remains in its code block. `timeout` bounds script
+execution (30000 ms by default, 0 to disable). Open dialogs are tracked per page,
+so blocked interactions fail promptly while diagnostic tools remain usable.
 
 ### Native frames and element search
 

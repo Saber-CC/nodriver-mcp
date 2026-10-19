@@ -40,6 +40,8 @@ class FakeTab:
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        s._dialog_state.clear()
+        self.addCleanup(s._dialog_state.clear)
         self.a, self.b = FakeTab("a"), FakeTab("b")
         self.browser = SimpleNamespace(
             tabs=[self.a, self.b], update_targets=AsyncMock()

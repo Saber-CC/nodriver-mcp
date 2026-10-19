@@ -908,6 +908,136 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.handlers.get(uc.cdp.runtime.ExceptionThrown))
         self.assertFalse(page.handlers.get(uc.cdp.runtime.ExceptionRevoked))
 
+    async def test_script_dialog_policies_handle_sync_async_and_repeated_dialogs(self):
+        page = await s._page_tab()
+        count = len(page.handlers[uc.cdp.page.JavascriptDialogOpening])
+        for source, options, expected in (
+            (
+                "() => {alert('accepted alert');return confirm('accepted confirm');}",
+                {},
+                "true",
+            ),
+            (
+                "() => confirm('dismissed confirm')",
+                {"dialog_action": "dismiss"},
+                "false",
+            ),
+            (
+                "() => prompt('prompt content','default')",
+                {"prompt_text": "hello 中文"},
+                "hello 中文",
+            ),
+            ("() => prompt('dismissed prompt')", {"dialog_action": "dismiss"}, "null"),
+            (
+                "async () => {await new Promise(r=>setTimeout(r,20));alert('async alert');return 'async ok';}",
+                {},
+                "async ok",
+            ),
+            (
+                "() => {for(let i=0;i<3;i++)alert('same');return 'three done';}",
+                {},
+                "three done",
+            ),
+        ):
+            with self.subTest(source=source):
+                result = await asyncio.wait_for(
+                    s.evaluate_script(source, wait_for_stable=False, **options), 5
+                )
+                self.assertIn("Status: completed", result)
+                self.assertIn(expected, result)
+                self.assertFalse(s._dialog_state.current)
+        self.assertEqual(len(page.handlers[uc.cdp.page.JavascriptDialogOpening]), count)
+
+    async def test_script_manual_dialog_interrupts_and_handles_the_same_page(self):
+        a = s._selected_target_id
+        opened = await s.new_page(self.url + "interaction", background=True)
+        b = re.search(r"page_id=(\w+)", opened).group(1)
+        result = await asyncio.wait_for(
+            s.evaluate_script(
+                "() => {window.afterManual=confirm('manual confirmation');return window.afterManual;}",
+                dialog_action="manual",
+                page_id=a,
+            ),
+            5,
+        )
+        self.assertIn("Status: interrupted", result)
+        self.assertIn("manual confirmation", result)
+        with self.assertRaisesRegex(ValueError, "manual confirmation"):
+            await asyncio.wait_for(s.take_snapshot(page_id=a), 2)
+        self.assertIn(
+            "Status: completed",
+            await s.evaluate_script("document.title", wait_for_stable=False, page_id=b),
+        )
+        await s.handle_dialog(action="accept", page_id=a)
+        self.assertIn(
+            "true",
+            await s.evaluate_script(
+                "window.afterManual", wait_for_stable=False, page_id=a
+            ),
+        )
+        self.assertFalse(s._dialog_state.current)
+
+    async def test_script_statuses_distinguish_timeout_failure_and_success(self):
+        page = await s._page_tab()
+        result = await asyncio.wait_for(
+            s.evaluate_script(
+                "new Promise(() => {})", timeout=100, wait_for_stable=False
+            ),
+            3,
+        )
+        self.assertIn("Status: timed_out", result)
+        self.assertIn("Script execution", result)
+        failed = await s.evaluate_script(
+            "() => {throw new Error('failed-marker');}", wait_for_stable=False
+        )
+        self.assertIn("Status: failed", failed)
+        self.assertIn("failed-marker", failed)
+        self.assertIn(
+            "Status: completed", await s.evaluate_script("21*2", wait_for_stable=False)
+        )
+        self.assertFalse(page._mapper)
+        self.assertFalse(s._dialog_state.current)
+
+    async def test_cross_process_script_dialog_policies_use_the_frame_owner(self):
+        page = await s._page_tab()
+        frames = await self.tool("list_frames")
+        child = next(frame["frame_id"] for frame in frames if frame["parent_id"])
+        await self.tool("select_frame", frame_id=child)
+        await self.navigate_frame(
+            page,
+            child,
+            f"http://localhost:{self.http.server_port}/frame",
+            separate=True,
+        )
+        result = await asyncio.wait_for(
+            s.evaluate_script(
+                "() => prompt('frame prompt')",
+                prompt_text="from iframe",
+                wait_for_stable=False,
+            ),
+            5,
+        )
+        self.assertIn("Status: completed", result)
+        self.assertIn("from iframe", result)
+        await s.enable_console_collection()
+        await s.evaluate_script(
+            "console.log('before-frame-dialog')", wait_for_stable=False
+        )
+        result = await asyncio.wait_for(
+            s.evaluate_script(
+                "() => confirm('frame manual')",
+                dialog_action="manual",
+                wait_for_stable=False,
+            ),
+            5,
+        )
+        self.assertIn("Status: interrupted", result)
+        self.assertIn(
+            "before-frame-dialog", await asyncio.wait_for(s.list_console_messages(), 2)
+        )
+        await s.handle_dialog(action="dismiss")
+        self.assertFalse(s._dialog_state.current)
+
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")
         snapshot = await s.take_snapshot()
