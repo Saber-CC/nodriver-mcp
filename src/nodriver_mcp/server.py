@@ -27,9 +27,10 @@ import nodriver as uc
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import CallToolResult, InputRequiredResult
-from pydantic import ValidationError
+from pydantic import StrictBool, ValidationError
 
 from .actions import ActionResult, ActionWaiter
+from .forms import fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .protocol import json_value
@@ -1731,7 +1732,15 @@ async def evaluate_script(
         return f"Error: {exc}"
 
 
-async def _fill_element(element, value: str):
+async def _fill_element(element, value: str | bool, uid: str):
+    async def click_toggle():
+        x, y = await _get_box_model(element.tab, uid)
+        await _dispatch_mouse_click(element.tab, x, y, False)
+
+    if await fill_toggle(element, value, click_toggle):
+        return
+    if not isinstance(value, str):
+        raise ValueError("Text inputs and select controls require a string value.")
     tag = await element.apply("(el) => el.tagName.toLowerCase()")
     if tag == "select":
         await element.apply(
@@ -1764,15 +1773,18 @@ async def _fill_element(element, value: str):
 @_page_tool()
 async def fill(
     uid: str,
-    value: str,
+    value: str | StrictBool,
     include_snapshot: bool = False,
     *,
     page_id: int | str | None = None,
 ) -> str:
-    """Fill an input or select and notify the page when clearing its value."""
+    """Fill text/select controls, or set checkbox/radio/switch state idempotently.
+
+    Toggles accept booleans or 'true'/'false'; selected radios cannot be unset.
+    """
     try:
         element = await _element_for_uid(uid)
-        await _perform_action(element.tab, lambda: _fill_element(element, value))
+        await _perform_action(element.tab, lambda: _fill_element(element, value, uid))
         return f"Filled uid={uid}" + await _maybe_snapshot(include_snapshot)
     except Exception as exc:
         return f"Error filling uid={uid}: {exc}"

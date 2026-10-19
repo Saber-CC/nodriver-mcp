@@ -88,6 +88,7 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
             def do_GET(self):
                 body = (
                     "<title>Concurrent MCP</title><input aria-label='Field'>"
+                    "<input type='checkbox' aria-label='Toggle'>"
                     f"<p>{self.path}</p>"
                 ).encode()
                 self.send_response(200)
@@ -176,6 +177,25 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertIn("client-alpha", values[0])
                     self.assertIn("client-beta", values[1])
+                    toggle_snapshot = await call(session, "take_snapshot", page_id=a)
+                    toggle = re.search(
+                        r'uid=(\S+) checkbox "Toggle"', toggle_snapshot
+                    ).group(1)
+                    await call(session, "fill", uid=toggle, value=True, page_id=a)
+                    self.assertIn(
+                        "true",
+                        await call(
+                            session,
+                            "evaluate_script",
+                            function="document.querySelector('[type=checkbox]').checked",
+                            wait_for_stable=False,
+                            page_id=a,
+                        ),
+                    )
+                    invalid = await session.call_tool(
+                        "fill", {"uid": toggle, "value": 1, "page_id": a}
+                    )
+                    self.assertTrue(invalid.is_error)
                     self.assertIn(
                         "client-alpha",
                         await call(
