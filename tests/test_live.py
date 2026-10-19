@@ -1,5 +1,6 @@
 """Opt-in integration tests: NODRIVER_MCP_LIVE_TESTS=1 uv run python -m unittest discover -s tests."""
 
+import asyncio
 import json
 import io
 import logging
@@ -31,6 +32,49 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/frame"):
             data, content_type = (
                 b'<input aria-label="Frame input"><button>Frame button</button>',
+                "text/html",
+            )
+        elif self.path.startswith("/interaction"):
+            data, content_type = (
+                b"""<title>Interaction regression</title>
+                <input id="event-input" aria-label="Event input" value="old">
+                <textarea id="event-textarea" aria-label="Event textarea">old</textarea>
+                <button id="event-button">Event button</button>
+                <script>
+                window.formValues = {};
+                window.controlledValues = {};
+                window.changedValues = {};
+                window.mouseEvents = [];
+                for (const id of ['event-input', 'event-textarea']) {
+                    const field = document.getElementById(id);
+                    window.formValues[id] = field.value;
+                    window.controlledValues[id] = field.value;
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        Object.getPrototypeOf(field), 'value'
+                    );
+                    let trackedValue = field.value;
+                    Object.defineProperty(field, 'value', {
+                        get() { return descriptor.get.call(this); },
+                        set(value) {
+                            trackedValue = String(value);
+                            descriptor.set.call(this, value);
+                        }
+                    });
+                    field.addEventListener('input', () => {
+                        if (field.value !== trackedValue) {
+                            window.controlledValues[id] = field.value;
+                            trackedValue = field.value;
+                        }
+                    });
+                    field.addEventListener('input', () => window.formValues[id] = field.value);
+                    field.addEventListener('change', () => window.changedValues[id] = field.value);
+                }
+                for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) {
+                    document.getElementById('event-button').addEventListener(type, event => {
+                        window.mouseEvents.push({type, trusted:event.isTrusted, detail:event.detail});
+                    });
+                }
+                </script>""",
                 "text/html",
             )
         else:
@@ -73,8 +117,11 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_HEADLESS": "true",
                 "NODRIVER_USER_DATA_DIR": self.directory.name,
                 "NODRIVER_EXTENSIONS": "[]",
+                "NODRIVER_PROXY": "",
                 "NODRIVER_BROWSER_ARGS": '["--enable-blink-features=WebMCPSupport,WebMCPTesting"]'
                 if "webmcp" in self._testMethodName
+                else '["--site-per-process", "--disable-features="]'
+                if "cross_process" in self._testMethodName
                 else "[]",
             },
         )
@@ -90,6 +137,178 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
 
     async def tool(self, tool_key, **kwargs):
         return await s.mcp._tool_manager.get_tool(tool_key).fn(**kwargs)
+
+    async def test_click_focuses_input_and_emits_trusted_mouse_events(self):
+        await s.new_page(self.url + "interaction")
+        snapshot = await s.take_snapshot()
+        field = re.search(r'uid=(\S+) textbox "Event input"', snapshot).group(1)
+        button = re.search(r'uid=(\S+) button "Event button"', snapshot).group(1)
+        self.assertNotIn("Error", await s.click(field))
+        tab = await s._active_tab()
+        self.assertEqual(
+            await s._evaluate(tab, "document.activeElement.id"), "event-input"
+        )
+        self.assertNotIn("Error", await s.click(button))
+        events = await s._evaluate(tab, "window.mouseEvents")
+        self.assertEqual(
+            [event["type"] for event in events], ["mousedown", "mouseup", "click"]
+        )
+        self.assertTrue(all(event["trusted"] for event in events))
+        await s._evaluate(tab, "window.mouseEvents = []")
+        self.assertNotIn("Error", await s.click(button, dbl_click=True))
+        events = await s._evaluate(tab, "window.mouseEvents")
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "mousedown",
+                "mouseup",
+                "click",
+                "mousedown",
+                "mouseup",
+                "click",
+                "dblclick",
+            ],
+        )
+        self.assertEqual(
+            [event["detail"] for event in events if event["type"] == "click"], [1, 2]
+        )
+        self.assertTrue(all(event["trusted"] for event in events))
+
+    async def test_empty_fill_updates_input_and_textarea_form_models(self):
+        await s.new_page(self.url + "interaction")
+        snapshot = await s.take_snapshot()
+        for label, field_id in (
+            ("Event input", "event-input"),
+            ("Event textarea", "event-textarea"),
+        ):
+            uid = re.search(rf'uid=(\S+) textbox "{label}"', snapshot).group(1)
+            self.assertNotIn("Error", await s.fill(uid, ""))
+            tab = await s._active_tab()
+            state = await s._evaluate(
+                tab,
+                f"({{value:document.getElementById('{field_id}').value, "
+                f"model:window.formValues['{field_id}'], "
+                f"controlled:window.controlledValues['{field_id}'], "
+                f"changed:window.changedValues['{field_id}']}})",
+            )
+            self.assertEqual(
+                state, {"value": "", "model": "", "controlled": "", "changed": ""}
+            )
+
+    async def test_selecting_main_frame_id_allows_element_search(self):
+        frames = await self.tool("list_frames")
+        root = next(frame for frame in frames if frame["parent_id"] is None)
+        await self.tool("select_frame", frame_id=root["frame_id"])
+        for query in (
+            {"selector": "input"},
+            {"text": "Click probe", "best_match": True},
+            {"xpath": "//button", "timeout": 0},
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(await self.tool("find_elements", **query))
+        self.assertIn("Main input", await s.take_snapshot())
+        self.assertEqual(
+            await s._evaluate(
+                await s._active_tab(),
+                "document.querySelector('input').getAttribute('aria-label')",
+            ),
+            "Main input",
+        )
+
+    async def test_cross_process_frame_navigation_refreshes_connections(self):
+        page = await s._page_tab()
+        frames = await self.tool("list_frames")
+        child = next(frame for frame in frames if frame["name"] == "child")
+        frame_id = child["frame_id"]
+        self.assertFalse(child["separate_connection"])
+        await self.tool("select_frame", frame_id=frame_id)
+        cross_url = f"http://localhost:{self.http.server_port}/frame?cross=1"
+
+        async def navigate_frame(url, separate):
+            await page.send(
+                uc.cdp.runtime.evaluate(
+                    f"document.querySelector('iframe').src = {json.dumps(url)}"
+                )
+            )
+            async with asyncio.timeout(15):
+                while True:
+                    tree = await page.get_frame_tree()
+                    listed = list(uc.util.flatten_frame_tree(tree))
+                    native = await page.get_frames()
+                    if (
+                        any(
+                            str(connection.target_id) == frame_id
+                            and connection.target.url == url
+                            for connection in native
+                        )
+                        if separate
+                        else not native
+                        and any(
+                            str(frame.id_) == frame_id and frame.url == url
+                            for frame in listed
+                        )
+                    ):
+                        return
+                    await asyncio.sleep(0.05)
+
+        import nodriver as uc
+
+        await navigate_frame(cross_url, True)
+        frames = await self.tool("list_frames")
+        child = next(frame for frame in frames if frame["frame_id"] == frame_id)
+        self.assertTrue(child["separate_connection"])
+        await self.tool("select_frame", frame_id=frame_id)
+        connection = await s._active_tab()
+        self.assertIsNot(connection, page)
+        self.assertIn("Frame input", await s.take_snapshot())
+        found = await self.tool("find_elements", selector="input")
+        self.assertTrue(found)
+        old_uid = found[0]["uid"]
+        self.assertNotIn("Error", await s.click(old_uid))
+        self.assertEqual(
+            await s._evaluate(connection, "document.activeElement.tagName"), "INPUT"
+        )
+        self.assertNotIn("Error", await s.fill(old_uid, "cross-process"))
+        self.assertIn(
+            "cross-process",
+            await s.evaluate_script("() => document.querySelector('input').value"),
+        )
+        await self.tool("list_frames")
+        self.assertIs(await s._active_tab(), connection)
+
+        await navigate_frame(self.url + "frame?return=1", False)
+        frames = await self.tool("list_frames")
+        child = next(frame for frame in frames if frame["frame_id"] == frame_id)
+        self.assertFalse(child["separate_connection"])
+        self.assertIs(await s._active_tab(), page)
+        self.assertIsNone(connection.socket)
+        self.assertIn("Frame input", await s.take_snapshot())
+        self.assertIn(
+            "INPUT",
+            await s.evaluate_script("() => document.querySelector('input').tagName"),
+        )
+        with self.assertRaisesRegex(ValueError, "stale"):
+            await s._tab_for_uid(old_uid)
+
+        current_uid = (await self.tool("find_elements", selector="input"))[0]["uid"]
+        await navigate_frame(self.url + "frame?return=2", False)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            await s._tab_for_uid(current_uid)
+        self.assertIs(await s._active_tab(), page)
+        current_uid = (await self.tool("find_elements", selector="input"))[0]["uid"]
+        self.assertNotIn("Error", await s.click(current_uid))
+        self.assertEqual(
+            await s._evaluate(page, "document.activeElement.tagName"), "INPUT"
+        )
+        await page.send(
+            uc.cdp.runtime.evaluate("document.querySelector('iframe').remove()")
+        )
+        await self.tool("list_frames")
+        with self.assertRaisesRegex(ValueError, "no longer exists"):
+            await s._active_tab()
+        with self.assertRaisesRegex(ValueError, "stale"):
+            await s._tab_for_uid(current_uid)
+        self.assertIsNotNone(page.socket)
 
     async def test_default_temporary_session_restarts_clean_and_removes_profile(self):
         first = s._browser_launch_info()

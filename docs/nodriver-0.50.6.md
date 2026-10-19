@@ -55,6 +55,24 @@ release; a checkout next to this project is not required at runtime.
   event descriptions flag this limitation to prevent treating incomplete
   conditions as complete routing rules. These hints do not recover lost fields
   or change Chrome's routing. The dependency remains the official package.
+- `Element.click()` uses JavaScript `el.click()`, so the MCP click tool uses
+  generated CDP mouse events to preserve focus, mouse events and trusted clicks.
+  Double clicks send both press/release pairs with click counts 1 and 2.
+- `Element.clear_input()` and `send_keys("")` emit no input events. Empty fills
+  use the native value setter through `Element.apply`, then dispatch bubbling
+  `input` and `change` events, including for controlled input/textarea elements.
+- Frame discovery refreshes connections when a frame moves between the page
+  process and a separate target. Stable native connections are reused;
+  replaced/removed documents invalidate UIDs, and obsolete iframe sockets close
+  without closing the shared page. Selecting the root frame ID selects the main
+  page, which has no iframe owner to query.
+- Command and parameter aliases match snake_case and CDP camelCase without
+  guessing acronym capitalization. Parameter discovery reads exact JSON names
+  from the official generated serializers, including `includeShadowDOM` and
+  `allowUnsafeEvalBlockedByCSP`.
+- Expected `nodriver.ProtocolException` failures use the SDK's `ToolError`,
+  retaining Chrome's error code and reason. Unexpected failures and output
+  validation errors retain the SDK's normal handling.
 
 ## Coverage policy
 
@@ -97,9 +115,13 @@ Total: **58** added generated commands.
 Verified locally on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 29 regression/integration tests: **28 passed, 1 skipped**.
+- 54 regression/integration tests: **53 passed, 1 skipped** (MCP version 1.4.1).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
+- Trusted mouse/focus/single-click/double-click sequences and empty fills for
+  input/textarea form models passed. Site-isolated iframe navigation to another
+  site and back, document replacement/removal, stale UID rejection and selecting
+  the main frame by ID passed.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
@@ -107,7 +129,9 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 - Network filtering/body retrieval, explicit console cleanup and nonempty trace
   stream export passed.
 - A real stdio MCP client initialized, discovered tools and called command
-  discovery successfully. All 675 command annotations resolved without errors.
+  discovery successfully under both supported protocol modes. A fresh isolated
+  `uv tool install` also initialized and discovered tools successfully.
+  All 675 official command names resolved and command schemas generated.
 - Ruff F checks, lock validation, whitespace checks and source/wheel builds passed.
 
 The WebMCP page-registration test was skipped because this Chrome build did not

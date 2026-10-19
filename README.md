@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.4.0 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.4.1 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -133,15 +133,21 @@ snapshots provided by `save_session` and `load_session`.
 preserves that selection. `navigate_page` and `new_page` accept a device preset
 before the first real navigation request.
 
+`click` sends trusted CDP mouse events, including both clicks for a double click.
+Clearing an input with `fill(uid, "")` dispatches `input` and `change` events so
+the page's form state follows the displayed value.
+
 ### Native frames and element search
 
 `list_frames`, `select_frame`, `find_elements`.
 
 `list_frames` combines native `Tab.get_frames()` with the page frame tree.
-`select_frame(frame_id="")` returns to the main page. Snapshots and scripts
-respect the selected frame; `take_snapshot(include_frames=true)` includes child
-frames. Element UIDs retain their page/frame connection, so an old UID cannot
-silently operate on another page.
+`select_frame(frame_id="")` or the main frame's ID returns to the main page.
+Snapshots and scripts respect the selected frame;
+`take_snapshot(include_frames=true)` includes child frames. Element UIDs retain
+their page/frame connection, so an old UID cannot silently operate on another page.
+Frame connections refresh when navigation changes their process ownership;
+elements from a replaced or removed frame document require new UIDs.
 
 `find_elements` uses native text, CSS or XPath search and returns actionable UIDs:
 
@@ -249,8 +255,10 @@ unsubscribe_cdp_events(subscription_id="1")
 ```
 
 Use `scope="browser"` for browser-wide commands. Top-level command parameters
-accept Python snake_case or CDP camelCase; nested objects use CDP JSON names.
+accept Python snake_case or CDP camelCase, including `HTML`, `HTTP` and `CSP`
+acronyms; nested objects use CDP JSON names.
 Values are constructed with nodriver's generated enums, IDs and dataclasses.
+Chrome protocol failures retain their error code and reason in MCP tool errors.
 Discovering a binding does not imply that every Chrome version implements it.
 
 Official nodriver 0.50.6 has a known parsing limitation:
