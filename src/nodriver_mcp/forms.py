@@ -1,6 +1,9 @@
 """State-based form controls using native DOM state and trusted mouse input."""
 
 import asyncio
+import json
+
+from nodriver import cdp
 
 
 _TOGGLE_STATE = """el => {
@@ -11,7 +14,10 @@ _TOGGLE_STATE = """el => {
     return {kind, native, checked: native ? el.checked : aria === 'true' ? true : aria === 'false' ? false : null,
             mixed: native ? el.indeterminate : aria === 'mixed',
             disabled: el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
-            readonly: el.getAttribute('aria-readonly') === 'true'};
+            readonly: (!native && !!el.readOnly) || el.getAttribute('aria-readonly') === 'true',
+            tag: el.tagName.toLowerCase(), input_type: el.type || '', editable: !!el.isContentEditable,
+            connected: el.isConnected, max_length: typeof el.maxLength === 'number' ? el.maxLength : -1,
+            value: el.isContentEditable ? el.innerText : typeof el.value === 'string' ? el.value : null};
 }"""
 
 
@@ -29,9 +35,13 @@ def _matches(state, desired):
     return state["checked"] is desired and not state["mixed"]
 
 
-async def fill_toggle(element, value, click) -> bool:
+async def control_state(element):
+    return await element.apply(_TOGGLE_STATE)
+
+
+async def fill_toggle(element, value, click, *, initial=None) -> bool:
     """Return False for text controls; otherwise set and verify a toggle state."""
-    initial = await element.apply(_TOGGLE_STATE)
+    initial = initial if initial is not None else await control_state(element)
     if not initial["kind"]:
         return False
     desired = _desired_state(value)
@@ -68,3 +78,89 @@ async def fill_toggle(element, value, click) -> bool:
     raise ValueError(
         f"Control did not reach checked={desired}; actual state is {actual}."
     )
+
+
+async def fill_text(element, value: str, state):
+    if state["disabled"] or state["readonly"]:
+        raise ValueError("Cannot fill a disabled or read-only form control.")
+    tag, kind, editable = state["tag"], state["input_type"], state["editable"]
+    typeable = (
+        tag == "textarea"
+        or tag == "input"
+        and kind in {"text", "url", "tel", "search", "password", "number", "email"}
+    )
+    special = tag == "input" and kind in {
+        "date",
+        "datetime-local",
+        "month",
+        "range",
+        "time",
+        "week",
+        "color",
+    }
+    if not (typeable or editable or special or tag == "select"):
+        raise ValueError(
+            "Element is not an editable text, select or supported form control."
+        )
+    maximum = state["max_length"]
+    if maximum >= 0 and len(value.encode("utf-16-le", "surrogatepass")) // 2 > maximum:
+        raise ValueError(f"Value exceeds the control's maxlength={maximum}.")
+    encoded = json.dumps(value)
+    if tag == "select" or special or not value:
+        await element.apply(
+            """el => {
+            const value = %s;
+            if (el.tagName === 'SELECT' && value && !Array.from(el.options).some(o => o.value === value))
+                throw new Error('No select option matches the requested value.');
+            el.focus();
+            if (el.isContentEditable) el.innerText=value;
+            else {
+                let prototype=Object.getPrototypeOf(el), setter;
+                while (prototype && !setter) {
+                    setter=Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                    prototype=Object.getPrototypeOf(prototype);
+                }
+                if (setter) setter.call(el, value); else el.value=value;
+            }
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+        }"""
+            % encoded
+        )
+    else:
+        same = bool(value) and state["value"] == value
+        focused = await element.apply(
+            """el => {
+            el.focus();
+            if (!el.matches(':focus')) return false;
+            if (el.isContentEditable) {
+                const selection=el.ownerDocument.defaultView.getSelection();
+                const range=el.ownerDocument.createRange(); range.selectNodeContents(el);
+                if (%s) range.collapse(false);
+                selection.removeAllRanges(); selection.addRange(range);
+            } else if (el.type === 'number') {
+                if (!%s) Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value').set.call(el,'');
+            } else if (%s) {
+                el.setSelectionRange(el.value.length,el.value.length);
+            } else el.select();
+            return true;
+        }"""
+            % (json.dumps(same), json.dumps(same), json.dumps(same))
+        )
+        if not focused:
+            raise ValueError(
+                "The form control did not receive focus; no text was inserted."
+            )
+        if not same:
+            if len(value.encode("utf-16-le", "surrogatepass")) // 2 >= 100:
+                await element.tab.send(cdp.input_.insert_text(value))
+            else:
+                await element.send_keys(value)
+    actual = await element.apply("el => el.isContentEditable ? el.innerText : el.value")
+    expected = (
+        value.replace("\r\n", "\n").replace("\r", "\n")
+        if tag == "textarea" or editable
+        else value
+    )
+    if actual != expected:
+        raise ValueError("The form control did not retain the requested value.")

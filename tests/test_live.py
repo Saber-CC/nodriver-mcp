@@ -49,6 +49,7 @@ class Handler(BaseHTTPRequestHandler):
                 window.changedValues = {};
                 window.mouseEvents = [];
                 window.keyEvents = [];
+                window.inputEvents = [];
                 for (const type of ['keydown', 'keyup', 'keypress']) {
                     document.addEventListener(type, event => {
                         window.keyEvents.push({type, key:event.key, code:event.code,
@@ -61,6 +62,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 for (const id of ['event-input', 'event-textarea']) {
                     const field = document.getElementById(id);
+                    field.addEventListener('input', event => inputEvents.push({id, trusted:event.isTrusted}));
                     window.formValues[id] = field.value;
                     window.controlledValues[id] = field.value;
                     const descriptor = Object.getOwnPropertyDescriptor(
@@ -171,6 +173,27 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/console-errors"):
             data, content_type = (
                 b"<title>Console stack</title><script src='/errors.js'></script><p>Exception test</p>",
+                "text/html",
+            )
+        elif self.path.startswith("/form-batch"):
+            data, content_type = (
+                b"""<title>Batch form</title>
+                <input id='first' value='old'><input id='second' value='untouched'><input id='third' value='last'>
+                <div id='edit' role='textbox' contenteditable='plaintext-only'>old</div>
+                <input id='readonly' readonly value='keep'><input id='disabled' disabled value='keep'>
+                <input id='limited' maxlength='3' value='old'><input id='date' type='date' value='2026-01-01'>
+                <button id='action'>Action</button>
+                <script>
+                window.batchMode=''; window.batchEvents=[];
+                document.addEventListener('input', event => {
+                  batchEvents.push(event.target.id); sessionStorage.setItem('batchEvents', JSON.stringify(batchEvents));
+                  if (event.target.id === 'second') {
+                    if (batchMode === 'dialog') alert('batch interrupted');
+                    if (batchMode === 'navigate') location.href='/actions/destination';
+                  }
+                });
+                window.editModel='old'; document.getElementById('edit').addEventListener('input', event=>window.editModel=event.target.innerText);
+                </script>""",
                 "text/html",
             )
         else:
@@ -1037,6 +1060,141 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         )
         await s.handle_dialog(action="dismiss")
         self.assertFalse(s._dialog_state.current)
+
+    async def test_bulk_fill_long_unicode_updates_controlled_models_in_one_insert(self):
+        await s.new_page(self.url + "interaction")
+        tab = await s._active_tab()
+        snapshot = await s.take_snapshot()
+        uid = re.search(r'uid=(\S+) textbox "Event input"', snapshot).group(1)
+        textarea = re.search(r'uid=(\S+) textbox "Event textarea"', snapshot).group(1)
+        value = "long 中文🙂" * 1000
+        self.assertNotIn("Error", await s.fill(uid, value))
+        self.assertEqual(
+            await s._evaluate(
+                tab, "[formValues['event-input'],controlledValues['event-input']]"
+            ),
+            [value, value],
+        )
+        events = await s._evaluate(tab, "window.inputEvents")
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["trusted"])
+        history = await self.tool("get_connection_history", limit=25)
+        inserts = [
+            item for item in history if item["request"]["method"] == "Input.insertText"
+        ]
+        self.assertEqual(len(inserts), 1)
+        self.assertEqual(inserts[0]["request"]["params"]["text"], value)
+        await s._evaluate(tab, "window.keyEvents=[]")
+        self.assertNotIn("Error", await s.fill(uid, "short"))
+        keys = await s._evaluate(tab, "window.keyEvents")
+        self.assertEqual(
+            sum(event["type"] == "keypress" for event in keys), len("short")
+        )
+        lines = "line 中文😀\n" * 300
+        self.assertNotIn("Error", await s.fill(textarea, lines))
+        self.assertEqual(
+            await s._evaluate(
+                tab, "[formValues['event-textarea'],controlledValues['event-textarea']]"
+            ),
+            [lines, lines],
+        )
+
+    async def test_bulk_fill_contenteditable_and_constraints_preserve_controls(self):
+        await s.new_page(self.url + "form-batch")
+        tab = await s._active_tab()
+
+        async def fill_id(element_id, value):
+            uid = (await self.tool("find_elements", selector="#" + element_id))[0][
+                "uid"
+            ]
+            return await s.fill(uid, value)
+
+        value = "editable 中文🙂" * 100
+        self.assertNotIn("Error", await fill_id("edit", value))
+        self.assertEqual(await s._evaluate(tab, "window.editModel"), value)
+        self.assertNotIn("Error", await fill_id("edit", ""))
+        self.assertEqual(await s._evaluate(tab, "window.editModel"), "")
+        for element_id in ("readonly", "disabled"):
+            self.assertIn("Error", await fill_id(element_id, "changed"))
+            self.assertEqual(
+                await s._evaluate(
+                    tab, f"document.getElementById('{element_id}').value"
+                ),
+                "keep",
+            )
+        self.assertIn("maxlength", await fill_id("limited", "🙂🙂"))
+        self.assertEqual(
+            await s._evaluate(tab, "document.getElementById('limited').value"), "old"
+        )
+        self.assertNotIn("Error", await fill_id("limited", "a🙂"))
+        self.assertNotIn("Error", await fill_id("date", "2026-10-19"))
+        self.assertEqual(
+            await s._evaluate(tab, "document.getElementById('date').value"),
+            "2026-10-19",
+        )
+        self.assertIn("not an editable", await fill_id("action", "ignored"))
+
+    async def test_fill_form_stops_on_stale_uid_and_reports_completed_entries(self):
+        await s.new_page(self.url + "form-batch")
+        tab = await s._active_tab()
+        first = (await self.tool("find_elements", selector="#first"))[0]["uid"]
+        third = (await self.tool("find_elements", selector="#third"))[0]["uid"]
+        with patch.object(s, "_discover_frames", wraps=s._discover_frames) as discover:
+            result = await s.fill_form(
+                [
+                    {"uid": first, "value": "committed"},
+                    {"uid": "stale-uid", "value": "bad"},
+                    {"uid": third, "value": "must-not-run"},
+                ],
+                include_snapshot=True,
+            )
+        self.assertEqual(discover.await_count, 1)
+        self.assertIn("Completed 1 of 3", result)
+        self.assertIn("Skipped 1", result)
+        self.assertIn("stale", result)
+        self.assertEqual(
+            await s._evaluate(tab, "[first.value,third.value]"), ["committed", "last"]
+        )
+
+    async def test_fill_form_stops_on_navigation_and_dialog_with_partial_progress(self):
+        for mode in ("dialog", "navigate"):
+            with self.subTest(mode=mode):
+                await s.new_page(self.url + "form-batch")
+                tab = await s._active_tab()
+                await s._evaluate(tab, "window.batchMode=" + json.dumps(mode))
+                uids = [
+                    (await self.tool("find_elements", selector="#" + element_id))[0][
+                        "uid"
+                    ]
+                    for element_id in ("first", "second", "third")
+                ]
+                result = await asyncio.wait_for(
+                    s.fill_form(
+                        [
+                            {"uid": uid, "value": value}
+                            for uid, value in zip(
+                                uids, ("committed", "blocked", "must-not-run")
+                            )
+                        ],
+                        include_snapshot=True,
+                    ),
+                    8,
+                )
+                self.assertIn("Completed 1 of 3", result)
+                self.assertIn("Skipped 1", result)
+                if mode == "dialog":
+                    self.assertIn("batch interrupted", result)
+                    await s.handle_dialog(action="dismiss")
+                    self.assertEqual(await s._evaluate(tab, "third.value"), "last")
+                else:
+                    self.assertIn("Navigation", result)
+                    await s.wait_for(["Destination ready"], timeout=5000)
+                    self.assertNotIn(
+                        "third",
+                        await s._evaluate(
+                            tab, "JSON.parse(sessionStorage.getItem('batchEvents'))"
+                        ),
+                    )
 
     async def test_empty_fill_updates_input_and_textarea_form_models(self):
         await s.new_page(self.url + "interaction")

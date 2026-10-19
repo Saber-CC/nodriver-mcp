@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.6 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.7 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -143,6 +143,14 @@ again emits no extra click. Changes use trusted mouse events and verify the
 result. Selected radios must be changed by selecting another option. Disabled,
 read-only or unresponsive controls report a clear failure. Text/select values
 continue to require strings.
+Text filling uses native `Element.send_keys` for short values and a single
+official `Input.insertText` command at 100 UTF-16 units or more. It supports
+Unicode, controlled inputs, textarea and contenteditable controls, checks focus
+and the retained value, and rejects disabled/read-only controls or maxlength
+overflow before changing them. Batch filling refreshes frames once and waits
+once; it stops on the first failed UID, navigation or dialog, reporting completed
+fields and skipped entries. An unavailable appended snapshot preserves that
+progress report.
 `upload_file` accepts the existing `file_path` or a `file_paths` list. File inputs
 delegate to native `Element.send_file`; an ordinary upload button can be clicked
 to intercept and accept its file chooser. Files are validated locally, multiple

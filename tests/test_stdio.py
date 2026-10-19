@@ -279,6 +279,48 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                         page_id=a,
                     )
                     self.assertIn("Status: timed_out", timed_out)
+                    latest = await call(session, "take_snapshot", page_id=a)
+                    field = re.search(r'uid=(\S+) textbox "Field"', latest).group(1)
+                    bulk = "MCP 中文🙂" * 100
+                    self.assertNotIn(
+                        "Error",
+                        await call(session, "fill", uid=field, value=bulk, page_id=a),
+                    )
+                    self.assertIn(
+                        bulk,
+                        await call(
+                            session,
+                            "evaluate_script",
+                            function="document.querySelector('input').value",
+                            wait_for_stable=False,
+                            page_id=a,
+                        ),
+                    )
+                    partial = await call(
+                        session,
+                        "fill_form",
+                        elements=[
+                            {"uid": field, "value": "one-before-error"},
+                            {"uid": "stale-client-uid", "value": "bad"},
+                            {"uid": field, "value": "must-not-run"},
+                        ],
+                        page_id=a,
+                    )
+                    self.assertIn("Completed 1 of 3", partial)
+                    self.assertIn("Skipped 1", partial)
+                    self.assertIn(
+                        "one-before-error",
+                        await call(
+                            session,
+                            "evaluate_script",
+                            function="document.querySelector('input').value",
+                            wait_for_stable=False,
+                            page_id=a,
+                        ),
+                    )
+                    await call(
+                        session, "fill", uid=field, value="client-alpha", page_id=a
+                    )
                     self.assertIn(
                         "client-alpha",
                         await call(
