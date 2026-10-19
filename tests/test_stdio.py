@@ -543,6 +543,35 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(
                                 info["event_count"], len(json.load(file)["traceEvents"])
                             )
+                        if os.environ.get("NODRIVER_MCP_PERFORMANCE_TESTS") == "1":
+                            fixture = (
+                                Path(__file__).parent
+                                / "fixtures/web-dev-with-commit.json.gz"
+                            )
+                            analysis_path = Path(trace_dir) / "client-analysis.json"
+                            analysis = await call(
+                                session,
+                                "performance_analyze_trace",
+                                trace_path=str(fixture),
+                                file_path=str(analysis_path),
+                                max_output_chars=100,
+                            )
+                            self.assertIn("preview truncated", analysis)
+                            payload = json.loads(analysis_path.read_text())
+                            self.assertAlmostEqual(
+                                payload["web_vitals"][0]["lcp_ms"], 129.211
+                            )
+                            detail = await call(
+                                session,
+                                "performance_analyze_insight",
+                                trace_path=str(fixture),
+                                insight_set_id=payload["insight_sets"][0]["id"],
+                                insight_name="LCPBreakdown",
+                                file_path=str(analysis_path),
+                                max_output_chars=10000,
+                            )
+                            self.assertIn("Time to first byte", detail)
+
                     await call(
                         session,
                         "evaluate_script",

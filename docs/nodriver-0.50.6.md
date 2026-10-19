@@ -133,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 151 regression/integration tests: **150 passed, 1 skipped** (MCP version 1.5.16).
+- 160 regression/integration tests: **159 passed, 1 skipped** (MCP version 1.5.17).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -209,6 +209,15 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   Real Chrome and stdio clients verified bounded previews and full Unicode body
   exports; fault injection covered binary/empty exports, evicted/unavailable/
   protocol-error states and skipping pending/failed/retired connections.
+- The pinned published DevTools engine generated 19 actual Insight models from
+  its portable regression fixture, with LCP 129.211 ms and complete native LCP
+  resource/subpart details. Real Chrome navigation/trusted input produced observed
+  LCP/INP/CLS and native INP details; automatic/manual analysis and offline reading
+  after browser closure passed. Missing Node, bad archive integrity, invalid IDs,
+  empty traces, bounded previews and timeout/cancellation cleanup passed. Optional
+  analysis failure retained raw trace files and released browser-wide recording.
+  Real stdio and isolated installation verified both analysis tools and packaged
+  Node bridge. Core browser tools retain the Python runtime; analysis uses Node.js.
 - A real temporary MV3 extension passed service-worker discovery, stable target
   execution, file sources, isolated console/async exceptions, timeout recovery and
   uninstall cleanup. Worker calls issued no Page/Emulation commands or DOM waits;

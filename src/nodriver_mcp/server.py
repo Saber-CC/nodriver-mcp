@@ -38,6 +38,7 @@ from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .network import NetworkCollector, request_details
+from .performance import analyze_trace_file
 from .screenshots import screenshot_clip
 from .scripts import (
     execute_script,
@@ -2454,12 +2455,14 @@ async def performance_start_trace(
     duration_ms: int = 5000,
     categories: list[str] | None = None,
     ignore_cache: bool = False,
+    analyze: bool = False,
     page_id: int | str | None = None,
 ) -> str:
     """Record a native trace, always preserving its complete raw file on stop.
 
     auto_stop records for duration_ms (default 5000). categories overrides native
-    DevTools defaults. ignore_cache applies to reload. Manual stop retains the
+    DevTools defaults. ignore_cache applies to reload. analyze=true appends native
+    DevTools Insights/Web Vitals (optional Node.js runtime). Manual stop retains the
     startup file_path when no replacement path is supplied. JSON/gzip are supported.
     """
     global _tracing_active, _trace_tab, _trace_metadata
@@ -2485,6 +2488,7 @@ async def performance_start_trace(
             "auto_stop": auto_stop,
             "duration_ms": duration_ms,
             "ignore_cache": ignore_cache,
+            "analyze": analyze,
         },
     }
     _tracing_active, _trace_tab, _trace_metadata = True, tab, state
@@ -2505,7 +2509,7 @@ async def performance_start_trace(
                 return state["result"]
             if _trace_metadata is not state:
                 raise ValueError("This recording is no longer active.")
-            return await performance_stop_trace(file_path)
+            return await performance_stop_trace(file_path, analyze=analyze)
         return "Trace started. Use performance_stop_trace to stop.\n" + json.dumps(
             state["config"], ensure_ascii=False
         )
@@ -2514,7 +2518,9 @@ async def performance_start_trace(
             if started and not _trace_stopping:
                 try:
                     await asyncio.shield(
-                        asyncio.wait_for(performance_stop_trace(file_path), 35)
+                        asyncio.wait_for(
+                            performance_stop_trace(file_path, analyze=False), 35
+                        )
                     )
                 except BaseException:
                     logger.debug("Trace cleanup failed", exc_info=True)
@@ -2525,12 +2531,17 @@ async def performance_start_trace(
 
 @_page_tool()
 async def performance_stop_trace(
-    file_path: str = "", *, page_id: int | str | None = None
+    file_path: str = "",
+    *,
+    analyze: bool | None = None,
+    page_id: int | str | None = None,
 ) -> str:
     """Finish via the original connection and save all raw events to JSON or gzip.
 
     Returns absolute file_path, recording duration, categories/config and Chrome's
     data-loss flag. An omitted path uses the start path or persistent artifacts/traces.
+    analyze=true appends real DevTools Insights; omit to inherit the start setting.
+    Raw data is preserved and recording state released even if analysis is unavailable.
     """
     global \
         _tracing_active, \
@@ -2573,18 +2584,80 @@ async def performance_stop_trace(
             + json.dumps(result, ensure_ascii=False, indent=2)
         )
         state["result"] = report
-        return report
     finally:
         tab.remove_handler(uc.cdp.tracing.TracingComplete, complete)
         if not done.done():
             done.cancel()
         _tracing_active, _trace_tab, _trace_metadata = False, None, {}
         _trace_stopping = False
+    should_analyze = (
+        state.get("config", {}).get("analyze", False) if analyze is None else analyze
+    )
+    if should_analyze:
+        try:
+            report += "\n\n" + await performance_analyze_trace(
+                trace_path=result["file_path"]
+            )
+        except (ValueError, TimeoutError) as exc:
+            report += "\nAnalysis unavailable: " + str(exc)
+    state["result"] = report
+    return report
+
+
+@mcp.tool()
+async def performance_analyze_trace(
+    trace_path: str = "",
+    file_path: str = "",
+    max_output_chars: int = 20000,
+    timeout: int = 60000,
+) -> str:
+    """Analyze a saved JSON/gzip trace with the actual upstream DevTools engine.
+
+    Omit trace_path to use the latest recording. Returns observed Web Vitals and
+    native Insights with IDs/names for performance_analyze_insight. Always saves
+    complete JSON analysis; max_output_chars bounds the inline preview. Runs offline
+    without launching Chrome. Requires Node.js 22.12+; downloads a pinned, verified
+    engine package into a local cache on first use. timeout is ms; 0 disables it.
+    """
+    source = trace_path or _last_trace_path
+    if not source:
+        raise ValueError("Provide trace_path or record a trace first.")
+    return await analyze_trace_file(
+        source, file_path=file_path, max_output_chars=max_output_chars, timeout=timeout
+    )
+
+
+@mcp.tool()
+async def performance_analyze_insight(
+    insight_set_id: str,
+    insight_name: str,
+    trace_path: str = "",
+    file_path: str = "",
+    max_output_chars: int = 20000,
+    timeout: int = 60000,
+) -> str:
+    """Inspect one native DevTools Insight, including detailed causes and savings.
+
+    Use insight_set_id and insight_name from performance_analyze_trace. Reads the
+    same saved trace (latest recording when omitted) without opening Chrome.
+    Complete analysis is saved to file_path or an automatic persistent artifact.
+    """
+    source = trace_path or _last_trace_path
+    if not source:
+        raise ValueError("Provide trace_path or record a trace first.")
+    return await analyze_trace_file(
+        source,
+        insight_set_id=insight_set_id,
+        insight_name=insight_name,
+        file_path=file_path,
+        max_output_chars=max_output_chars,
+        timeout=timeout,
+    )
 
 
 async def _cleanup_trace():
     if _tracing_active and not _trace_stopping:
-        await asyncio.wait_for(performance_stop_trace(), 35)
+        await asyncio.wait_for(performance_stop_trace(analyze=False), 35)
 
 
 @_page_tool()

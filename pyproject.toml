@@ -1,6 +1,6 @@
 [project]
 name = "nodriver-mcp"
-version = "1.5.16"
+version = "1.5.17"
 description = "Undetected Chrome automation MCP server powered by nodriver"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -34,6 +34,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nodriver_mcp = ["*.mjs"]
 
 [project.scripts]
 nodriver-mcp = "nodriver_mcp.cli:main"

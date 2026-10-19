@@ -1,7 +1,7 @@
 # nodriver-mcp
 
 A Python MCP server for Chromium automation using official **nodriver 0.50.6**.
-It exposes 74 MCP tools for browser startup, page interaction, native cookies and screenshots,
+It exposes 76 MCP tools for browser startup, page interaction, native cookies and screenshots,
 frames, network inspection, website WebMCP tools and the complete generated CDP API.
 
 ## Installation
@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.16 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.17 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -310,7 +310,8 @@ cookie expiry converted into the official typed value before a native batch set.
 
 `list_network_requests`, `get_network_request`, `configure_network_capture`,
 `emulate`, `emulate_device`, `reset_emulation`, `resize_page`,
-`performance_start_trace`, `performance_stop_trace`, `take_memory_snapshot`.
+`performance_start_trace`, `performance_stop_trace`, `performance_analyze_trace`,
+`performance_analyze_insight`, `take_memory_snapshot`.
 
 Network collection starts before a new page's first request. Request IDs remain
 stable under filtering and pagination; body retrieval uses the connection that
@@ -336,6 +337,22 @@ path, event count, duration, categories/config and Chrome's data-loss flag.
 replace DevTools defaults and `ignore_cache` applies during reload. Stopping
 uses the original connection after page switches. Cancellation and failure
 release recording state; closing its page/browser first finishes the trace.
+
+Set `analyze=true` on trace start/stop to append real DevTools Insights and
+observed Web Vitals. Saved JSON/gzip files can also be analyzed offline with
+`performance_analyze_trace(trace_path=...)`; omit the path to use the latest
+recording. `performance_analyze_insight` expands an insight set/name into native
+causes, request details and estimated savings. Complete JSON reports are saved
+under `artifacts/performance` or the specified `file_path`; inline previews are
+bounded by `max_output_chars`. Analysis failures preserve the raw recording.
+
+Analysis requires Node.js 22.12+ (`NODRIVER_NODE_PATH` can select its executable).
+On first analysis, the server fetches the published `chrome-devtools-mcp@1.11.0`
+engine into `~/.cache/nodriver-mcp/trace-engine`, verifies its pinned SHA-512 and
+reuses it on later calls. `NODRIVER_TRACE_ENGINE_CACHE_DIR` changes that directory;
+`NODRIVER_DEVTOOLS_PACKAGE` selects an existing published package for offline use.
+Browser automation and raw trace capture use the Python dependencies alone.
+See [performance analysis](docs/performance-analysis.md) for inputs and metrics.
 
 ### Website WebMCP tools
 

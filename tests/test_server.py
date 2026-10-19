@@ -830,6 +830,55 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["output"], {"ok": True})
         await s._shutdown_callbacks[0]()
 
+    async def test_optional_analysis_failure_keeps_raw_trace_and_releases_recording(
+        self,
+    ):
+        raw = b'{"traceEvents":[{"name":"preserved"}]}'
+
+        async def send(command):
+            if next(command)["method"] == "Tracing.end":
+                for callback in self.a.handlers[uc.cdp.tracing.TracingComplete]:
+                    callback(SimpleNamespace(stream="handle"))
+
+        async def failed_analysis(**kwargs):
+            self.assertFalse(s._tracing_active)
+            self.assertFalse(s._trace_stopping)
+            raise ValueError("Node unavailable")
+
+        self.a.send.side_effect = send
+        s._tracing_active, s._trace_tab = True, self.a
+        with (
+            patch.object(s, "_read_stream", AsyncMock(return_value=raw)),
+            patch.object(s, "performance_analyze_trace", failed_analysis),
+        ):
+            report = await s.performance_stop_trace(analyze=True)
+        self.assertIn("Analysis unavailable: Node unavailable", report)
+        self.assertEqual(Path(s._last_trace_path).read_bytes(), raw)
+        self.assertFalse(self.a.handlers[uc.cdp.tracing.TracingComplete])
+
+    async def test_trace_analysis_tools_do_not_resolve_or_launch_a_browser(self):
+        with (
+            patch.object(
+                s, "analyze_trace_file", AsyncMock(return_value="native analysis")
+            ) as analyze,
+            patch.object(
+                s,
+                "_get_browser",
+                AsyncMock(side_effect=AssertionError("browser launch")),
+            ),
+        ):
+            self.assertEqual(
+                await s.performance_analyze_trace(trace_path="trace.json"),
+                "native analysis",
+            )
+            self.assertEqual(
+                await s.performance_analyze_insight(
+                    "NAVIGATION_0", "LCPBreakdown", trace_path="trace.json"
+                ),
+                "native analysis",
+            )
+            self.assertEqual(analyze.await_count, 2)
+
     async def test_trace_consumes_stream_and_keeps_originating_connection(self):
         trace = json.dumps({"traceEvents": [{"name": "probe"}]}).encode()
 
