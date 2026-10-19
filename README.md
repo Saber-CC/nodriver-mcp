@@ -18,6 +18,10 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
+The MCP SDK is constrained to `mcp>=1.26.0,<2` because the server uses its 1.x
+FastMCP API. Version 1.3.1 fixes fresh installs and tool upgrades that previously
+resolved MCP SDK 2.x and exited during startup with `Connection closed`.
+
 For a source checkout:
 
 ```bash
@@ -262,10 +266,14 @@ do not restore the missing fields.
 ```bash
 uv run python -m unittest discover -s tests -v
 NODRIVER_MCP_LIVE_TESTS=1 uv run python -m unittest discover -s tests -v
+NODRIVER_MCP_INSTALL_TESTS=1 uv run python -m unittest discover -s tests -p test_installation.py -v
 ```
 
 Live tests launch headless Chrome with temporary profiles and a local HTTP
-server. See [the upgrade coverage and implementation notes](docs/nodriver-0.50.6.md)
+server. The opt-in installation test performs a fresh `uv tool install` in
+temporary tool directories, resolving dependencies independently of `uv.lock`,
+and verifies the installed server's MCP handshake and tool discovery.
+See [the upgrade coverage and implementation notes](docs/nodriver-0.50.6.md)
 for the complete added-command inventory and native API decisions.
 
 ## License
