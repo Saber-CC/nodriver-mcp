@@ -789,6 +789,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.a.handlers[uc.cdp.tracing.TracingComplete], [])
         self.b.send.assert_not_awaited()
 
+    async def test_cancelled_trace_cleanup_cannot_reset_a_new_recording(self):
+        entered = asyncio.Event()
+        newer = {"started": 123, "config": {"page_id": "b"}}
+
+        async def send(command):
+            if next(command)["method"] == "Tracing.start":
+                entered.set()
+
+        async def stop(*args, **kwargs):
+            # Force the interleaving between cleanup completing and its caller resuming.
+            s._tracing_active, s._trace_tab, s._trace_metadata = True, self.b, newer
+            return "old recording saved"
+
+        self.a.send.side_effect = send
+        with patch.object(s, "performance_stop_trace", stop):
+            task = asyncio.create_task(
+                s.performance_start_trace(reload=False, duration_ms=10000)
+            )
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(s._tracing_active)
+        self.assertIs(s._trace_tab, self.b)
+        self.assertIs(s._trace_metadata, newer)
+
     async def test_trace_auto_stop_cancel_and_export_failure_clear_owned_state(self):
         started = asyncio.Event()
         trace = b'{"traceEvents":[{"name":"auto-test"}]}'
