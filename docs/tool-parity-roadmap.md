@@ -14,6 +14,7 @@
 
 - [x] FIX-01：修复 `press_key` 组合键、加号键和失败后的按键释放。1.4.3。
 - [x] FIX-02：修复 `click_at` 坐标双击，共用 UID 点击的可信事件实现。1.4.3。
+- [x] ADV-01：页面工具支持每次调用的稳定 `page_id` 和多页面并发。1.5.0。
 - [ ] OPT-01：统一交互后的导航与 DOM 稳定等待。
 - [ ] REQ-01：补齐表单控件的指定状态设置。
 - [ ] REQ-02：补齐多文件上传和文件选择器处理。
@@ -155,8 +156,14 @@ PNG/JPEG/WebP 均可用；省略新参数时保留现有分辨率和图片返回
 
 ## 按需求推进的增强
 
-- [ ] ADV-01：页面工具增加显式 `page_id`。多 AI 或多页面并发需求出现时提高优先级；
-  同时隔离 frame 选择、UID、采集和仿真状态，并确定页面 ID 的稳定性。
+- [x] ADV-01：1.5.0 已为 63 个页面工具加入显式 `page_id`，包含已有的选择/关闭工具。
+  使用 Chrome target ID 作为稳定字符串 ID，兼容原有数字索引。
+  参考 `chrome-devtools-mcp/src/ToolHandler.ts` 的入口选页与 `request.page` 传递方式，
+  使用调用上下文固定页面和 frame；嵌套操作、快照、UID、采集与仿真按目标页面工作，
+  显式 ID 不修改全局选页，关闭后的 ID 明确失败。录屏按页管理，性能 trace 保留
+  Chrome 的浏览器级单实例限制并校验停止时的页面归属。
+  真实 Chrome 覆盖两页并发填充/输入、图片、frame、导航、仿真、日志、网络与旧 ID；
+  stdio MCP 客户端验证并发调用及新参数 schema。
 - [ ] ADV-02：`emulate` 增加 forced-colors、prefers-contrast、prefers-reduced-motion
   和额外 HTTP headers。当前可先通过通用 CDP 工具调用底层能力。
 - [ ] ADV-03：`evaluate_script` 支持从脚本文件加载源码，明确与内联源码的互斥关系。

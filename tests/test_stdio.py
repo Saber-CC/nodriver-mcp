@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -78,6 +80,122 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
     os.environ.get("NODRIVER_MCP_LIVE_TESTS") == "1", "Chrome integration is opt-in"
 )
 class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_client_operates_on_two_pages_concurrently(self):
+        class Page(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = (
+                    "<title>Concurrent MCP</title><input aria-label='Field'>"
+                    f"<p>{self.path}</p>"
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        http = ThreadingHTTPServer(("127.0.0.1", 0), Page)
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{http.server_port}"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "nodriver_mcp"],
+            env={
+                **os.environ,
+                "NODRIVER_HEADLESS": "true",
+                "NODRIVER_PROXY": "",
+                "NODRIVER_EXTENSIONS": "[]",
+                "NODRIVER_BROWSER_ARGS": "[]",
+            },
+        )
+
+        async def call(session, name, **arguments):
+            result = await session.call_tool(name, arguments)
+            self.assertFalse(result.is_error, str(result))
+            return "".join(getattr(c, "text", "") for c in result.content)
+
+        try:
+            async with stdio_client(parameters) as (reader, writer):
+                async with ClientSession(reader, writer) as session:
+                    await session.initialize()
+                    tools = {
+                        tool.name: tool for tool in (await session.list_tools()).tools
+                    }
+                    self.assertIn("page_id", tools["fill"].input_schema["properties"])
+                    a = json.loads(
+                        await call(
+                            session, "start_browser", url=url + "/alpha", proxy=""
+                        )
+                    )["page_id"]
+                    opened = await call(
+                        session, "new_page", url=url + "/beta", background=True
+                    )
+                    b = re.search(r"page_id=(\w+)", opened).group(1)
+                    snapshots = await asyncio.gather(
+                        *(
+                            call(session, "take_snapshot", page_id=page)
+                            for page in (a, b)
+                        )
+                    )
+                    uids = [
+                        re.search(r'uid=(\S+) textbox "Field"', text).group(1)
+                        for text in snapshots
+                    ]
+                    filled = await asyncio.gather(
+                        call(
+                            session,
+                            "fill_form",
+                            elements=[{"uid": uids[0], "value": "client-alpha"}],
+                            include_snapshot=True,
+                            page_id=a,
+                        ),
+                        call(
+                            session,
+                            "fill_form",
+                            elements=[{"uid": uids[1], "value": "client-beta"}],
+                            include_snapshot=True,
+                            page_id=b,
+                        ),
+                    )
+                    self.assertIn("client-alpha", filled[0])
+                    self.assertNotIn("client-beta", filled[0])
+                    self.assertIn("client-beta", filled[1])
+                    values = await asyncio.gather(
+                        *(
+                            call(
+                                session,
+                                "evaluate_script",
+                                function="document.querySelector('input').value",
+                                page_id=page,
+                            )
+                            for page in (a, b)
+                        )
+                    )
+                    self.assertIn("client-alpha", values[0])
+                    self.assertIn("client-beta", values[1])
+                    self.assertIn(
+                        "client-alpha",
+                        await call(
+                            session,
+                            "evaluate_script",
+                            function="document.querySelector('input').value",
+                        ),
+                    )
+                    await call(session, "close_page", page_id=b)
+                    failure = await session.call_tool("take_snapshot", {"page_id": b})
+                    self.assertTrue(failure.is_error)
+                    self.assertIn(
+                        "closed page_id",
+                        "".join(getattr(c, "text", "") for c in failure.content),
+                    )
+        finally:
+            http.shutdown()
+            http.server_close()
+            thread.join()
+
     async def test_persistent_profile_survives_mcp_process_restart(self):
         class Page(BaseHTTPRequestHandler):
             def log_message(self, *args):

@@ -39,6 +39,12 @@ release; a checkout next to this project is not required at runtime.
   enable `Runtime` for console collection.
 - Track selected pages explicitly. Keep request and console records with their
   originating page; snapshot UIDs also retain their connection and frame.
+- Page tools accept a per-call `page_id`. Stable Chrome target ID strings avoid
+  list-index changes; numeric indexes remain compatible. A task-local context
+  pins page/frame selection for nested tools and appended snapshots without
+  changing the global default. Explicit closed IDs never fall back. Frame
+  discovery locks, navigation history retention and screen recordings are scoped
+  per page. Trace collection remains browser-wide and validates its page owner.
 - Consume `TracingComplete.stream` with official `IO.read`/`IO.close`.
 - `Tab.get()` in 0.50.6 reattaches a second session after navigation, leaving
   Network enabled on the old session. Existing-session navigation therefore
@@ -127,7 +133,7 @@ Total: **58** added generated commands.
 Verified locally on macOS on 2026-10-19 against official PyPI nodriver 0.50.6 and
 Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
 
-- 64 regression/integration tests: **63 passed, 1 skipped** (MCP version 1.4.3).
+- 78 regression/integration tests: **77 passed, 1 skipped** (MCP version 1.5.0).
 - Native element input (including Unicode), CSS/XPath/best-match search,
   same-process frame selection and scoped operations passed.
 - Trusted mouse/focus/single-click/double-click sequences and empty fills for
@@ -141,6 +147,12 @@ Chrome 154, with temporary headless browser profiles and a loopback HTTP server.
   behavior passed. `type_text` also moved focus via `submit_key="Tab"`.
   Fault injection verified key cleanup after dispatch errors, release errors
   and cancellation, including preservation of the original failure.
+- Real Chrome tests operated on two pages concurrently: form input, nested
+  snapshots, distinct screenshot pixels, frame selection, navigation, viewport
+  emulation, console/network collection and response bodies. A pending script
+  did not block another page. Closing an earlier tab preserved stable IDs;
+  closed IDs failed without falling back. A real stdio client discovered the
+  new parameters, filled two pages concurrently and verified independent values.
 - Native CookieJar save/load/clear, isolated cookie contexts, batch expiry
   conversion and JSON session/localStorage round trips passed.
 - Native image responses passed both direct calls and MCP content conversion;
