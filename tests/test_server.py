@@ -131,11 +131,67 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.a.send.side_effect = RuntimeError("disconnected")
         with self.assertRaises(RuntimeError):
             await s._auto_enable_network_collection(self.a)
-        self.assertNotIn("a", s._network_collection_enabled_tabs)
+        self.assertNotIn(s._tab_key(self.a), s._network_collection_enabled_tabs)
         self.assertFalse(any(self.a.handlers.values()))
         self.a.send.side_effect = None
         await s._auto_enable_network_collection(self.a)
-        self.assertIn("a", s._network_collection_enabled_tabs)
+        self.assertIn(s._tab_key(self.a), s._network_collection_enabled_tabs)
+
+    async def test_collectors_are_isolated_for_connections_with_the_same_target_id(
+        self,
+    ):
+        replacement = FakeTab(self.a.target_id)
+        for tab in (self.a, replacement):
+            self.assertTrue(await s._enable_console_collection(tab))
+            await s._auto_enable_network_collection(tab)
+            self.assertEqual(len(tab.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+            self.assertEqual(len(tab.handlers[uc.cdp.network.RequestWillBeSent]), 1)
+        await s._disable_console_collection(self.a)
+        s._clear_collection_state(self.a)
+        self.assertFalse(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled])
+        self.assertEqual(len(replacement.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+        self.assertEqual(len(replacement.handlers[uc.cdp.network.RequestWillBeSent]), 1)
+        self.assertFalse(await s._enable_console_collection(replacement))
+        await s._auto_enable_network_collection(replacement)
+        self.assertEqual(len(replacement.handlers[uc.cdp.network.RequestWillBeSent]), 1)
+
+    async def test_retiring_a_frame_removes_only_its_collection_state(self):
+        frame = FakeTab("frame")
+        frame.parent = self.a
+        frame.aclose = AsyncMock()
+        frame_key = (self.a.target_id, frame.target_id)
+        s._frame_connections[frame_key] = frame
+        s._frame_loaders[frame_key] = "old-loader"
+        self.a.get_frame_tree = AsyncMock(
+            return_value=SimpleNamespace(
+                frame=SimpleNamespace(id_=self.a.target_id, loader_id="root-loader"),
+                child_frames=None,
+            )
+        )
+        self.a.get_frames = AsyncMock(return_value=[])
+        for tab in (self.a, frame):
+            await s._enable_console_collection(tab)
+            await s._auto_enable_network_collection(tab)
+        external_console = lambda event: None
+        external_network = lambda event: None
+        frame.add_handler(uc.cdp.runtime.ConsoleAPICalled, external_console)
+        frame.add_handler(uc.cdp.network.RequestWillBeSent, external_network)
+
+        await s._discover_frames(self.a)
+        frame.aclose.assert_awaited_once()
+        self.assertNotIn(s._tab_key(frame), s._console_collection_enabled_tabs)
+        self.assertNotIn(s._tab_key(frame), s._network_collection_enabled_tabs)
+        self.assertNotIn(s._tab_key(frame), s._console_callbacks)
+        self.assertNotIn(s._tab_key(frame), s._network_callbacks)
+        self.assertEqual(
+            frame.handlers[uc.cdp.runtime.ConsoleAPICalled], [external_console]
+        )
+        self.assertEqual(
+            frame.handlers[uc.cdp.network.RequestWillBeSent], [external_network]
+        )
+        self.assertFalse(await s._enable_console_collection(self.a))
+        self.assertEqual(len(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+        self.assertEqual(len(self.a.handlers[uc.cdp.network.RequestWillBeSent]), 1)
 
     async def test_request_ids_survive_filters_and_do_not_cross_pages(self):
         for rid, tab, resource in [

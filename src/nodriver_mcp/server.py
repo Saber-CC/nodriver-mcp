@@ -195,8 +195,8 @@ _network_requests: list[dict] = []
 _preserved_console_messages: list[list[dict]] = []  # last 3 navigations
 _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
-_network_collection_enabled_tabs: set[str] = set()
-_console_collection_enabled_tabs: set[str] = set()
+_network_collection_enabled_tabs: set[int] = set()
+_console_collection_enabled_tabs: set[int] = set()
 _named_browser_contexts: dict[
     str, Any
 ] = {}  # isolated_context name -> BrowserContextID
@@ -205,8 +205,8 @@ _selected_frames: dict[str, str] = {}
 _frame_connections: dict[tuple[str, str], uc.Tab] = {}
 _frame_loaders: dict[tuple[str, str], str] = {}
 _frame_discovery_lock = asyncio.Lock()
-_console_callbacks: dict[str, Any] = {}
-_network_callbacks: dict[str, list[tuple[type, Any]]] = {}
+_console_callbacks: dict[int, Any] = {}
+_network_callbacks: dict[int, list[tuple[type, Any]]] = {}
 _uid_owners: dict[str, tuple[str, uc.Tab, str]] = {}
 _request_ids = itertools.count()
 _message_ids = itertools.count()
@@ -224,8 +224,21 @@ def _page_key(tab: uc.Tab) -> str:
     return str(current.target_id)
 
 
-def _tab_key(tab: uc.Tab) -> str:
-    return str(tab.target_id)
+def _tab_key(tab: uc.Tab) -> int:
+    """Scope collectors to a connection instance; Chrome can reuse target IDs."""
+    return id(tab)
+
+
+def _clear_collection_state(tab: uc.Tab) -> None:
+    """Remove this connection's collectors before retiring its transport."""
+    key = _tab_key(tab)
+    callback = _console_callbacks.pop(key, None)
+    if callback is not None:
+        tab.remove_handler(uc.cdp.runtime.ConsoleAPICalled, callback)
+    _console_collection_enabled_tabs.discard(key)
+    for event, callback in _network_callbacks.pop(key, []):
+        tab.remove_handler(event, callback)
+    _network_collection_enabled_tabs.discard(key)
 
 
 async def _shutdown_browser() -> None:
@@ -262,6 +275,7 @@ async def _shutdown_browser() -> None:
             connections.extend(browser.targets)
             for connection in {id(c): c for c in connections}.values():
                 try:
+                    _clear_collection_state(connection)
                     await connection.aclose()
                 except Exception:
                     logger.debug("Connection cleanup failed", exc_info=True)
@@ -427,6 +441,7 @@ async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
                 subtree = await connection.get_frame_tree()
             except Exception:
                 if connection is native:
+                    _clear_collection_state(connection)
                     await connection.aclose()
                 raise
             frame = subtree.frame
@@ -460,6 +475,7 @@ async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
         live = {id(connection) for connection in _frame_connections.values()}
         for connection_id, connection in retired.items():
             if connection_id not in live:
+                _clear_collection_state(connection)
                 await connection.aclose()
         return list(discovered.values())
 
@@ -674,6 +690,7 @@ def _preserve_on_navigation(tab: uc.Tab) -> None:
     for key, connection in list(_frame_connections.items()):
         if key[0] == page_id:
             if connection is not tab:
+                _clear_collection_state(connection)
                 asyncio.create_task(connection.aclose())
             del _frame_connections[key]
             _frame_loaders.pop(key, None)
@@ -1333,11 +1350,13 @@ async def close_page(page_id: int = -1) -> str:
         return f"Error: Invalid page_id {page_id}."
     key = str(tab.target_id)
     await tab.close()
+    _clear_collection_state(tab)
     await tab.aclose()
     _selected_frames.pop(key, None)
     for pair, connection in list(_frame_connections.items()):
         if pair[0] == key:
             if connection is not tab:
+                _clear_collection_state(connection)
                 await connection.aclose()
             del _frame_connections[pair]
             _frame_loaders.pop(pair, None)
