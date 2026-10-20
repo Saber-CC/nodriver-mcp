@@ -58,6 +58,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         prepare_patch = patch.object(s, "_prepare_page", AsyncMock())
         prepare_patch.start()
         self.addCleanup(prepare_patch.stop)
+        frame_watch = patch.object(s._frame_overrides, "watch", AsyncMock())
+        frame_watch.start()
+        self.addCleanup(frame_watch.stop)
 
         async def perform(_tab, action, **_options):
             return await action()
@@ -713,7 +716,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             s, "_resolve_uid", AsyncMock(return_value=SimpleNamespace(object_id="obj"))
         ):
-            self.a.send.return_value = (SimpleNamespace(value=0), None)
+            self.a.send.return_value = (
+                uc.cdp.runtime.RemoteObject(type_="number", value=0),
+                None,
+            )
             self.assertIn(
                 "\\n0\\n".replace("\\n", "\n"),
                 await s.evaluate_script("el => 0", ["el"]),
@@ -897,6 +903,33 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 events", result)
         self.assertEqual(self.a.handlers[uc.cdp.tracing.TracingComplete], [])
         self.b.send.assert_not_awaited()
+
+    async def test_trace_stop_finally_only_releases_its_own_recording(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        newer = {"started": 123, "config": {"page_id": "b"}}
+
+        async def send(command):
+            if next(command)["method"] == "Tracing.end":
+                for callback in self.a.handlers[uc.cdp.tracing.TracingComplete]:
+                    callback(SimpleNamespace(stream="handle"))
+
+        async def read(*args):
+            entered.set()
+            await release.wait()
+            return b'{"traceEvents":[]}'
+
+        self.a.send.side_effect = send
+        s._tracing_active, s._trace_tab = True, self.a
+        with patch.object(s, "_read_stream", read):
+            stopping = asyncio.create_task(s.performance_stop_trace(analyze=False))
+            await entered.wait()
+            s._tracing_active, s._trace_tab, s._trace_metadata = True, self.b, newer
+            s._trace_stopping = False
+            release.set()
+            await stopping
+        self.assertTrue(s._tracing_active)
+        self.assertIs(s._trace_tab, self.b)
+        self.assertIs(s._trace_metadata, newer)
 
     async def test_cancelled_trace_cleanup_cannot_reset_a_new_recording(self):
         entered = asyncio.Event()

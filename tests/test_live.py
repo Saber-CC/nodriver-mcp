@@ -12,6 +12,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, patch
 
 import nodriver as uc
@@ -35,6 +36,37 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path.startswith(("/early-frame", "/echo-headers?early=")):
+            self.server.early_requests.append((self.path, dict(self.headers)))
+        if self.path.startswith("/identity-"):
+            parsed = urlsplit(self.path)
+            label = parse_qs(parsed.query)["name"][0]
+            if parsed.path == "/identity-page":
+                data = f'<script src="/identity-script?name={label}"></script>'.encode()
+                content_type = "text/html"
+            elif parsed.path == "/identity-script":
+                data = (
+                    f'function minified(){{console.log("identity-{label}")}};minified();\n'
+                    f"//# sourceMappingURL=/identity-map?name={label}"
+                ).encode()
+                content_type = "application/javascript"
+            else:
+                data = json.dumps(
+                    {
+                        "version": 3,
+                        "sources": [label + ".ts"],
+                        "names": [],
+                        "mappings": "AAAA",
+                        "sourcesContent": [f'console.log("source-{label}");'],
+                    }
+                ).encode()
+                content_type = "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path.startswith("/mapped.js.map"):
             headers = getattr(self.server, "source_map_headers", [])
             headers.append(dict(self.headers))
@@ -81,7 +113,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.path.startswith("/echo-headers"):
+        if self.path.startswith("/early-frame-asset.js"):
+            data, content_type = (
+                (
+                    "window.assetHeader="
+                    + json.dumps(self.headers.get("X-Review"))
+                    + ";"
+                ).encode(),
+                "application/javascript",
+            )
+        elif self.path.startswith("/early-frame"):
+            marker = parse_qs(urlsplit(self.path).query)["early"][0]
+            data, content_type = (
+                (
+                    "<script>window.initialMotion=matchMedia('(prefers-reduced-motion:reduce)').matches;</script>"
+                    f"<script src='/early-frame-asset.js?early={marker}'></script>"
+                    f"<script>window.initialFetch=fetch('/echo-headers?early={marker}').then(r=>r.json());</script>"
+                ).encode(),
+                "text/html",
+            )
+        elif self.path.startswith("/echo-headers"):
             data, content_type = (
                 json.dumps(dict(self.headers)).encode(),
                 "application/json",
@@ -377,6 +428,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             [event["type"] for event in events], ["mousedown", "mouseup", "click"]
         )
         self.assertTrue(all(event["trusted"] for event in events))
+
         await s._evaluate(tab, "window.mouseEvents = []")
         self.assertNotIn("Error", await s.click(button, dbl_click=True))
         events = await s._evaluate(tab, "window.mouseEvents")
@@ -396,6 +448,32 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             [event["detail"] for event in events if event["type"] == "click"], [1, 2]
         )
         self.assertTrue(all(event["trusted"] for event in events))
+
+    async def test_same_email_fill_keeps_focus_and_does_not_interrupt_batch(self):
+        page = await s._page_tab()
+        await s._evaluate(
+            page,
+            """document.body.insertAdjacentHTML('beforeend',
+            '<input id="email" type="email" aria-label="Repeat email" value="old@example.test">');""",
+        )
+        snapshot = await s.take_snapshot()
+        email = re.search(r'uid=(\S+) textbox "Repeat email"', snapshot).group(1)
+        other = re.search(r'uid=(\S+) textbox "Main input"', snapshot).group(1)
+        self.assertNotIn("Error", await s.fill(email, "old@example.test"))
+        self.assertEqual(await s._evaluate(page, "document.activeElement.id"), "email")
+        report = await s.fill_form(
+            [
+                {"uid": email, "value": "old@example.test"},
+                {"uid": other, "value": "batch continues"},
+            ]
+        )
+        self.assertIn("Completed 2 of 2 fields", report)
+        self.assertNotIn("Error", report)
+        self.assertNotIn("Error", await s.fill(email, "next@example.test"))
+        self.assertEqual(
+            await s._evaluate(page, "document.getElementById('email').value"),
+            "next@example.test",
+        )
 
     async def test_coordinate_clicks_emit_complete_trusted_single_and_double_sequences(
         self,
@@ -619,6 +697,68 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                 "document.getElementById('event-input').value", page_id=b
             ),
         )
+
+    async def test_cross_process_initial_iframe_scripts_and_resources_inherit_overrides(
+        self,
+    ):
+        page = await s._page_tab()
+        self.http.early_requests = []
+        await s.emulate(
+            prefers_reduced_motion="reduce", extra_http_headers={"X-Review": "first"}
+        )
+        for number, header in enumerate(("first", "updated")):
+            if number:
+                await s.emulate(extra_http_headers={"X-Review": header})
+            url = (
+                self.url.replace("127.0.0.1", "localhost")
+                + f"early-frame?early={number}"
+            )
+            # No list_frames/snapshot call may initialize the new connection.
+            with patch.object(
+                s,
+                "_discover_frames",
+                side_effect=AssertionError("late frame discovery"),
+            ):
+                await s._evaluate(
+                    page,
+                    """new Promise(resolve => {
+                    const frame=document.createElement('iframe');frame.id='early-%s';
+                    frame.onload=()=>resolve(true);frame.src=%s;document.body.append(frame);
+                })"""
+                    % (number, json.dumps(url)),
+                )
+            native = next(c for c in await page.get_frames() if c.target.url == url)
+            try:
+                result, error = await native.send(
+                    uc.cdp.runtime.evaluate(
+                        "(async()=>({motion:initialMotion,asset:assetHeader,headers:await initialFetch}))()",
+                        return_by_value=True,
+                        await_promise=True,
+                    )
+                )
+                self.assertIsNone(error)
+                self.assertEqual(
+                    result.value,
+                    {
+                        "motion": True,
+                        "asset": header,
+                        "headers": result.value["headers"],
+                    },
+                )
+                self.assertEqual(result.value["headers"].get("X-Review"), header)
+            finally:
+                await native.aclose()
+            requests = [
+                (p, h)
+                for p, h in self.http.early_requests
+                if p.endswith(f"early={number}")
+            ]
+            self.assertEqual(len(requests), 3, requests)
+            self.assertTrue(
+                all(h.get("X-Review") == header for p, h in requests), requests
+            )
+        await s.close_page(str(page.target_id))
+        self.assertFalse(s._frame_overrides.pages)
 
     async def test_cross_process_media_and_headers_follow_frame_connections(self):
         page = await s._page_tab()
@@ -1530,6 +1670,32 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(s._selected_target_id, selected)
 
+    async def test_cross_process_source_map_id_reuse_preserves_old_log_ownership(self):
+        await s.enable_console_collection(source_maps=True)
+        logs = []
+        for host, label in (("source-a.localhost", "A"), ("source-b.localhost", "B")):
+            url = f"http://{host}:{self.http.server_port}/identity-page?name={label}"
+            await s.navigate_page(url=url)
+            async with asyncio.timeout(5):
+                while not any(
+                    m["text"] == f"identity-{label}" for m in s._console_messages
+                ):
+                    await asyncio.sleep(0.01)
+            message = next(
+                m for m in s._console_messages if m["text"] == f"identity-{label}"
+            )
+            logs.append(message)
+            detail = await s.get_console_message(message["msgid"])
+            self.assertIn(f"/{label}.ts:1:1", detail)
+            self.assertIn(f"source-{label}", detail)
+        self.assertEqual(
+            logs[0]["location"]["script_id"], logs[1]["location"]["script_id"]
+        )
+        old = await s.get_console_message(logs[0]["msgid"])
+        self.assertIn("/A.ts:1:1", old)
+        self.assertIn("source-A", old)
+        self.assertNotIn("/B.ts", old)
+
     async def test_source_maps_use_browser_credentials_and_symbolize_async_stacks(self):
         tab = await s._active_tab()
         self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))
@@ -1733,6 +1899,64 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             42,
         )
         self.assertFalse(page._mapper)
+
+    async def test_argument_script_busy_deadline_restores_page_and_keeps_promise_waits_safe(
+        self,
+    ):
+        page = await s._page_tab()
+        uid = re.search(
+            r'uid=(\S+) textbox "Main input"', await s.take_snapshot()
+        ).group(1)
+        for source in (
+            "el => {while(true){}}",
+            "async el => {await new Promise(r=>setTimeout(r,10));while(true){}}",
+            "el => new Promise(() => {})",
+        ):
+            with self.subTest(source=source):
+                recovered = False
+                try:
+                    result = await asyncio.wait_for(
+                        s.evaluate_script(
+                            source, [uid], timeout=200, wait_for_stable=False
+                        ),
+                        5,
+                    )
+                    self.assertIn("Status: timed_out", result)
+                    next_result = await asyncio.wait_for(
+                        s.evaluate_script("42", timeout=1000, wait_for_stable=False), 3
+                    )
+                    self.assertIn("Status: completed", next_result)
+                    self.assertEqual(json.loads(next_result.splitlines()[1]), 42)
+                    recovered = True
+                finally:
+                    # A failing implementation must not leave teardown stuck in JS.
+                    if not recovered:
+                        await asyncio.wait_for(
+                            page.send(uc.cdp.runtime.terminate_execution()), 2
+                        )
+        self.assertNotIn(s._tab_key(page), s._console_collection_enabled_tabs)
+        self.assertFalse(page._mapper)
+
+        opened = await s.new_page(self.url, background=True)
+        other = re.search(r"page_id=(\w+)", opened).group(1)
+        timed_out, completed = await asyncio.gather(
+            s.evaluate_script(
+                "el => new Promise(() => {})",
+                [uid],
+                timeout=100,
+                wait_for_stable=False,
+                page_id=str(page.target_id),
+            ),
+            s.evaluate_script(
+                "new Promise(resolve=>setTimeout(()=>resolve(84),300))",
+                timeout=1500,
+                wait_for_stable=False,
+                page_id=other,
+            ),
+        )
+        self.assertIn("Status: timed_out", timed_out)
+        self.assertIn("Status: completed", completed)
+        self.assertEqual(json.loads(completed.splitlines()[1]), 84)
 
     async def test_script_large_results_save_complete_json_and_keep_bounded_previews(
         self,
@@ -2293,6 +2517,59 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("preview truncated", offline)
         self.assertIsNone(s._browser)
         self.assertTrue(analysis_path.exists())
+
+    async def test_trace_manual_stop_owns_state_when_auto_recording_is_cancelled(self):
+        started, reading, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        page = await s._page_tab()
+        original_send, original_read = page.send, s._read_stream
+
+        async def send(command, **kwargs):
+            start = command.gi_code is uc.cdp.tracing.start.__code__
+            result = await original_send(command, **kwargs)
+            if start:
+                started.set()
+            return result
+
+        async def read(*args):
+            data = await original_read(*args)
+            reading.set()
+            await release.wait()
+            return data
+
+        with patch.object(page, "send", send), patch.object(s, "_read_stream", read):
+            automatic = asyncio.create_task(
+                s.performance_start_trace(reload=False, duration_ms=60000)
+            )
+            stopping = None
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                state = s._trace_metadata
+                stopping = asyncio.create_task(s.performance_stop_trace(analyze=False))
+                await asyncio.wait_for(reading.wait(), 10)
+                automatic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await automatic
+                self.assertTrue(s._tracing_active)
+                self.assertTrue(s._trace_stopping)
+                self.assertIs(s._trace_metadata, state)
+                self.assertIn(
+                    "already running",
+                    await s.performance_start_trace(reload=False, auto_stop=False),
+                )
+                release.set()
+                self.assertIn("Trace stopped", await stopping)
+            finally:
+                release.set()
+                automatic.cancel()
+                await asyncio.gather(
+                    automatic, *([stopping] if stopping else []), return_exceptions=True
+                )
+        self.assertIn(
+            "Trace started",
+            await s.performance_start_trace(reload=False, auto_stop=False),
+        )
+        self.assertTrue(s._tracing_active)
+        self.assertIn("Trace stopped", await s.performance_stop_trace(analyze=False))
 
     async def test_trace_auto_and_manual_exports_keep_complete_files_and_config(self):
         first = str((await s._page_tab()).target_id)

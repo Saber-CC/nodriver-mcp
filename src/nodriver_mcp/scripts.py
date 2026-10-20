@@ -68,6 +68,81 @@ def script_value(result):
     return result.value
 
 
+async def _argument_command(tab, command, *, synchronous):
+    """Keep an in-flight command alive until cancellation can stop its JS."""
+    runtime = uc.cdp.runtime
+    task = asyncio.create_task(tab.send(command))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        busy = synchronous and not task.done()
+        if not synchronous and not task.done():
+            # An unresolved Promise need not be executing JS. Terminating an
+            # idle isolate can poison its next evaluation. Probe responsiveness
+            # before interrupting a continuation that may be running a loop.
+            try:
+                await asyncio.wait_for(
+                    tab.send(
+                        runtime.evaluate(
+                            "0", silent=True, timeout=runtime.TimeDelta(50)
+                        )
+                    ),
+                    0.1,
+                )
+            except TimeoutError:
+                busy = True
+            except Exception:
+                pass
+        if busy:
+            try:
+                await asyncio.wait_for(tab.send(runtime.terminate_execution()), 1)
+            except Exception:
+                logger.debug("Script interruption failed", exc_info=True)
+        raise
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _execute_with_arguments(tab, source, objects, group):
+    runtime = uc.cdp.runtime
+    # Do not await a returned Promise in callFunctionOn: its pending command
+    # otherwise cannot distinguish an idle Promise from synchronous busy JS.
+    result, error = await _argument_command(
+        tab,
+        runtime.call_function_on(
+            function_declaration=source,
+            object_id=objects[0].object_id,
+            arguments=[runtime.CallArgument(object_id=o.object_id) for o in objects],
+            return_by_value=False,
+            await_promise=False,
+            user_gesture=True,
+            object_group=group,
+        ),
+        synchronous=True,
+    )
+    if error or result.object_id is None or result.type_ in {"function", "symbol"}:
+        return result, error
+    if result.subtype == "promise":
+        return await _argument_command(
+            tab,
+            runtime.await_promise(result.object_id, return_by_value=True),
+            synchronous=False,
+        )
+    return await _argument_command(
+        tab,
+        runtime.call_function_on(
+            "function(){return this}",
+            object_id=result.object_id,
+            return_by_value=True,
+            await_promise=False,
+            object_group=group,
+        ),
+        synchronous=True,
+    )
+
+
 async def execute_script(
     tab, source, args, *, format="auto", timeout=0, context_id=None, resolve_uid=None
 ):
@@ -76,19 +151,7 @@ async def execute_script(
     try:
         if args:
             objects = [await resolve_uid(uid, group) for uid in args]
-            result, error = await tab.send(
-                runtime.call_function_on(
-                    function_declaration=source,
-                    object_id=objects[0].object_id,
-                    arguments=[
-                        runtime.CallArgument(object_id=o.object_id) for o in objects
-                    ],
-                    return_by_value=True,
-                    await_promise=True,
-                    user_gesture=True,
-                    object_group=group,
-                )
-            )
+            result, error = await _execute_with_arguments(tab, source, objects, group)
         else:
             expression = source
             if format in {"auto", "function"}:

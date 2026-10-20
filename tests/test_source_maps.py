@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import unittest
 from collections import defaultdict
@@ -23,6 +24,103 @@ def mapping(**overrides):
 
 
 class SourceMapTests(unittest.IsolatedAsyncioTestCase):
+    def parsed(self, maps, label, *, external=False):
+        data = dict(
+            mapping(),
+            sources=[label + ".ts"],
+            sourcesContent=["1\n2\n3\n4\nsource-" + label],
+        )
+        maps.parsed(
+            NS(
+                script_id="3",
+                execution_context_id=1,
+                hash_=label,
+                execution_context_aux_data={"frameId": "root"},
+                url=f"https://{label}.test/app.js",
+                start_line=0,
+                start_column=0,
+                source_map_url="app.map"
+                if external
+                else "data:application/json;base64,"
+                + base64.b64encode(json.dumps(data).encode()).decode(),
+            )
+        )
+
+    async def test_reused_script_id_keeps_cached_and_uncached_old_messages_separate(
+        self,
+    ):
+        tab = NS(send=AsyncMock(), handlers=defaultdict(list))
+        maps = SourceMaps(tab)
+        maps.active = maps.ever_enabled = True
+        self.parsed(maps, "A")
+        old = {
+            "stack_trace": {
+                "callFrames": [
+                    {
+                        "scriptId": "3",
+                        "url": "https://A.test/app.js",
+                        "lineNumber": 0,
+                        "columnNumber": 0,
+                    }
+                ]
+            }
+        }
+        maps.bind(old)
+        self.assertIn("A.ts", (await maps.symbolize(old))["mapped_location"]["url"])
+        maps.contexts_cleared(None)
+        self.parsed(maps, "B")
+        new = {
+            "stack_trace": {
+                "callFrames": [
+                    {
+                        "scriptId": "3",
+                        "url": "https://B.test/app.js",
+                        "lineNumber": 0,
+                        "columnNumber": 0,
+                    }
+                ]
+            }
+        }
+        maps.bind(new)
+        self.assertIn("B.ts", (await maps.symbolize(new))["mapped_location"]["url"])
+        self.assertIn("A.ts", (await maps.symbolize(old))["mapped_location"]["url"])
+        # Replacing an ID without a contextsCleared notification also needs a
+        # new cache key and a stable catalog for the already captured log.
+        self.parsed(maps, "C")
+        self.assertIn("B.ts", (await maps.symbolize(new))["mapped_location"]["url"])
+        self.parsed(maps, "external", external=True)
+        stale = {"location": {"script_id": "3", "line_number": 0, "column_number": 0}}
+        maps.bind(stale)
+        maps.contexts_cleared(None)
+        self.parsed(maps, "D")
+        result = await maps.symbolize(stale)
+        self.assertIsNone(result.get("mapped_location"))
+        self.assertIn("retired", result["source_map_errors"][0])
+        tab.send.assert_not_awaited()
+
+    async def test_inflight_old_map_load_cannot_populate_reused_script_cache(self):
+        maps = SourceMaps(NS(handlers=defaultdict(list)))
+        maps.active = maps.ever_enabled = True
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch(url, script):
+            if script["hash"] == "A":
+                entered.set()
+                await release.wait()
+            return dict(mapping(), sources=[script["hash"] + ".ts"])
+
+        maps.fetch = fetch
+        self.parsed(maps, "A", external=True)
+        first = maps.scripts["3"]
+        task = asyncio.create_task(maps.map_for(first))
+        await entered.wait()
+        self.parsed(maps, "B", external=True)
+        second = maps.scripts["3"]
+        release.set()
+        self.assertIn("A.ts", (await task).find(0, 0)["url"])
+        self.assertIn("B.ts", (await maps.map_for(second)).find(0, 0)["url"])
+        self.assertNotEqual(first["identity"], second["identity"])
+
     def test_vlq_root_names_unmapped_segments_and_indexed_offsets(self):
         basic = mapping()
         source = SourceMap(basic, "https://example.test/build/app.js.map")

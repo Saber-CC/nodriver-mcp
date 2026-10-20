@@ -18,10 +18,12 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.17 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.18 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
+The [1.5.18 fixes](docs/regressions-1.5.18.md) cover script deadlines, concurrent
+trace cleanup, source-map ownership, iframe initialization and repeated email fills.
 
 For a source checkout:
 
@@ -248,7 +250,9 @@ Media emulation accepts `forced_colors`, `prefers_contrast` and
 `auto` resets only the named feature. `extra_http_headers` accepts a string-valued
 object or JSON string, replaces extra headers and persists across navigation.
 Use `{}` or `""` to clear headers. `reset_emulation` clears all media and headers.
-Overrides are synchronized to discovered iframe connections, including replacements.
+New cross-process iframes receive these overrides before their initial scripts and
+subresources run, including nested frames. Later changes and resets also update
+existing frame sessions; no `list_frames` call is needed to initialize them.
 
 ### Screenshots and debugging
 
@@ -280,6 +284,9 @@ positions. External maps load through Chrome with its proxy and cookies; inline
 and indexed maps are supported. Failed or slow maps retain raw positions and a
 diagnostic. `resolve_source_maps=false` skips resolution; `source_maps=false`
 disables owned Debugger collection. Ordinary browsing keeps these domains disabled.
+Script identities and captured log metadata remain separate across renderer changes,
+even when Chrome reuses a script ID. Cached old maps remain usable; uncached external
+maps from a retired execution context retain generated positions and a diagnostic.
 
 `list_pages(include_service_workers=true)` also lists running service workers
 and their stable `service_worker_id`, including extension IDs when applicable.

@@ -33,7 +33,7 @@ from pydantic import StrictBool, ValidationError
 from .actions import ActionResult, ActionWaiter
 from .console import ConsoleCollector, format_message, format_stack
 from .dialogs import DialogInterrupted, DialogRegistry
-from .emulation import EmulationOverrides, http_headers, media_updates
+from .emulation import EmulationOverrides, FrameOverrides, http_headers, media_updates
 from .forms import control_state, fill_text, fill_toggle
 from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
@@ -403,6 +403,7 @@ _worker_targets = WorkerTargets(lambda tab: _clear_collection_state(tab))
 _emulation_overrides = EmulationOverrides(
     lambda tab: _auto_enable_network_collection(tab)
 )
+_frame_overrides = FrameOverrides(_emulation_overrides)
 
 
 async def _prepare_page(tab: uc.Tab) -> None:
@@ -462,6 +463,7 @@ async def _forget_page_state(tab: uc.Tab) -> None:
     key = str(tab.target_id)
     for cleanup in _page_cleanup_callbacks:
         await cleanup(key)
+    await _frame_overrides.close(key)
     _clear_collection_state(tab)
     _emulation_overrides.forget(key)
     _selected_frames.pop(key, None)
@@ -496,6 +498,7 @@ async def _shutdown_browser() -> None:
             await callback()
         except Exception:
             logger.debug("Tool cleanup failed", exc_info=True)
+    await _frame_overrides.close_all()
     browser, _browser = _browser, None
     lease, _profile_lease = _profile_lease, None
     _launch_options = None
@@ -1305,9 +1308,14 @@ async def _apply_emulation(
 
     if updates or headers is not None:
         page = await _page_tab()
+        await _frame_overrides.watch(page)
         frames = await _discover_frames(page)
+        page_id = str(page.target_id)
         await _emulation_overrides.update(
-            str(page.target_id), [page, *(c for _, c in frames)], updates, headers
+            page_id,
+            [page, *(c for _, c in frames), *_frame_overrides.connections(page_id)],
+            updates,
+            headers,
         )
         results.extend(f"{name}={value or 'auto'}" for name, value in updates.items())
         if headers is not None:
@@ -1408,7 +1416,13 @@ async def _reset_emulation(tab: uc.Tab) -> list[str]:
     page = await _page_tab()
     frames = await _discover_frames(page)
     await _emulation_overrides.update(
-        str(page.target_id), [page, *(c for _, c in frames)], reset=True
+        str(page.target_id),
+        [
+            page,
+            *(c for _, c in frames),
+            *_frame_overrides.connections(str(page.target_id)),
+        ],
+        reset=True,
     )
     results.append("media_and_headers=reset")
 
@@ -2514,8 +2528,8 @@ async def performance_start_trace(
             state["config"], ensure_ascii=False
         )
     except BaseException:
-        if _trace_metadata is state:
-            if started and not _trace_stopping:
+        if _trace_metadata is state and not _trace_stopping:
+            if started:
                 try:
                     await asyncio.shield(
                         asyncio.wait_for(
@@ -2524,7 +2538,7 @@ async def performance_start_trace(
                     )
                 except BaseException:
                     logger.debug("Trace cleanup failed", exc_info=True)
-            if _trace_metadata is state:
+            if _trace_metadata is state and not _trace_stopping:
                 _tracing_active, _trace_tab, _trace_metadata = False, None, {}
         raise
 
@@ -2554,6 +2568,8 @@ async def performance_stop_trace(
     tab, state = _trace_tab, _trace_metadata
     if page_id is not None and tab is not await _page_tab():
         raise ValueError("The active trace belongs to a different page_id.")
+    if _trace_metadata is not state:
+        raise ValueError("This recording is no longer active.")
     if _trace_stopping:
         raise ValueError("The active trace is already stopping.")
     _trace_stopping = True
@@ -2588,8 +2604,9 @@ async def performance_stop_trace(
         tab.remove_handler(uc.cdp.tracing.TracingComplete, complete)
         if not done.done():
             done.cancel()
-        _tracing_active, _trace_tab, _trace_metadata = False, None, {}
-        _trace_stopping = False
+        if _trace_metadata is state:
+            _tracing_active, _trace_tab, _trace_metadata = False, None, {}
+            _trace_stopping = False
     should_analyze = (
         state.get("config", {}).get("analyze", False) if analyze is None else analyze
     )

@@ -309,3 +309,7 @@ CDP 缩写映射与错误详情、主 frame 搜索、iframe 连接切换及采�
 真实 DevTools 引擎的全量回归共 160 项：159 项通过，1 项因 Chrome 缺少网站
 navigator.modelContext API 跳过。构建、锁文件、Python 检查及 Node 桥接语法检查通过。
 性能分析的运行方式和观察指标含义见 [performance-analysis.md](performance-analysis.md)。
+
+1.5.18 修复脚本超时、trace 并发清理、source map 身份复用、iframe 初始设置和重复
+邮箱填充的回归；验证增至 170 项（169 通过，1 项因上述 Chrome API 缺失跳过）。
+复现、修复和验证记录见 [regressions-1.5.18.md](regressions-1.5.18.md)。

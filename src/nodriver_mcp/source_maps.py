@@ -8,6 +8,7 @@ import posixpath
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
 from urllib.parse import unquote_to_bytes, urljoin, urlsplit
+from uuid import uuid4
 
 from nodriver import ProtocolException, cdp
 
@@ -152,24 +153,83 @@ class SourceMaps:
         self.connection = connection
         self.active = self.ever_enabled = self.watching = False
         self.scripts, self.cache = OrderedDict(), OrderedDict()
+        self.contexts = {}
         self.callbacks = [
             (cdp.debugger.ScriptParsed, self.parsed),
             (cdp.debugger.ScriptFailedToParse, self.parsed),
+            (cdp.runtime.ExecutionContextCreated, self.context_created),
+            (cdp.runtime.ExecutionContextDestroyed, self.context_destroyed),
+            (cdp.runtime.ExecutionContextsCleared, self.contexts_cleared),
         ]
         self.lock = asyncio.Lock()
 
     def parsed(self, event):
         aux = event.execution_context_aux_data or {}
-        self.scripts[str(event.script_id)] = {
+        key = str(event.script_id)
+        script = {
             "id": str(event.script_id),
+            "context_id": int(event.execution_context_id),
+            "context_unique_id": self.contexts.get(int(event.execution_context_id)),
+            "hash": event.hash_,
             "url": event.url,
             "map_url": event.source_map_url,
             "frame_id": aux.get("frameId"),
             "start_line": event.start_line,
             "start_column": event.start_column,
         }
+        previous = self.scripts.get(key)
+        if previous is not None:
+            if not previous.get("retired") and all(
+                previous.get(k) == v for k, v in script.items()
+            ):
+                return
+            previous["retired"] = True
+            # Old messages retain this catalog, including lazily resolved async
+            # parents. Replacing an ID must not change their script ownership.
+            self.scripts = self.scripts.copy()
+        self.scripts[key] = dict(script, identity=uuid4().hex)
         while len(self.scripts) > 10000:
             self.scripts.popitem(last=False)
+
+    def context_created(self, event):
+        context = event.context
+        self.contexts[int(context.id_)] = context.unique_id
+
+    def context_destroyed(self, event):
+        context_id = int(event.execution_context_id)
+        unique_id = event.execution_context_unique_id
+        if self.contexts.get(context_id) == unique_id:
+            self.contexts.pop(context_id, None)
+        for script in self.scripts.values():
+            if script.get("context_id") == context_id and (
+                not script.get("context_unique_id")
+                or script["context_unique_id"] == unique_id
+            ):
+                script["retired"] = True
+
+    def contexts_cleared(self, event):
+        for script in self.scripts.values():
+            script["retired"] = True
+        self.contexts.clear()
+        self.scripts = OrderedDict()
+
+    def bind(self, message):
+        """Keep generated frames tied to the scripts observed with this log."""
+        message["_source_maps"] = self
+        message["_source_catalog"] = self.scripts
+        scripts = {}
+        current = message.get("stack_trace")
+        for _ in range(8):
+            if not current:
+                break
+            for frame in current.get("callFrames", [])[:50]:
+                key = str(frame.get("scriptId"))
+                scripts[key] = self.scripts.get(key)
+            current = current.get("parent")
+        if message.get("location"):
+            key = str(message["location"].get("script_id"))
+            scripts[key] = self.scripts.get(key)
+        message["_source_scripts"] = scripts
 
     async def enable(self):
         if self.active:
@@ -217,8 +277,8 @@ class SourceMaps:
             raw = unquote_to_bytes(payload)
             raw = base64.b64decode(raw, validate=True) if ";base64" in metadata else raw
         else:
-            if not self.active:
-                raise ValueError("Source-map connection is retired or disabled.")
+            if not self.active or script.get("retired"):
+                raise ValueError("Source-map execution context is retired or disabled.")
             result = await self.connection.send(
                 cdp.network.load_network_resource(
                     url,
@@ -241,9 +301,9 @@ class SourceMaps:
                         f"Cannot load source map (HTTP {result.http_status_code}, {result.net_error_name})."
                     )
                 while True:
-                    if not self.active:
+                    if not self.active or script.get("retired"):
                         raise ValueError(
-                            "Source-map connection is retired or disabled."
+                            "Source-map execution context is retired or disabled."
                         )
                     encoded, text, eof = await self.connection.send(
                         cdp.io.read(result.stream, size=65536)
@@ -293,7 +353,7 @@ class SourceMaps:
 
     async def map_for(self, script):
         async with self.lock:
-            key = script["id"]
+            key = script.setdefault("identity", uuid4().hex)
             if key not in self.cache:
                 try:
                     url = resolve_url(script["url"], script["map_url"])
@@ -321,9 +381,16 @@ class SourceMaps:
                 raise ValueError(value)
             return value
 
-    async def frame(self, frame):
-        script = self.scripts.get(str(frame.get("scriptId")))
+    async def frame(self, frame, scripts=None, catalog=None):
+        key = str(frame.get("scriptId"))
+        scripts = scripts if scripts is not None else self.scripts
+        script = scripts.get(key) if key in scripts else (catalog or {}).get(key)
         if script is None or not script.get("map_url"):
+            return
+        if frame.get("url") and script["url"] and frame["url"] != script["url"]:
+            frame["sourceMapError"] = (
+                "Generated frame does not match the captured script."
+            )
             return
         try:
             mapping = await self.map_for(script)
@@ -341,6 +408,8 @@ class SourceMaps:
         if not self.ever_enabled:
             return message
         result = dict(message)
+        scripts = message.get("_source_scripts", self.scripts)
+        catalog = message.get("_source_catalog", self.scripts)
         stack = copy.deepcopy(message.get("stack_trace"))
         result["stack_trace"] = stack
         current, visited, errors = stack, set(), []
@@ -348,13 +417,13 @@ class SourceMaps:
             if not current:
                 break
             for frame in current.get("callFrames", [])[:50]:
-                await self.frame(frame)
+                await self.frame(frame, scripts, catalog)
                 if frame.get("sourceMapError"):
                     errors.append(frame["sourceMapError"])
             if "parent" not in current and current.get("parentId"):
                 parent = current["parentId"]
                 key = json.dumps(parent, sort_keys=True)
-                if key in visited or not self.active:
+                if key in visited or not self.active or catalog is not self.scripts:
                     break
                 visited.add(key)
                 try:
@@ -378,7 +447,7 @@ class SourceMaps:
                 "lineNumber": native.get("line_number", 0),
                 "columnNumber": native.get("column_number", 0),
             }
-            await self.frame(frame)
+            await self.frame(frame, scripts, catalog)
             if frame.get("originalLocation"):
                 result["mapped_location"] = frame["originalLocation"]
             if frame.get("sourceMapError"):
