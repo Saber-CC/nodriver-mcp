@@ -80,7 +80,7 @@ class InstallationTests(unittest.IsolatedAsyncioTestCase):
                         }
                         <= names
                     )
-                    self.assertEqual(len(names), 67 if performance_enabled else 60)
+                    self.assertEqual(len(names), 63 if performance_enabled else 56)
                     self.assertNotIn("call_webmcp_tool", names)
                     self.assertNotIn("get_ad_info", names)
                     result = await session.call_tool(

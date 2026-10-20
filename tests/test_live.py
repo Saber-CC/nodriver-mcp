@@ -20,6 +20,7 @@ import nodriver as uc
 from mcp.server.mcpserver import Image
 from mcp.server.mcpserver.exceptions import ToolError
 from PIL import Image as PillowImage
+from websockets.asyncio.server import serve
 
 from nodriver_mcp import server as s
 
@@ -3386,6 +3387,106 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             s._default_browser_context_id,
         )
 
+    async def test_runtime_opt_in_preserves_websocket_events_without_console_serialization(
+        self,
+    ):
+        page = await s._page_tab()
+        native_send = page.send
+        methods = []
+
+        async def send(command, *args, **kwargs):
+            packet = next(command)
+            methods.append(packet["method"])
+
+            def replay():
+                response = yield packet
+                try:
+                    command.send(response)
+                except StopIteration as stop:
+                    return stop.value
+
+            return await native_send(replay(), *args, **kwargs)
+
+        async def echo(socket):
+            async for message in socket:
+                await socket.send(message)
+
+        with patch.object(page, "send", send):
+            await s.evaluate_script(
+                """window.runtimePolicyDetected=false;
+                const policyError=new Error('runtime-policy-probe');
+                Object.defineProperty(policyError,'name',{get(){window.runtimePolicyDetected=true;return 'Error'}});
+                console.log(policyError);window.runtimePolicyDetected=false;""",
+                format="script",
+                wait_for_stable=False,
+            )
+            with self.assertRaisesRegex(ValueError, "allow_runtime_enable=true"):
+                await self.tool("send_cdp_command", domain="Runtime", command="enable")
+            with self.assertRaisesRegex(ValueError, "allow_runtime_enable=true"):
+                await self.tool(
+                    "subscribe_cdp_events",
+                    events=[
+                        "Network.webSocketFrameReceived",
+                        "Runtime.consoleAPICalled",
+                    ],
+                )
+            identifier = await self.tool(
+                "subscribe_cdp_events",
+                events=["Network.webSocketFrameReceived", "Network.webSocketFrameSent"],
+            )
+            try:
+                async with serve(echo, "127.0.0.1", 0) as websocket:
+                    port = websocket.sockets[0].getsockname()[1]
+                    result = await s.evaluate_script(
+                        f"""new Promise((resolve,reject)=>{{
+                        const socket=new WebSocket('ws://127.0.0.1:{port}');
+                        socket.onopen=()=>socket.send('runtime-policy-ws');
+                        socket.onmessage=event=>{{socket.close();resolve(event.data)}};
+                        socket.onerror=()=>reject(new Error('WebSocket failed'));
+                        }})""",
+                        format="script",
+                        timeout=5000,
+                        wait_for_stable=False,
+                    )
+                    self.assertEqual(
+                        json.loads(result.splitlines()[1]), "runtime-policy-ws"
+                    )
+                    async with asyncio.timeout(3):
+                        while True:
+                            events = await self.tool(
+                                "get_cdp_events", subscription_id=identifier
+                            )
+                            received = {
+                                event["method"]
+                                for event in events
+                                if event["data"]["response"]["payloadData"]
+                                == "runtime-policy-ws"
+                            }
+                            if received == {
+                                "Network.webSocketFrameSent",
+                                "Network.webSocketFrameReceived",
+                            }:
+                                break
+                            await asyncio.sleep(0.01)
+                self.assertNotIn("Runtime.enable", methods)
+                flag = await s.evaluate_script(
+                    "runtimePolicyDetected", wait_for_stable=False
+                )
+                self.assertFalse(json.loads(flag.splitlines()[1]))
+                await self.tool(
+                    "send_cdp_command",
+                    domain="Runtime",
+                    command="enable",
+                    allow_runtime_enable=True,
+                )
+                flag = await s.evaluate_script(
+                    "runtimePolicyDetected", wait_for_stable=False
+                )
+                self.assertTrue(json.loads(flag.splitlines()[1]))
+                await self.tool("send_cdp_command", domain="Runtime", command="disable")
+            finally:
+                await self.tool("unsubscribe_cdp_events", subscription_id=identifier)
+
     async def test_frame_runtime_cleanup_serializes_new_event_subscriptions(self):
         page = await s._page_tab()
         frames = await self.tool("list_frames")
@@ -3432,6 +3533,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                             self.tool(
                                 "subscribe_cdp_events",
                                 events=["Runtime.ConsoleAPICalled"],
+                                allow_runtime_enable=True,
                             )
                         )
                         pending.append(subscription)
@@ -3460,7 +3562,12 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_frame_lookup_preserves_explicit_runtime_domain_ownership(self):
         page = await s._page_tab()
-        await self.tool("send_cdp_command", domain="Runtime", command="enable")
+        await self.tool(
+            "send_cdp_command",
+            domain="Runtime",
+            command="enable",
+            allow_runtime_enable=True,
+        )
         self.assertTrue(s._frame_contexts.state(page)["runtime_requested"])
         child = next(
             frame

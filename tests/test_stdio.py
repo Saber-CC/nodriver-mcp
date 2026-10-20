@@ -33,10 +33,11 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 initialized = await session.initialize()
                 self.assertEqual(initialized.server_info.name, "nodriver-mcp")
                 self.assertTrue(initialized.server_info.version)
+                self.assertIn("Runtime.enable", initialized.instructions)
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
                 self.assertNotIn("find_in_page", names)
-                self.assertEqual(len(names), 60)
+                self.assertEqual(len(names), 56)
                 self.assertTrue(names.isdisjoint(TOOL_GROUP_BY_NAME))
                 self.assertTrue(
                     {
@@ -76,6 +77,78 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                     "".join(getattr(c, "text", "") for c in disabled.content),
                 )
 
+    async def test_runtime_opt_in_and_risk_descriptions_reach_real_mcp_clients(self):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "nodriver_mcp"],
+            env={**os.environ, ENABLED_GROUPS_ENV: "console"},
+        )
+        async with stdio_client(parameters) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                self.assertEqual(len(tools), 60)
+                for name in (
+                    "enable_console_collection",
+                    "subscribe_cdp_events",
+                    "send_cdp_command",
+                ):
+                    with self.subTest(name=name):
+                        self.assertIn("Runtime.enable", tools[name].description)
+                        self.assertIn("bot detection", tools[name].description)
+                        self.assertIn("Do not enable", tools[name].description)
+                for name in ("send_cdp_command", "subscribe_cdp_events"):
+                    option = tools[name].input_schema["properties"][
+                        "allow_runtime_enable"
+                    ]
+                    self.assertFalse(option["default"])
+                    self.assertEqual(option["type"], "boolean")
+                for name, arguments in (
+                    ("send_cdp_command", {"domain": "Runtime", "command": "enable"}),
+                    (
+                        "send_cdp_command",
+                        {
+                            "domain": "runtime",
+                            "command": "Runtime.enable",
+                            "page_id": "unknown",
+                        },
+                    ),
+                    (
+                        "subscribe_cdp_events",
+                        {
+                            "events": [
+                                "Network.webSocketFrameReceived",
+                                "Runtime.consoleAPICalled",
+                            ]
+                        },
+                    ),
+                    (
+                        "subscribe_cdp_events",
+                        {"events": ["runtime.ConsoleAPICalled"], "page_id": "unknown"},
+                    ),
+                ):
+                    with self.subTest(name=name, arguments=arguments):
+                        result = await session.call_tool(name, arguments)
+                        self.assertTrue(result.is_error)
+                        self.assertIn(
+                            "allow_runtime_enable=true",
+                            "".join(getattr(c, "text", "") for c in result.content),
+                        )
+                for value in (1, "true"):
+                    result = await session.call_tool(
+                        "send_cdp_command",
+                        {
+                            "domain": "Runtime",
+                            "command": "enable",
+                            "allow_runtime_enable": value,
+                        },
+                    )
+                    self.assertTrue(result.is_error)
+                    self.assertIn(
+                        "allow_runtime_enable",
+                        "".join(getattr(c, "text", "") for c in result.content),
+                    )
+
     async def test_modern_client_discovers_and_calls_tools(self):
         parameters = StdioServerParameters(
             command=sys.executable,
@@ -86,7 +159,7 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.protocol_version, "2026-07-28")
             tools = await client.list_tools()
             names = {tool.name for tool in tools.tools}
-            self.assertEqual(len(names), 60)
+            self.assertEqual(len(names), 56)
             self.assertIn("start_browser", names)
             self.assertTrue(names.isdisjoint(TOOL_GROUP_BY_NAME))
             response = await client.call_tool(
@@ -127,7 +200,7 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
         )
         async with Client(parameters, mode="2026-07-28") as client:
             names = {tool.name for tool in (await client.list_tools()).tools}
-            self.assertEqual(len(names), 64)
+            self.assertEqual(len(names), 60)
             self.assertIn("get_connection_history", names)
             self.assertNotIn("performance_start_trace", names)
             self.assertNotIn("call_webmcp_tool", names)
@@ -157,7 +230,7 @@ class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_PROXY": "",
                 "NODRIVER_EXTENSIONS": "[]",
                 "NODRIVER_BROWSER_ARGS": "[]",
-                ENABLED_GROUPS_ENV: "",
+                ENABLED_GROUPS_ENV: "console",
             },
         )
         async with stdio_client(parameters) as (reader, writer):
@@ -249,7 +322,11 @@ class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(json.loads(clean.splitlines()[1]), [[], []])
                 await self.call(
-                    session, "send_cdp_command", domain="Runtime", command="enable"
+                    session,
+                    "send_cdp_command",
+                    domain="Runtime",
+                    command="enable",
+                    allow_runtime_enable=True,
                 )
                 flag = await self.call(
                     session,
@@ -397,7 +474,7 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_PROXY": "",
                 "NODRIVER_EXTENSIONS": "[]",
                 "NODRIVER_BROWSER_ARGS": '["--enable-unsafe-extension-debugging"]',
-                ENABLED_GROUPS_ENV: "performance",
+                ENABLED_GROUPS_ENV: "console,performance",
             },
         )
 

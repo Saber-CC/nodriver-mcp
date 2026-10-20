@@ -3,6 +3,14 @@
 ENABLED_GROUPS_ENV = "NODRIVER_ENABLED_TOOL_GROUPS"
 
 OPTIONAL_TOOL_GROUPS = {
+    "console": frozenset(
+        {
+            "enable_console_collection",
+            "disable_console_collection",
+            "list_console_messages",
+            "get_console_message",
+        }
+    ),
     "performance": frozenset(
         {
             "performance_start_trace",
@@ -43,6 +51,6 @@ def parse_enabled_tool_groups(value: str) -> frozenset[str]:
     if unknown:
         raise ValueError(
             f"Unknown {ENABLED_GROUPS_ENV} group(s): {', '.join(sorted(unknown))}. "
-            "Choose performance, diagnostics, webmcp or all."
+            "Choose console, performance, diagnostics, webmcp or all."
         )
     return frozenset(OPTIONAL_TOOL_GROUPS) if "all" in groups else frozenset(groups)

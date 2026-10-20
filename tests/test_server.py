@@ -886,6 +886,113 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             s._frame_contexts.forget(self.a)
 
+    async def test_runtime_enabling_is_rejected_before_any_browser_or_event_changes(
+        self,
+    ):
+        invoke = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        for page_id in (None, "a", "unknown"):
+            for domain, command in (
+                ("Runtime", "enable"),
+                ("runtime", "Runtime.enable"),
+                ("RUNTIME", "e_n_a_b_l_e"),
+            ):
+                with self.subTest(page_id=page_id, domain=domain, command=command):
+                    with self.assertRaisesRegex(
+                        ValueError, "allow_runtime_enable=true"
+                    ):
+                        await invoke("send_cdp_command")(
+                            domain, command, page_id=page_id
+                        )
+            for events in (
+                ["Runtime.consoleAPICalled"],
+                ["runtime.ConsoleAPICalled"],
+                ["Network.webSocketFrameReceived", "Runtime.exceptionThrown"],
+            ):
+                with self.subTest(page_id=page_id, events=events):
+                    with self.assertRaisesRegex(
+                        ValueError, "allow_runtime_enable=true"
+                    ):
+                        await invoke("subscribe_cdp_events")(events, page_id=page_id)
+        s._get_browser.assert_not_awaited()
+        self.a.send.assert_not_awaited()
+        self.assertFalse(any(self.a.handlers.values()))
+
+    async def test_explicit_opt_in_enables_runtime_but_does_not_gate_other_commands(
+        self,
+    ):
+        methods = []
+
+        async def send(command):
+            methods.append(next(command)["method"])
+
+        self.a.send.side_effect = send
+        invoke = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        await invoke("send_cdp_command")("Runtime", "enable", allow_runtime_enable=True)
+        self.assertTrue(s._frame_contexts.state(self.a)["runtime_requested"])
+        await invoke("send_cdp_command")("Runtime", "disable")
+        await invoke("send_cdp_command")("Runtime", "evaluate", {"expression": "42"})
+        await invoke("send_cdp_command")("Network", "enable")
+        identifier = await invoke("subscribe_cdp_events")(
+            ["Runtime.consoleAPICalled"], allow_runtime_enable=True
+        )
+        self.assertTrue(s._frame_contexts.has_runtime_consumers(self.a))
+        await invoke("unsubscribe_cdp_events")(identifier)
+        self.assertEqual(
+            methods,
+            [
+                "Runtime.enable",
+                "Runtime.disable",
+                "Runtime.evaluate",
+                "Network.enable",
+                "Runtime.enable",
+            ],
+        )
+
+    async def test_websocket_subscriptions_enable_only_network(self):
+        methods = []
+
+        async def send(command):
+            methods.append(next(command)["method"])
+
+        self.a.send.side_effect = send
+        invoke = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        identifier = await invoke("subscribe_cdp_events")(
+            ["Network.webSocketFrameReceived", "Network.webSocketFrameSent"]
+        )
+        self.assertEqual(methods, ["Network.enable"])
+        self.assertFalse(s._frame_contexts.has_runtime_consumers(self.a))
+        await invoke("unsubscribe_cdp_events")(identifier)
+
+    async def test_listener_only_runtime_subscription_cannot_enable_runtime_in_recovery(
+        self,
+    ):
+        invoke = lambda name: s.mcp._tool_manager.get_tool(name).fn
+        identifier = await invoke("subscribe_cdp_events")(
+            ["Runtime.consoleAPICalled"], enable_domain=False
+        )
+        self.a.send.assert_not_awaited()
+        self.assertFalse(s._frame_contexts.has_runtime_consumers(self.a))
+        methods = []
+
+        async def send(command):
+            methods.append(next(command)["method"])
+            if len(methods) == 1:
+                raise TimeoutError("disable reply lost")
+
+        self.a.send.side_effect = send
+        with self.assertRaises(TimeoutError):
+            await invoke("send_cdp_command")("Runtime", "disable")
+        self.assertEqual(methods, ["Runtime.disable", "Runtime.disable"])
+        await s._enable_console_collection(self.a)
+        await s._disable_console_collection(self.a)
+        self.assertEqual(
+            methods,
+            ["Runtime.disable", "Runtime.disable", "Runtime.enable", "Runtime.disable"],
+        )
+        self.assertFalse(s._frame_contexts.has_runtime_consumers(self.a))
+        self.assertEqual(len(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+        await invoke("unsubscribe_cdp_events")(identifier)
+
     async def test_navigation_header_uses_refreshed_final_url(self):
         destination = "https://redirect.test/final"
         navigated = False

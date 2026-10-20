@@ -40,6 +40,7 @@ from .launch import LaunchOptions, ProfileLease
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .network import NetworkCollector, request_details
 from .performance import analyze_trace_file
+from .runtime_policy import RUNTIME_ENABLE_WARNING
 from .screenshots import screenshot_clip
 from .scripts import (
     execute_script,
@@ -199,6 +200,10 @@ mcp = BrowserMCPServer(
     instructions=(
         "Undetected Chrome browser automation via nodriver. "
         "Drop-in replacement for chrome-devtools-mcp that avoids CDP fingerprint detection. "
+        + RUNTIME_ENABLE_WARNING
+        + " Ordinary browsing, scripts, HTTP inspection and Network WebSocket events "
+        "do not need Runtime.enable. Console tools are optional; CDP/event tools "
+        "require allow_runtime_enable=true to enable Runtime. "
         "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
         "take_snapshot returns searchable HTML text and is much faster and smaller. "
         "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression. "
@@ -2384,7 +2389,16 @@ async def list_console_messages(
     return f"Console messages ({len(records)} of {total}):\n" + "\n".join(lines)
 
 
-@_page_tool()
+@_page_tool(
+    description=(
+        "Enable page or service_worker_id console collection (optional console tool group). "
+        "This calls Runtime.enable. "
+        + RUNTIME_ENABLE_WARNING
+        + " source_maps=true additionally enables Debugger, async stacks and source-map "
+        "symbolization while skipping debugger pauses. Omit source_maps to preserve "
+        "its setting; false disables owned Debugger collection."
+    )
+)
 async def enable_console_collection(
     *,
     source_maps: bool | None = None,
