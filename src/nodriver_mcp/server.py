@@ -27,7 +27,7 @@ from typing import Any, Literal
 import nodriver as uc
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
-from mcp.types import CallToolResult, InputRequiredResult
+from mcp.types import CallToolResult, InputRequiredResult, Tool as MCPTool
 from pydantic import StrictBool, ValidationError
 
 from .actions import ActionResult, ActionWaiter
@@ -48,6 +48,11 @@ from .scripts import (
     script_result,
 )
 from .source_maps import symbolize_message, symbolize_messages
+from .tool_groups import (
+    ENABLED_GROUPS_ENV,
+    TOOL_GROUP_BY_NAME,
+    parse_enabled_tool_groups,
+)
 from .traces import TRACE_CATEGORIES, save_trace
 from .uploads import FileUploads, upload_paths
 from .workers import WorkerTargets, worker_info
@@ -137,7 +142,24 @@ def _browser_launch_info() -> dict:
 # MCP Server
 # ---------------------------------------------------------------------------
 class BrowserMCPServer(MCPServer):
-    """Report expected browser failures through the SDK's ToolError API."""
+    """Expose enabled tools and report expected browser failures through ToolError."""
+
+    def __init__(self, *args, **kwargs):
+        self.enabled_tool_groups = parse_enabled_tool_groups(
+            os.environ.get(ENABLED_GROUPS_ENV, "")
+        )
+        super().__init__(*args, **kwargs)
+
+    def _disabled_tool_group(self, name: str) -> str | None:
+        group = TOOL_GROUP_BY_NAME.get(name)
+        return group if group and group not in self.enabled_tool_groups else None
+
+    async def list_tools(self) -> list[MCPTool]:
+        return [
+            tool
+            for tool in await super().list_tools()
+            if self._disabled_tool_group(tool.name) is None
+        ]
 
     async def call_tool(
         self,
@@ -145,6 +167,12 @@ class BrowserMCPServer(MCPServer):
         arguments: dict[str, Any],
         context: Context | None = None,
     ) -> CallToolResult | InputRequiredResult:
+        group = self._disabled_tool_group(name)
+        if group is not None:
+            raise ToolError(
+                f"Tool '{name}' is disabled. Add '{group}' to "
+                f"{ENABLED_GROUPS_ENV} and restart the MCP server to enable it."
+            )
         try:
             return await super().call_tool(name, arguments, context)
         except UnexpectedToolError as exc:

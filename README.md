@@ -1,8 +1,10 @@
 # nodriver-mcp
 
 A Python MCP server for Chromium automation using official **nodriver 0.50.6**.
-It exposes 75 MCP tools for browser startup, page interaction, native cookies and screenshots,
-frames, network inspection, website WebMCP tools and the complete generated CDP API.
+It exposes 60 MCP tools by default for browser startup, page interaction, native cookies and screenshots,
+frames, network inspection and the complete generated CDP API.
+Another 15 tools for performance, specialized diagnostics and website WebMCP can
+be enabled through optional tool groups.
 
 ## Installation
 
@@ -18,7 +20,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.22 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.6.0 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -103,6 +105,7 @@ chooses its directory but does not enable persistence by itself.
 | `NODRIVER_PROXY` | Default browser proxy address, overridden by `start_browser(proxy=...)` | Chrome/system settings |
 | `NODRIVER_BROWSER_ARGS` | JSON array of extra native browser arguments | `[]` |
 | `NODRIVER_EXTENSIONS` | JSON array of extension directories/CRX paths, loaded with native Config.add_extension | `[]` |
+| `NODRIVER_ENABLED_TOOL_GROUPS` | Optional tool groups to expose, separated by commas: `performance`, `diagnostics`, `webmcp`, or `all` | Empty (60 default tools) |
 
 `start_browser(proxy="")` forces direct access, overriding environment/system
 proxy settings; omitting the argument inherits the configured defaults. Startup
@@ -113,6 +116,34 @@ Named contexts can also be reused with `new_page(isolated_context="name")`.
 Cookies and storage tools operate in the selected context.
 
 ## Tools
+
+### Optional tool groups
+
+The default tool list contains 60 tools. The following 15 tools retain their
+implementations and tests, but are hidden from MCP discovery and reject calls
+until their group is enabled:
+
+| Group | Tools |
+| --- | --- |
+| `performance` | `performance_start_trace`, `performance_stop_trace`, `performance_analyze_trace`, `performance_analyze_insight`, `take_memory_snapshot`, `start_screen_recording`, `stop_screen_recording` |
+| `diagnostics` | `get_ad_info`, `get_crash_report_context`, `get_annotated_page_content`, `get_connection_history` |
+| `webmcp` | `list_webmcp_tools`, `call_webmcp_tool`, `get_webmcp_invocation`, `cancel_webmcp_invocation` |
+
+To enable groups, add this environment setting to the MCP server's client
+configuration and restart the server:
+
+```json
+{
+  "env": {
+    "NODRIVER_ENABLED_TOOL_GROUPS": "performance,diagnostics,webmcp"
+  }
+}
+```
+
+Use one group name to enable only that group, or `all` to expose all 75 tools.
+Remove the setting or leave it empty to restore the 60-tool default. The groups
+are selected at server startup. The capability descriptions below also document
+the optional tools for when their groups are enabled.
 
 ### Browser startup and sessions
 
@@ -315,6 +346,8 @@ cookie expiry converted into the official typed value before a native batch set.
 
 ### Network, emulation and performance
 
+The trace and memory tools below require the `performance` tool group.
+
 `list_network_requests`, `get_network_request`, `configure_network_capture`,
 `emulate`, `emulate_device`, `reset_emulation`, `resize_page`,
 `performance_start_trace`, `performance_stop_trace`, `performance_analyze_trace`,
@@ -362,6 +395,8 @@ Browser automation and raw trace capture use the Python dependencies alone.
 
 ### Website WebMCP tools
 
+These tools require the `webmcp` tool group.
+
 `list_webmcp_tools`, `call_webmcp_tool`, `get_webmcp_invocation`,
 `cancel_webmcp_invocation`.
 
@@ -381,6 +416,9 @@ The browser must expose the website's WebMCP registration API. A successful CDP
 Use `NODRIVER_BROWSER_ARGS` for feature flags required by a particular browser build.
 
 ### Additional 0.50.6 browser capabilities
+
+Screen recording requires `performance`. Annotated content, ad information and
+crash context require `diagnostics`.
 
 `start_screen_recording`, `stop_screen_recording`,
 `get_annotated_page_content`, `list_extensions`, `trigger_extension_action`,
