@@ -13,15 +13,18 @@ from uuid import uuid4
 
 import anyio
 import nodriver as uc
+from pydantic import StrictBool
 
 from .protocol import (
     build_command,
+    command_function,
     describe_commands,
     domain_module,
     event_types,
     json_value,
     resolve_event,
 )
+from .runtime_policy import RUNTIME_ENABLE_WARNING, require_runtime_enable
 from .scripts import script_error
 
 
@@ -33,6 +36,21 @@ _SERVICE_WORKER_ROUTER_NOTE = (
     "match. Do not infer a website's cache/network routing solely from these "
     "records; check actual request behavior. Chrome's own routing is unaffected."
 )
+
+
+async def _prepare_cdp_command(arguments):
+    domain = arguments["domain"]
+    command = command_function(domain, arguments["command"])
+    if domain_module(domain) is uc.cdp.runtime and command.__name__ == "enable":
+        require_runtime_enable(arguments.get("allow_runtime_enable", False))
+
+
+async def _prepare_cdp_subscription(arguments):
+    parsed = [resolve_event(name) for name in arguments["events"]]
+    if arguments.get("enable_domain", True) and any(
+        cls.__module__ == uc.cdp.runtime.__name__ for _, cls in parsed
+    ):
+        require_runtime_enable(arguments.get("allow_runtime_enable", False))
 
 
 async def _browser_version_page(browser) -> dict[str, str]:
@@ -518,7 +536,18 @@ def register_tools(mcp, s) -> None:
             "commands": commands[offset : offset + limit],
         }
 
-    @s._page_tool()
+    @s._page_tool(
+        prepare=_prepare_cdp_command,
+        description=(
+            "Invoke an official generated CDP command with JSON parameters and typed conversion. "
+            "Use list_cdp_commands for names/parameters. Top-level fields accept snake_case or "
+            "CDP camelCase; nested objects use CDP JSON names. Use browser scope for "
+            "browser-wide commands. Experimental errors come from Chrome. "
+            "Runtime.enable requires allow_runtime_enable=true (default false). "
+            "Runtime.evaluate and ordinary CDP commands do not require this opt-in. "
+            + RUNTIME_ENABLE_WARNING
+        ),
+    )
     async def send_cdp_command(
         domain: str,
         command: str,
@@ -526,6 +555,7 @@ def register_tools(mcp, s) -> None:
         scope: str = "page",
         timeout: int = 30000,
         *,
+        allow_runtime_enable: StrictBool = False,
         page_id: int | str | None = None,
     ) -> Any:
         """Invoke an official generated command with JSON parameters and typed conversion.
@@ -574,12 +604,18 @@ def register_tools(mcp, s) -> None:
         return result
 
     @s._page_tool(
+        prepare=_prepare_cdp_subscription,
         description=(
-            "Subscribe to official CDP events. Runtime is enabled only when requested here. "
+            "Subscribe to official CDP events. Network/WebSocket events do not enable Runtime. "
             "Domains with a parameterless enable command are enabled automatically; "
-            "otherwise enable/configure the domain with send_cdp_command first.\n\n"
+            "otherwise enable/configure the domain with send_cdp_command first. "
+            "Auto-enabling Runtime for Runtime.* events requires allow_runtime_enable=true "
+            "(default false). enable_domain=false only registers callbacks; it cannot "
+            "receive Runtime events unless Runtime is already enabled. "
+            + RUNTIME_ENABLE_WARNING
+            + "\n\n"
             + _SERVICE_WORKER_ROUTER_NOTE
-        )
+        ),
     )
     async def subscribe_cdp_events(
         events: list[str],
@@ -587,6 +623,7 @@ def register_tools(mcp, s) -> None:
         enable_domain: bool = True,
         buffer_size: int = 200,
         *,
+        allow_runtime_enable: StrictBool = False,
         page_id: int | str | None = None,
     ) -> str:
         """Subscribe to official CDP events. Runtime is enabled only when requested here.
@@ -631,6 +668,9 @@ def register_tools(mcp, s) -> None:
             def handler(event, _connection=None, callback=callback):
                 callback(event)
 
+            # A listener-only subscription must not make failure recovery or
+            # console shutdown activate/retain Runtime on its behalf.
+            handler._runtime_passive = not enable_domain
             target.add_handler(cls, handler)
             entry["callbacks"].append((cls, handler))
             domains.add(cls.__module__.rsplit(".", 1)[-1])

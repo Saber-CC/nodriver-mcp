@@ -1,9 +1,9 @@
 # nodriver-mcp
 
 A Python MCP server for Chromium automation using official **nodriver 0.50.6**.
-It exposes 60 MCP tools by default for browser startup, page interaction, native cookies and screenshots,
+It exposes 56 MCP tools by default for browser startup, page interaction, native cookies and screenshots,
 frames, network inspection and the complete generated CDP API.
-Another 15 tools for performance, specialized diagnostics and website WebMCP can
+Another 19 tools for console collection, performance, specialized diagnostics and website WebMCP can
 be enabled through optional tool groups.
 
 ## Installation
@@ -20,7 +20,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.6.2 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.6.3 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -105,7 +105,7 @@ chooses its directory but does not enable persistence by itself.
 | `NODRIVER_PROXY` | Default browser proxy address, overridden by `start_browser(proxy=...)` | Chrome/system settings |
 | `NODRIVER_BROWSER_ARGS` | JSON array of extra native browser arguments | `[]` |
 | `NODRIVER_EXTENSIONS` | JSON array of extension directories/CRX paths, loaded with native Config.add_extension | `[]` |
-| `NODRIVER_ENABLED_TOOL_GROUPS` | Optional tool groups to expose, separated by commas: `performance`, `diagnostics`, `webmcp`, or `all` | Empty (60 default tools) |
+| `NODRIVER_ENABLED_TOOL_GROUPS` | Optional tool groups to expose, separated by commas: `console`, `performance`, `diagnostics`, `webmcp`, or `all` | Empty (56 default tools) |
 
 `start_browser(proxy="")` forces direct access, overriding environment/system
 proxy settings; omitting the argument inherits the configured defaults. Startup
@@ -119,12 +119,13 @@ Cookies and storage tools operate in the selected context.
 
 ### Optional tool groups
 
-The default tool list contains 60 tools. The following 15 tools retain their
+The default tool list contains 56 tools. The following 19 tools retain their
 implementations and tests, but are hidden from MCP discovery and reject calls
 until their group is enabled:
 
 | Group | Tools |
 | --- | --- |
+| `console` | `enable_console_collection`, `disable_console_collection`, `list_console_messages`, `get_console_message` |
 | `performance` | `performance_start_trace`, `performance_stop_trace`, `performance_analyze_trace`, `performance_analyze_insight`, `take_memory_snapshot`, `start_screen_recording`, `stop_screen_recording` |
 | `diagnostics` | `get_ad_info`, `get_crash_report_context`, `get_annotated_page_content`, `get_connection_history` |
 | `webmcp` | `list_webmcp_tools`, `call_webmcp_tool`, `get_webmcp_invocation`, `cancel_webmcp_invocation` |
@@ -135,13 +136,13 @@ configuration and restart the server:
 ```json
 {
   "env": {
-    "NODRIVER_ENABLED_TOOL_GROUPS": "performance,diagnostics,webmcp"
+    "NODRIVER_ENABLED_TOOL_GROUPS": "console,performance,diagnostics,webmcp"
   }
 }
 ```
 
 Use one group name to enable only that group, or `all` to expose all 75 tools.
-Remove the setting or leave it empty to restore the 60-tool default. The groups
+Remove the setting or leave it empty to restore the 56-tool default. The groups
 are selected at server startup. The capability descriptions below also document
 the optional tools for when their groups are enabled.
 
@@ -304,8 +305,12 @@ proportionally for viewport, full-page and element captures, including high DPI.
 Limits use native CDP scaling and never upscale. Both inline images and saved
 files honor the limits; omitting them retains the original resolution.
 
-Console collection is opt-in and does not enable `Runtime` during ordinary
-browsing. Explicit console/event tools can enable it when needed.
+Console tools are hidden by default; set `NODRIVER_ENABLED_TOOL_GROUPS=console`
+and restart the MCP server to expose them. Enabling console collection calls
+`Runtime.enable`, which can expose CDP/automation to websites and trigger bot
+detection or blocked requests. Disabling it later may not undo detection already
+recorded by the page. Use only for debugging explicitly requested by a user who
+accepts this risk, never as a routine browsing step or troubleshooting fallback.
 Once enabled, it captures `console.*`, uncaught JavaScript errors and unhandled
 Promise rejections. `list_console_messages(include_stack_traces=true)` includes
 native stacks; `get_console_message` shows stack and source/context metadata by
@@ -462,6 +467,19 @@ acronyms; nested objects use CDP JSON names.
 Values are constructed with nodriver's generated enums, IDs and dataclasses.
 Chrome protocol failures retain their error code and reason in MCP tool errors.
 Discovering a binding does not imply that every Chrome version implements it.
+
+`send_cdp_command` blocks `Runtime.enable` by default. Likewise,
+`subscribe_cdp_events` blocks automatic activation of Runtime for `Runtime.*`
+events, including subscriptions mixed with other domains. Only pass
+`allow_runtime_enable=true` when the user explicitly requests debugging and
+accepts the detection risk described above. Enabling any optional tool group,
+including `all`, does not bypass this per-call opt-in.
+
+Ordinary CDP commands, `Runtime.evaluate`, HTTP capture and subscriptions to
+`Network.webSocketFrameReceived` / `Network.webSocketFrameSent` work without this
+opt-in. `enable_domain=false` only installs event listeners and never enables a
+domain; Runtime events still need an explicitly enabled Runtime. Listener-only
+subscriptions do not keep Runtime enabled after console collection stops.
 
 Official nodriver 0.50.6 has a known parsing limitation:
 `ServiceWorker.workerVersionUpdated` can lose recursive `or`/`not` conditions

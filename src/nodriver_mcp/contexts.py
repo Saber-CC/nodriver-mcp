@@ -74,7 +74,7 @@ class FrameContexts:
             return True
         passive = {callback for _, callback in state["callbacks"]} if state else set()
         return any(
-            callback not in passive
+            callback not in passive and not getattr(callback, "_runtime_passive", False)
             for event, callbacks in connection.handlers.items()
             if event.__module__ == cdp.runtime.__name__
             for callback in callbacks

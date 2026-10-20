@@ -9,6 +9,10 @@ from nodriver_mcp.tool_groups import ENABLED_GROUPS_ENV, parse_enabled_tool_grou
 
 
 DISABLED_TOOLS = {
+    "enable_console_collection",
+    "disable_console_collection",
+    "list_console_messages",
+    "get_console_message",
     "performance_start_trace",
     "performance_stop_trace",
     "performance_analyze_trace",
@@ -34,14 +38,14 @@ class ToolGroupConfigTests(unittest.TestCase):
 
     def test_named_groups_allow_whitespace_case_and_duplicates(self):
         self.assertEqual(
-            parse_enabled_tool_groups(" Performance, diagnostics,performance "),
-            {"performance", "diagnostics"},
+            parse_enabled_tool_groups(" Performance, Console,diagnostics,console "),
+            {"performance", "console", "diagnostics"},
         )
 
     def test_all_enables_every_optional_group(self):
         self.assertEqual(
             parse_enabled_tool_groups("all"),
-            {"performance", "diagnostics", "webmcp"},
+            {"console", "performance", "diagnostics", "webmcp"},
         )
 
     def test_unknown_groups_fail_with_configuration_help(self):
@@ -60,11 +64,11 @@ class ToolGroupExposureTests(unittest.IsolatedAsyncioTestCase):
                 "tool-groups-test", tools=s.mcp._tool_manager.list_tools()
             )
 
-    async def test_default_hides_exactly_the_requested_fifteen_tools(self):
+    async def test_default_hides_all_nineteen_optional_tools(self):
         server = self.server()
         visible = {tool.name for tool in await server.list_tools()}
         retained = {tool.name for tool in server._tool_manager.list_tools()}
-        self.assertEqual(len(visible), 60)
+        self.assertEqual(len(visible), 56)
         self.assertEqual(retained - visible, DISABLED_TOOLS)
         self.assertTrue(
             {
@@ -82,10 +86,11 @@ class ToolGroupExposureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_each_group_and_combination_can_be_enabled(self):
         for enabled, expected_count, included in (
-            ("performance", 67, {"performance_start_trace", "stop_screen_recording"}),
-            ("diagnostics", 64, {"get_connection_history", "get_ad_info"}),
-            ("webmcp", 64, {"list_webmcp_tools", "call_webmcp_tool"}),
-            ("performance,webmcp", 71, {"take_memory_snapshot", "call_webmcp_tool"}),
+            ("console", 60, {"enable_console_collection", "get_console_message"}),
+            ("performance", 63, {"performance_start_trace", "stop_screen_recording"}),
+            ("diagnostics", 60, {"get_connection_history", "get_ad_info"}),
+            ("webmcp", 60, {"list_webmcp_tools", "call_webmcp_tool"}),
+            ("performance,webmcp", 67, {"take_memory_snapshot", "call_webmcp_tool"}),
             ("all", 75, DISABLED_TOOLS),
         ):
             with self.subTest(enabled=enabled):
