@@ -17,6 +17,39 @@ from nodriver_mcp.scripts import (
 
 
 class ScriptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_evaluation_cancellation_interrupts_busy_js_only(self):
+        for busy in (False, True):
+            commands = []
+            entered = asyncio.Event()
+
+            async def send(command):
+                packet = next(command)
+                commands.append(packet)
+                if packet["method"] == "Runtime.evaluate":
+                    if packet["params"]["expression"] != "0":
+                        entered.set()
+                        await asyncio.Future()
+                    if busy:
+                        await asyncio.Future()
+                    return uc.cdp.runtime.RemoteObject(type_="number", value=0), None
+
+            with self.subTest(busy=busy):
+                task = asyncio.create_task(
+                    execute_script(
+                        SimpleNamespace(send=send),
+                        "while(true){}" if busy else "new Promise(() => {})",
+                        None,
+                        format="script",
+                    )
+                )
+                await asyncio.wait_for(entered.wait(), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                methods = [packet["method"] for packet in commands]
+                self.assertEqual(methods.count("Runtime.terminateExecution"), int(busy))
+                self.assertEqual(methods[-1], "Runtime.releaseObjectGroup")
+
     async def test_argument_cancellation_stops_synchronous_js_but_not_idle_promises(
         self,
     ):

@@ -580,6 +580,71 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await s._disable_console_collection(self.a)
             self.assertEqual(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled], [])
 
+    async def test_concurrent_console_enable_and_disable_share_initialization(self):
+        for disable in (False, True):
+            with self.subTest(disable=disable):
+                entered, released = asyncio.Event(), asyncio.Event()
+
+                async def send(command):
+                    if next(command)["method"] == "Runtime.enable":
+                        entered.set()
+                        await released.wait()
+
+                self.a.send.side_effect = send
+                first = asyncio.create_task(s._enable_console_collection(self.a))
+                await asyncio.wait_for(entered.wait(), 1)
+                second = asyncio.create_task(
+                    s._disable_console_collection(self.a)
+                    if disable
+                    else s._enable_console_collection(self.a)
+                )
+                await asyncio.sleep(0)
+                released.set()
+                self.assertEqual(await asyncio.gather(first, second), [True, disable])
+                callbacks = self.a.handlers[uc.cdp.runtime.ConsoleAPICalled]
+                self.assertEqual(len(callbacks), int(not disable))
+                if not disable:
+                    await s._disable_console_collection(self.a)
+                self.assertFalse(self.a.handlers[uc.cdp.runtime.ConsoleAPICalled])
+
+    async def test_retirement_during_console_startup_does_not_publish_collector(self):
+        entered, released = asyncio.Event(), asyncio.Event()
+
+        async def send(command):
+            if next(command)["method"] == "Runtime.enable":
+                entered.set()
+                await released.wait()
+
+        self.a.send.side_effect = send
+        task = asyncio.create_task(s._enable_console_collection(self.a))
+        await asyncio.wait_for(entered.wait(), 1)
+        s._clear_collection_state(self.a)
+        released.set()
+        with self.assertRaisesRegex(ValueError, "retired"):
+            await task
+        self.assertNotIn(s._tab_key(self.a), s._console_callbacks)
+        self.assertNotIn(s._tab_key(self.a), s._console_collection_enabled_tabs)
+        self.assertFalse(any(self.a.handlers.values()))
+
+    async def test_concurrent_network_enable_registers_one_collector(self):
+        entered, released = asyncio.Event(), asyncio.Event()
+
+        async def send(command):
+            if next(command)["method"] == "Network.enable":
+                entered.set()
+                await released.wait()
+
+        self.a.send.side_effect = send
+        first = asyncio.create_task(s._auto_enable_network_collection(self.a))
+        await asyncio.wait_for(entered.wait(), 1)
+        second = asyncio.create_task(s._auto_enable_network_collection(self.a))
+        await asyncio.sleep(0)
+        released.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(len(self.a.handlers[uc.cdp.network.RequestWillBeSent]), 1)
+        s._clear_collection_state(self.a)
+        self.assertFalse(any(self.a.handlers.values()))
+
     async def test_failed_network_enable_can_be_retried(self):
         self.a.send.side_effect = RuntimeError("disconnected")
         with self.assertRaises(RuntimeError):
