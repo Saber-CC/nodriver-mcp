@@ -1,10 +1,13 @@
-"""Observe default frame worlds without enabling Runtime during page startup."""
+"""Resolve default frame worlds without implicitly enabling Runtime events."""
 
 import logging
 import weakref
+from uuid import uuid4
 
 import anyio
 from nodriver import cdp
+
+from .scripts import script_error
 
 logger = logging.getLogger(__name__)
 
@@ -105,22 +108,71 @@ class FrameContexts:
 
     async def main_world(self, connection, frame_id):
         state = self.watch(connection)
+        context = state["contexts"].get(frame_id)
+        if context is not None:
+            return {"unique_context_id": context.unique_id}
+
+        owner, _ = await connection.send(
+            cdp.dom.get_frame_owner(cdp.page.FrameId(frame_id))
+        )
+        node = await connection.send(
+            cdp.dom.describe_node(backend_node_id=owner, depth=1, pierce=True)
+        )
+        if node.content_document is None:
+            raise ValueError(
+                "This frame needs a separate connection; refresh list_frames."
+            )
+        backend_id = node.content_document.backend_node_id
+        group = "nodriver-mcp-context-" + uuid4().hex
         try:
-            # A previous console/CDP consumer may already own Runtime. Repeated
-            # enable is harmless, and replays contexts if it was disabled.
-            await connection.send(cdp.runtime.enable())
-            context = state["contexts"].get(frame_id)
-            if context is None:
+            document = await connection.send(
+                cdp.dom.resolve_node(backend_node_id=backend_id, object_group=group)
+            )
+            # Chrome's V8 RemoteObjectId currently carries isolate.context.object.
+            # This format is opaque in CDP, so validate it against both the live
+            # isolate and the selected Document; never fall back to Runtime.enable
+            # or install a binding in the page if Chrome changes the format.
+            parts = str(document.object_id).split(".")
+            if (
+                len(parts) != 3
+                or not parts[0].removeprefix("-").isdecimal()
+                or not all(part.isdecimal() for part in parts[1:])
+                or int(parts[1]) <= 0
+            ):
                 raise ValueError(
-                    "Frame main execution context is unavailable; refresh frames."
+                    "Chrome returned an unsupported frame object identifier; cannot resolve its execution context without enabling Runtime."
                 )
-            return context.unique_id
+            isolate = await connection.send(cdp.runtime.get_isolate_id())
+            if int(parts[0]) & ((1 << 64) - 1) != int(isolate, 16):
+                raise ValueError(
+                    "Frame execution context changed during discovery; refresh frames and retry."
+                )
+            context_id = cdp.runtime.ExecutionContextId(int(parts[1]))
+            checked, error = await connection.send(
+                cdp.runtime.evaluate(
+                    "document", context_id=context_id, object_group=group
+                )
+            )
+            if error:
+                raise script_error(error)
+            if str(checked.object_id).rsplit(".", 1)[0] != ".".join(parts[:2]):
+                raise ValueError(
+                    "Frame execution context changed during discovery; refresh frames and retry."
+                )
+            current = await connection.send(
+                cdp.dom.describe_node(object_id=checked.object_id, depth=0)
+            )
+            if current.backend_node_id != backend_id:
+                raise ValueError(
+                    "Execution context does not belong to the selected frame; refresh frames and retry."
+                )
+            return {"context_id": context_id}
         finally:
-            if not self.has_runtime_consumers(connection):
-                # Leave buffered logs available for the first explicit console
-                # collector, including after cancelled discovery. Clear worlds
-                # only after Chrome confirms that Runtime is disabled.
-                await self.restore_runtime(connection)
+            with anyio.move_on_after(0.5, shield=True):
+                try:
+                    await connection.send(cdp.runtime.release_object_group(group))
+                except Exception:
+                    logger.debug("Frame context object cleanup failed", exc_info=True)
 
     def forget(self, connection):
         state = self.watchers.pop(id(connection), None)

@@ -20,7 +20,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.6.1 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.6.2 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -264,6 +264,10 @@ Snapshots and scripts respect the selected frame;
 their page/frame connection, so an old UID cannot silently operate on another page.
 Frame connections refresh when navigation changes their process ownership;
 elements from a replaced or removed frame document require new UIDs.
+
+Same-process frame scripts and action stability checks resolve the main world
+without `Runtime.enable` or page bindings. Page globals and native script/CSP
+behavior are preserved. Unsupported Chrome object identifiers fail explicitly.
 
 `find_elements` uses native text, CSS or XPath search and returns actionable UIDs:
 
