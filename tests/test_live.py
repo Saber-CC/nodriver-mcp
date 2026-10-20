@@ -3029,6 +3029,17 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await s.evaluate_script(
             "var frameCreated=21", format="script", wait_for_stable=False
         )
+        await s.evaluate_script(
+            "let frameCreatedLet=21;const frameCreatedConst=42;",
+            format="script",
+            wait_for_stable=False,
+        )
+        self.assertIn(
+            "63",
+            await s.evaluate_script(
+                "frameCreatedLet+frameCreatedConst", wait_for_stable=False
+            ),
+        )
         self.assertIn(
             "42", await s.evaluate_script("frameCreated*2", wait_for_stable=False)
         )
@@ -3040,6 +3051,112 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "84", await s.evaluate_script("frameAnswer()", wait_for_stable=False)
         )
+
+    async def test_same_process_frame_actions_never_enable_runtime_or_leave_bindings(
+        self,
+    ):
+        page = await s._page_tab()
+        methods = []
+        native_send = page.send
+
+        async def send(command, *args, **kwargs):
+            packet = next(command)
+            methods.append(packet["method"])
+
+            def replay():
+                response = yield packet
+                try:
+                    command.send(response)
+                except StopIteration as stop:
+                    return stop.value
+
+            return await native_send(replay(), *args, **kwargs)
+
+        with patch.object(page, "send", send):
+            await page.send(
+                uc.cdp.runtime.evaluate("""(() => {
+                window.runtimeEnableLeakDetected=false;
+                const error=new Error('runtime-enable-probe');
+                Object.defineProperty(error,'name',{get(){window.runtimeEnableLeakDetected=true;return 'Error'}});
+                console.log(error);
+                window.runtimeEnableLeakDetected=false;
+                document.querySelector('iframe').contentDocument.body.insertAdjacentHTML('beforeend','<p>iframe marker</p>');
+            })()""")
+            )
+            self.assertFalse(
+                (
+                    await page.send(
+                        uc.cdp.runtime.evaluate(
+                            "runtimeEnableLeakDetected", return_by_value=True
+                        )
+                    )
+                )[0].value
+            )
+            child = next(
+                frame
+                for frame in await self.tool("list_frames")
+                if frame["name"] == "child"
+            )
+            await self.tool("select_frame", frame_id=child["frame_id"])
+            first = await s.evaluate_script(
+                "let frameLexicalProbe=21;const frameConstProbe=42;var frameVarProbe=7;",
+                format="script",
+                wait_for_stable=False,
+            )
+            self.assertIn("Status: completed", first)
+            value = await s.evaluate_script(
+                "[frameLexicalProbe,frameConstProbe,frameVarProbe]",
+                wait_for_stable=False,
+            )
+            self.assertEqual(json.loads(value.splitlines()[1]), [21, 42, 7])
+            field = (await self.tool("find_elements", selector="input"))[0]["uid"]
+            self.assertNotIn("Error", await s.click(field))
+            self.assertNotIn("Error", await s.fill(field, "without-runtime"))
+            self.assertIn(
+                "Found text", await s.wait_for(["iframe marker"], timeout=2000)
+            )
+            timed = await s.evaluate_script(
+                "while(true){}", format="script", timeout=100, wait_for_stable=False
+            )
+            self.assertIn("Status: timed_out", timed)
+            self.assertIn(
+                "Status: completed",
+                await s.evaluate_script("42", wait_for_stable=False),
+            )
+            remaining = (
+                await page.send(
+                    uc.cdp.runtime.evaluate(
+                        "[window,document.querySelector('iframe').contentWindow].map(w=>Object.getOwnPropertyNames(w).filter(n=>n.startsWith('__mcp_context_')))",
+                        return_by_value=True,
+                    )
+                )
+            )[0].value
+            self.assertEqual(remaining, [[], []])
+            self.assertFalse(page.handlers.get(uc.cdp.runtime.BindingCalled))
+            self.assertNotIn("Runtime.enable", methods)
+            self.assertNotIn("Runtime.disable", methods)
+            self.assertNotIn("Debugger.enable", methods)
+            self.assertFalse(
+                (
+                    await page.send(
+                        uc.cdp.runtime.evaluate(
+                            "runtimeEnableLeakDetected", return_by_value=True
+                        )
+                    )
+                )[0].value
+            )
+            # Positive control proves that the buffered console probe can see
+            # the exact signal that frame discovery must avoid.
+            await page.send(uc.cdp.runtime.enable())
+            self.assertTrue(
+                (
+                    await page.send(
+                        uc.cdp.runtime.evaluate(
+                            "runtimeEnableLeakDetected", return_by_value=True
+                        )
+                    )
+                )[0].value
+            )
 
     async def test_same_process_iframe_xpath_wait_keeps_nodes_inserted_during_query(
         self,
@@ -3292,7 +3409,11 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                             return stop.value
 
                     result = await native_send(replay(), *args, **kwargs)
-                    if packet["method"] == "Runtime.disable":
+                    if packet["method"] == (
+                        "Runtime.disable"
+                        if console_shutdown
+                        else "Runtime.releaseObjectGroup"
+                    ):
                         entered.set()
                         await released.wait()
                     return result

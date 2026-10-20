@@ -184,6 +184,81 @@ class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
             while not path.exists():
                 await asyncio.sleep(0.01)
 
+    async def test_frame_evaluation_preserves_lexicals_without_runtime_console_serialization(
+        self,
+    ):
+        with tempfile.TemporaryDirectory(
+            prefix="nodriver-mcp-frame-world-"
+        ) as temporary:
+            async with self.session(Path(temporary)) as session:
+                setup = await self.call(
+                    session,
+                    "evaluate_script",
+                    function="""new Promise(resolve=>{
+                    window.runtimeEnableLeakDetected=false;
+                    const error=new Error('stdio-runtime-probe');
+                    Object.defineProperty(error,'name',{get(){window.runtimeEnableLeakDetected=true;return 'Error'}});
+                    console.log(error);
+                    window.runtimeEnableLeakDetected=false;
+                    const frame=document.createElement('iframe');
+                    frame.name='stdio-frame';frame.srcdoc='<input aria-label="Frame field"><p>frame marker</p>';
+                    frame.onload=()=>resolve(true);document.body.append(frame);
+                })""",
+                    format="script",
+                    wait_for_stable=False,
+                )
+                self.assertIn("Status: completed", setup)
+                frames = await session.call_tool("list_frames", {})
+                self.assertFalse(frames.is_error, str(frames))
+                child = next(
+                    frame
+                    for frame in frames.structured_content["result"]
+                    if frame["name"] == "stdio-frame"
+                )
+                await self.call(session, "select_frame", frame_id=child["frame_id"])
+                await self.call(
+                    session,
+                    "evaluate_script",
+                    function="let lexicalFrameProbe=21;const constFrameProbe=42;",
+                    format="script",
+                    wait_for_stable=False,
+                )
+                value = await self.call(
+                    session,
+                    "evaluate_script",
+                    function="[lexicalFrameProbe,constFrameProbe]",
+                    wait_for_stable=False,
+                )
+                self.assertEqual(json.loads(value.splitlines()[1]), [21, 42])
+                await self.call(
+                    session, "wait_for", text=["frame marker"], timeout=2000
+                )
+                await self.call(session, "select_frame", frame_id="")
+                flag = await self.call(
+                    session,
+                    "evaluate_script",
+                    function="runtimeEnableLeakDetected",
+                    wait_for_stable=False,
+                )
+                self.assertFalse(json.loads(flag.splitlines()[1]))
+                clean = await self.call(
+                    session,
+                    "evaluate_script",
+                    function="[window,document.querySelector('iframe').contentWindow].map(w=>Object.getOwnPropertyNames(w).filter(n=>n.startsWith('__mcp_context_')))",
+                    wait_for_stable=False,
+                )
+                self.assertEqual(json.loads(clean.splitlines()[1]), [[], []])
+                await self.call(
+                    session, "send_cdp_command", domain="Runtime", command="enable"
+                )
+                flag = await self.call(
+                    session,
+                    "evaluate_script",
+                    function="runtimeEnableLeakDetected",
+                    wait_for_stable=False,
+                )
+                self.assertTrue(json.loads(flag.splitlines()[1]))
+
     async def test_real_request_cancellation_stops_busy_js_and_preserves_idle_promises(
         self,
     ):

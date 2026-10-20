@@ -621,7 +621,7 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
     result, error = await tab.send(
         uc.cdp.runtime.evaluate(
             expression,
-            unique_context_id=context,
+            **(context or {}),
             await_promise=await_promise,
             return_by_value=True,
             user_gesture=True,
@@ -1949,7 +1949,7 @@ async def _evaluate_script_value(
         args,
         format=format,
         timeout=timeout,
-        unique_context_id=context,
+        **(context or {}),
         resolve_uid=lambda uid, group: _resolve_uid(tab, uid, object_group=group),
     )
 
