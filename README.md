@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.19 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.20 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -26,6 +26,8 @@ The [1.5.18 fixes](docs/regressions-1.5.18.md) cover script deadlines, concurren
 trace cleanup, source-map ownership, iframe initialization and repeated email fills.
 The [1.5.19 fix](docs/regressions-1.5.19.md) restores source maps for logs Chrome
 replays when console collection is first enabled with `source_maps=true`.
+The [1.5.20 fix](docs/regressions-1.5.20.md) cleans up a pending Debugger enable
+when startup is cancelled, so retries can capture existing scripts again.
 
 For a source checkout:
 

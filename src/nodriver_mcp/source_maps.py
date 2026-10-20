@@ -151,7 +151,7 @@ class SourceMap:
 class SourceMaps:
     def __init__(self, connection):
         self.connection = connection
-        self.active = self.ever_enabled = self.watching = False
+        self.active = self.enabling = self.ever_enabled = self.watching = False
         self.scripts, self.cache = OrderedDict(), OrderedDict()
         self.contexts = {}
         self.callbacks = [
@@ -248,8 +248,12 @@ class SourceMaps:
         for event, callback in self.callbacks:
             self.connection.add_handler(event, callback)
         try:
+            # Chrome can enable Debugger and replay scripts before the response
+            # reaches us. Cancellation in that window still requires disable.
+            self.enabling = True
             await self.connection.send(cdp.debugger.enable())
             self.active = True
+            self.enabling = False
             await self.connection.send(cdp.debugger.set_skip_all_pauses(True))
             await self.connection.send(cdp.debugger.set_async_call_stack_depth(32))
             self.ever_enabled = True
@@ -261,7 +265,7 @@ class SourceMaps:
             raise
 
     def retire(self):
-        self.active = False
+        self.active = self.enabling = False
         if not self.watching:
             return
         self.watching = False
@@ -270,7 +274,7 @@ class SourceMaps:
                 self.connection.remove_handler(event, callback)
 
     async def disable(self):
-        enabled = self.active
+        enabled = self.active or self.enabling
         self.retire()
         if enabled and not any(
             callbacks
