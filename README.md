@@ -1,7 +1,7 @@
 # nodriver-mcp
 
 A Python MCP server for Chromium automation using official **nodriver 0.50.6**.
-It exposes 76 MCP tools for browser startup, page interaction, native cookies and screenshots,
+It exposes 75 MCP tools for browser startup, page interaction, native cookies and screenshots,
 frames, network inspection, website WebMCP tools and the complete generated CDP API.
 
 ## Installation
@@ -18,7 +18,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.21 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.22 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -382,7 +382,7 @@ Use `NODRIVER_BROWSER_ARGS` for feature flags required by a particular browser b
 
 ### Additional 0.50.6 browser capabilities
 
-`find_in_page`, `start_screen_recording`, `stop_screen_recording`,
+`start_screen_recording`, `stop_screen_recording`,
 `get_annotated_page_content`, `list_extensions`, `trigger_extension_action`,
 `get_ad_info`, `get_crash_report_context`, `create_browser_context`,
 `close_browser_context`.
@@ -391,6 +391,9 @@ Native screen recording writes Chrome's stream without a separate ffmpeg
 process. Annotated page content is a base64 protobuf, distinct from readable
 accessibility snapshots. These experimental capabilities depend on the browser
 build and enabled features; protocol failures are reported rather than simulated.
+`trigger_extension_action` brings its requested page to the front before invoking
+the browser toolbar action. An explicit `page_id` keeps the MCP's default page
+selection unchanged.
 
 ### Complete official CDP coverage
 

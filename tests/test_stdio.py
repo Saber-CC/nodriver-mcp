@@ -30,6 +30,7 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(initialized.server_info.version)
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
+                self.assertNotIn("find_in_page", names)
                 self.assertTrue(
                     {
                         "take_screenshot",

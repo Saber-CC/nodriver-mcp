@@ -29,6 +29,9 @@ class FakeTab:
         self.parent = None
         self.handlers = collections.defaultdict(list)
         self.activate = AsyncMock()
+        self.back = AsyncMock()
+        self.forward = AsyncMock()
+        self.reload = AsyncMock()
         self.send = AsyncMock(return_value=None)
 
     def add_handler(self, event, callback):
@@ -861,6 +864,47 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         command = self.a.send.call_args.args[0]
         self.assertEqual(next(command)["method"], "Page.navigate")
         self.assertFalse(hasattr(self.a, "attach"))
+
+    async def test_navigation_header_uses_refreshed_final_url(self):
+        destination = "https://redirect.test/final"
+        navigated = False
+
+        async def navigate(_tab, _url):
+            nonlocal navigated
+            navigated = True
+
+        async def refresh():
+            if navigated:
+                self.a.target.url = destination
+
+        self.browser.update_targets.side_effect = refresh
+        with (
+            patch.object(s, "_navigate_url", navigate),
+            patch.object(s, "_auto_enable_network_collection", AsyncMock()),
+        ):
+            result = await s.navigate_page(
+                url="https://redirect.test/start", page_id="a"
+            )
+        self.assertEqual(result.splitlines()[0], f"Navigated to {destination}")
+
+    async def test_new_page_header_uses_refreshed_final_url(self):
+        destination = "https://redirect.test/final"
+        self.b.target.url = "about:blank"
+
+        async def refresh():
+            self.b.target.url = destination
+
+        self.browser.update_targets.side_effect = refresh
+        with (
+            patch.object(s, "_open_new_tab", AsyncMock(return_value=self.b)),
+            patch.object(s, "_navigate_url", AsyncMock()),
+            patch.object(s, "_auto_enable_network_collection", AsyncMock()),
+        ):
+            result = await s.new_page("https://redirect.test/start", background=True)
+        self.assertEqual(
+            result.splitlines()[0], f"Opened new page: {destination} (page_id=b)"
+        )
+        self.assertEqual(s._selected_target_id, "a")
 
     async def test_webmcp_result_arriving_before_waiter_is_preserved(self):
         def dispatch(event):

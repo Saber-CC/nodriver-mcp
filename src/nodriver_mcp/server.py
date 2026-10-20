@@ -2500,7 +2500,8 @@ async def navigate_page(
             preserve_navigation=False,
             ignored_dialogs=frozenset({"beforeunload"}),
         )
-        return f"Navigated to {tab.target.url}" + await _format_pages()
+        pages = await _format_pages()
+        return f"Navigated to {tab.target.url}" + pages
     except Exception as exc:
         return f"Error: {exc}"
     finally:
@@ -2552,10 +2553,8 @@ async def new_page(
         if not background:
             _selected_target_id = str(tab.target_id)
             await tab.activate()
-        return (
-            f"Opened new page: {tab.target.url} (page_id={tab.target_id})"
-            + await _format_pages()
-        )
+        pages = await _format_pages()
+        return f"Opened new page: {tab.target.url} (page_id={tab.target_id})" + pages
     except Exception as exc:
         return f"Error opening new page: {exc}"
 
@@ -2842,7 +2841,8 @@ async def select_page(page_id: int | str, bring_to_front: bool = True) -> str:
     await _auto_enable_network_collection(tab)
     if bring_to_front:
         await tab.activate()
-    return f"Selected page [{page_id}]: {tab.target.url}" + await _format_pages()
+    pages = await _format_pages()
+    return f"Selected page [{page_id}]: {tab.target.url}" + pages
 
 
 @_page_tool()
