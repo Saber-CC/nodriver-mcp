@@ -38,6 +38,15 @@ class ScriptTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(packet["params"]["objectId"], "opaque-document")
                 self.assertEqual(packet["params"]["objectGroup"], group)
                 self.assertNotIn("executionContextId", packet["params"])
+                if not packet["params"].get("arguments"):
+                    return uc.cdp.runtime.RemoteObject(
+                        type_="function",
+                        description="function eval() { [native code] }",
+                        object_id=uc.cdp.runtime.RemoteObjectId("native-eval"),
+                    ), None
+                self.assertEqual(
+                    packet["params"]["arguments"][1], {"objectId": "native-eval"}
+                )
                 return uc.cdp.runtime.RemoteObject(type_="boolean", value=True), None
 
         value = await execute_script(
@@ -52,10 +61,50 @@ class ScriptTests(unittest.IsolatedAsyncioTestCase):
             [
                 "Runtime.callFunctionOn",
                 "Runtime.callFunctionOn",
+                "Runtime.callFunctionOn",
                 "Runtime.releaseObjectGroup",
             ],
         )
         self.assertEqual(commands[-1]["params"]["objectGroup"], group)
+
+    async def test_replaced_document_eval_never_receives_the_script_source(self):
+        for evaluator in (
+            uc.cdp.runtime.RemoteObject(
+                type_="function", description='() => "blocked"', object_id="wrapper"
+            ),
+            uc.cdp.runtime.RemoteObject(
+                type_="object", subtype="proxy", description="Proxy(Function)",
+                object_id="proxy",
+            ),
+            uc.cdp.runtime.RemoteObject(
+                type_="function", description="function () { [native code] }",
+                object_id="bound-function",
+            ),
+            uc.cdp.runtime.RemoteObject(type_="undefined"),
+        ):
+            with self.subTest(evaluator=evaluator.description):
+                commands = []
+
+                async def send(command):
+                    packet = next(command)
+                    commands.append(packet)
+                    if packet["method"] == "Runtime.callFunctionOn":
+                        return evaluator, None
+
+                with self.assertRaisesRegex(ValueError, "script was not executed"):
+                    await execute_script(
+                        SimpleNamespace(send=send),
+                        "window.sensitiveSourceMarker=42;sensitiveSourceMarker",
+                        None,
+                        document_object_id=uc.cdp.runtime.RemoteObjectId(
+                            "opaque-document"
+                        ),
+                    )
+                self.assertNotIn("sensitiveSourceMarker", json.dumps(commands))
+                self.assertEqual(
+                    [packet["method"] for packet in commands],
+                    ["Runtime.callFunctionOn", "Runtime.releaseObjectGroup"],
+                )
 
     async def test_unrecognized_frame_context_never_falls_back_to_the_main_page(self):
         commands = []

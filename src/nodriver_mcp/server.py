@@ -1986,6 +1986,8 @@ async def evaluate_script(
     declarations in one call or store deliberate shared state on window. Strict
     eval var/function declarations are also call-local. Do not enable Runtime as
     a workaround; navigating away fails instead of evaluating in a replacement frame.
+    If the page replaces/wraps its native eval, fail before passing script source
+    to it; Runtime is never enabled as a fallback.
     """
     try:
         if dialog_action not in {"accept", "dismiss", "manual"}:
