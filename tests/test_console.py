@@ -1,3 +1,4 @@
+import asyncio
 import collections
 import json
 import unittest
@@ -129,6 +130,98 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(collector.source_maps.active)
                 await collector.source_maps.disable()
                 collector.remove()
+
+    async def test_source_map_cancellation_resets_partial_debugger_and_allows_retry(
+        self,
+    ):
+        for phase in ("Debugger.enable", "Debugger.setSkipAllPauses", "Runtime.enable"):
+            with self.subTest(phase=phase):
+                collector, connection, handlers, _ = self.fixture()
+                entered = asyncio.Event()
+                commands = []
+                native_enabled = False
+                interrupt = True
+
+                async def send(command):
+                    nonlocal native_enabled
+                    method = next(command)["method"]
+                    commands.append(method)
+                    if method == "Debugger.enable":
+                        native_enabled = True
+                    elif method == "Debugger.disable":
+                        native_enabled = False
+                    if interrupt and method == phase:
+                        entered.set()
+                        await asyncio.Future()
+
+                connection.send.side_effect = send
+                task = asyncio.create_task(collector.enable(source_maps=True))
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assertTrue(native_enabled)
+                    self.assertEqual(
+                        collector.source_maps.enabling, phase == "Debugger.enable"
+                    )
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertFalse(native_enabled)
+                    self.assertEqual(commands.count("Debugger.disable"), 1)
+                    self.assertFalse(collector.source_maps.active)
+                    self.assertFalse(collector.source_maps.enabling)
+                    self.assertFalse(any(handlers.values()))
+
+                    interrupt = False
+                    await collector.enable(source_maps=True)
+                    self.assertTrue(native_enabled)
+                    self.assertTrue(collector.source_maps.active)
+                    self.assertFalse(collector.source_maps.enabling)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    await collector.source_maps.disable()
+                    collector.remove()
+
+    async def test_cancelled_source_map_startup_preserves_external_debugger_callbacks(
+        self,
+    ):
+        collector, connection, handlers, _ = self.fixture()
+        external = lambda event: None
+        connection.add_handler(cdp.debugger.ScriptParsed, external)
+        entered = asyncio.Event()
+        commands = []
+
+        async def send(command):
+            method = next(command)["method"]
+            commands.append(method)
+            if method == "Debugger.enable":
+                entered.set()
+                await asyncio.Future()
+
+        connection.send.side_effect = send
+        task = asyncio.create_task(collector.enable(source_maps=True))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertNotIn("Debugger.disable", commands)
+            self.assertEqual(handlers[cdp.debugger.ScriptParsed], [external])
+            self.assertFalse(collector.source_maps.enabling)
+            self.assertFalse(collector.source_maps.active)
+            self.assertFalse(
+                any(
+                    callbacks
+                    for event, callbacks in handlers.items()
+                    if event is not cdp.debugger.ScriptParsed
+                )
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            collector.remove()
 
     async def test_console_and_uncaught_exception_keep_native_locations_and_stacks(
         self,

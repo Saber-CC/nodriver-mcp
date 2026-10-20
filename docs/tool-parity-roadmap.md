@@ -317,3 +317,7 @@ navigator.modelContext API 跳过。构建、锁文件、Python 检查及 Node �
 1.5.19 修复首次开启 source map 时 Runtime 回放的历史日志无法映射的问题，并覆盖
 关闭再开启采集与跨站导航；全量 174 项，173 通过，1 跳过。详见
 [regressions-1.5.19.md](regressions-1.5.19.md)。
+
+1.5.20 修复 `Debugger.enable` 尚未返回时取消初始化，导致重试缺少已有脚本目录的
+回归；覆盖回放期间和响应交付时取消。全量 177 项，176 通过，1 跳过。详见
+[regressions-1.5.20.md](regressions-1.5.20.md)。

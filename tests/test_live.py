@@ -1744,6 +1744,100 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/Replay.ts:1:1", old)
         self.assertNotIn("/After.ts", old)
 
+    async def test_source_map_initialization_cancellation_retries_existing_scripts(
+        self,
+    ):
+        tab = await s._page_tab()
+        for phase in ("script_replay", "enable_response"):
+            with self.subTest(phase=phase):
+                await s.disable_console_collection()
+                await s.navigate_page(url=self.url + "identity-page?name=Cancelled")
+                script_url = self.url + "identity-script?name=Cancelled"
+                entered, release = asyncio.Event(), asyncio.Event()
+                original_send, original_event = tab.send, tab.process_event
+                paused = False
+                commands = []
+
+                async def send(command, **kwargs):
+                    nonlocal paused
+                    enabling = command.gi_code is uc.cdp.debugger.enable.__code__
+                    if enabling:
+                        commands.append("enable")
+                    elif command.gi_code is uc.cdp.debugger.disable.__code__:
+                        commands.append("disable")
+                    result = await original_send(command, **kwargs)
+                    if enabling and phase == "enable_response" and not paused:
+                        paused = True
+                        entered.set()
+                        await release.wait()
+                    return result
+
+                async def process_event(message, tx_id=None):
+                    nonlocal paused
+                    await original_event(message, tx_id)
+                    if (
+                        phase == "script_replay"
+                        and not paused
+                        and message.get("method") == "Debugger.scriptParsed"
+                        and message.get("params", {}).get("url") == script_url
+                    ):
+                        paused = True
+                        entered.set()
+                        await release.wait()
+
+                with (
+                    patch.object(tab, "send", send),
+                    patch.object(tab, "process_event", process_event),
+                ):
+                    initializing = asyncio.create_task(
+                        s.enable_console_collection(source_maps=True)
+                    )
+                    try:
+                        await asyncio.wait_for(entered.wait(), 5)
+                        initializing.cancel()
+                        release.set()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await initializing
+                        self.assertNotIn(
+                            s._tab_key(tab), s._console_collection_enabled_tabs
+                        )
+                        self.assertNotIn(s._tab_key(tab), s._console_callbacks)
+                        self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))
+                        await s.enable_console_collection(source_maps=True)
+                        previous = {m["msgid"] for m in s._console_messages}
+                        await s.evaluate_script("minified()", wait_for_stable=False)
+                        async with asyncio.timeout(5):
+                            while not any(
+                                m["text"] == "identity-Cancelled"
+                                and m["msgid"] not in previous
+                                for m in s._console_messages
+                            ):
+                                await asyncio.sleep(0.01)
+                        message = next(
+                            m
+                            for m in s._console_messages
+                            if m["text"] == "identity-Cancelled"
+                            and m["msgid"] not in previous
+                        )
+                        detail = await s.get_console_message(message["msgid"])
+                        self.assertIn("/Cancelled.ts:1:1", detail)
+                        self.assertIn("source-Cancelled", detail)
+                        maps = s._console_callbacks[s._tab_key(tab)].source_maps
+                        self.assertTrue(
+                            any(
+                                script["url"] == script_url
+                                for script in maps.scripts.values()
+                            )
+                        )
+                        self.assertEqual(commands, ["enable", "disable", "enable"])
+                        self.assertFalse(tab._mapper)
+                    finally:
+                        release.set()
+                        if not initializing.done():
+                            initializing.cancel()
+                        await asyncio.gather(initializing, return_exceptions=True)
+                        await s.disable_console_collection()
+
     async def test_source_maps_use_browser_credentials_and_symbolize_async_stacks(self):
         tab = await s._active_tab()
         self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))
