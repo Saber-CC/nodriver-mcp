@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import anyio
 import nodriver as uc
 from nodriver_mcp.scripts import (
     execute_script,
@@ -17,6 +18,33 @@ from nodriver_mcp.scripts import (
 
 
 class ScriptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_anyio_request_cancellation_interrupts_busy_js_and_releases_handles(
+        self,
+    ):
+        commands = []
+        entered = asyncio.Event()
+
+        async def send(command):
+            packet = next(command)
+            commands.append(packet)
+            if packet["method"] == "Runtime.evaluate":
+                if packet["params"]["expression"] != "0":
+                    entered.set()
+                await asyncio.Future()
+
+        async def request():
+            await execute_script(
+                SimpleNamespace(send=send), "while(true){}", None, format="script"
+            )
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(request)
+            await entered.wait()
+            tasks.cancel_scope.cancel()
+        methods = [packet["method"] for packet in commands]
+        self.assertIn("Runtime.terminateExecution", methods)
+        self.assertIn("Runtime.releaseObjectGroup", methods)
+
     async def test_native_evaluation_cancellation_interrupts_busy_js_only(self):
         for busy in (False, True):
             commands = []

@@ -865,6 +865,27 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(command)["method"], "Page.navigate")
         self.assertFalse(hasattr(self.a, "attach"))
 
+    async def test_failed_runtime_disable_preserves_contexts_and_previous_owner(self):
+        state = s._frame_contexts.watch(self.a)
+        s._frame_contexts.request_runtime(self.a, True)
+        marker = object()
+        state["contexts"]["child"] = marker
+
+        async def send(command):
+            packet = next(command)
+            if packet["method"] == "Runtime.disable":
+                raise TimeoutError("disable was not sent")
+
+        self.a.send.side_effect = send
+        invoke = s.mcp._tool_manager.get_tool("send_cdp_command").fn
+        try:
+            with self.assertRaises(TimeoutError):
+                await invoke("Runtime", "disable", timeout=50)
+            self.assertIs(state["contexts"].get("child"), marker)
+            self.assertTrue(state["runtime_requested"])
+        finally:
+            s._frame_contexts.forget(self.a)
+
     async def test_navigation_header_uses_refreshed_final_url(self):
         destination = "https://redirect.test/final"
         navigated = False

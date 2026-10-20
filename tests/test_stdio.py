@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image as PillowImage
@@ -135,6 +136,155 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(
                 "disabled", "".join(getattr(c, "text", "") for c in response.content)
             )
+
+
+@unittest.skipUnless(
+    os.environ.get("NODRIVER_MCP_LIVE_TESTS") == "1", "Chrome integration is opt-in"
+)
+class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
+    @asynccontextmanager
+    async def session(self, directory):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                str(Path(__file__).with_name("stdio_cancellation_server.py")),
+                str(directory),
+            ],
+            env={
+                **os.environ,
+                "NODRIVER_HEADLESS": "true",
+                "NODRIVER_USER_DATA_DIR": str(directory / "profile"),
+                "NODRIVER_PROXY": "",
+                "NODRIVER_EXTENSIONS": "[]",
+                "NODRIVER_BROWSER_ARGS": "[]",
+                ENABLED_GROUPS_ENV: "",
+            },
+        )
+        async with stdio_client(parameters) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                try:
+                    await self.call(
+                        session,
+                        "start_browser",
+                        url="data:text/html,<title>MCP cancellation</title><input>",
+                    )
+                    yield session
+                finally:
+                    (directory / "release-version").touch()
+                    await self.call(session, "close_browser")
+
+    async def call(self, session, name, **arguments):
+        result = await asyncio.wait_for(session.call_tool(name, arguments), 15)
+        self.assertFalse(result.is_error, str(result))
+        return "".join(getattr(item, "text", "") for item in result.content)
+
+    async def wait_file(self, path):
+        async with asyncio.timeout(5):
+            while not path.exists():
+                await asyncio.sleep(0.01)
+
+    async def test_real_request_cancellation_stops_busy_js_and_preserves_idle_promises(
+        self,
+    ):
+        with tempfile.TemporaryDirectory(prefix="nodriver-mcp-cancel-") as temporary:
+            directory = Path(temporary)
+            async with self.session(directory) as session:
+                await self.call(session, "enable_console_collection")
+                snapshot = await self.call(session, "take_snapshot")
+                uid = re.search(r"uid=(\S+) textbox", snapshot).group(1)
+                for args in (None, [uid]):
+                    for busy in (True, False):
+                        with self.subTest(args=args, busy=busy):
+                            finished = directory / "script-cancelled"
+                            finished.unlink(missing_ok=True)
+                            marker = f"started-{bool(args)}-{busy}"
+                            source = f"console.log({json.dumps(marker)});"
+                            source += "while(true){}" if busy else "new Promise(()=>{})"
+                            if args:
+                                source = (
+                                    "el=>{"
+                                    + source.replace(
+                                        "new Promise", "return new Promise"
+                                    )
+                                    + "}"
+                                )
+                            pending = asyncio.create_task(
+                                session.call_tool(
+                                    "evaluate_script",
+                                    {
+                                        "function": source,
+                                        "format": "function" if args else "script",
+                                        "args": args,
+                                        "timeout": 0,
+                                        "wait_for_stable": False,
+                                    },
+                                )
+                            )
+                            responsive = False
+                            try:
+                                async with asyncio.timeout(5):
+                                    while marker not in await self.call(
+                                        session, "list_console_messages"
+                                    ):
+                                        await asyncio.sleep(0.01)
+                                pending.cancel()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await pending
+                                await self.wait_file(finished)
+                                for _ in range(2):
+                                    result = await self.call(
+                                        session,
+                                        "evaluate_script",
+                                        function="42",
+                                        format="script",
+                                        timeout=1000,
+                                        wait_for_stable=False,
+                                    )
+                                    self.assertIn("Status: completed", result)
+                                    self.assertEqual(
+                                        json.loads(result.splitlines()[1]), 42
+                                    )
+                                responsive = True
+                            finally:
+                                pending.cancel()
+                                await asyncio.gather(pending, return_exceptions=True)
+                                if not responsive:
+                                    await self.call(
+                                        session,
+                                        "send_cdp_command",
+                                        domain="Runtime",
+                                        command="terminateExecution",
+                                    )
+
+    async def test_real_request_cancellation_closes_version_target_created_before_reply(
+        self,
+    ):
+        with tempfile.TemporaryDirectory(
+            prefix="nodriver-mcp-version-cancel-"
+        ) as temporary:
+            directory = Path(temporary)
+            async with self.session(directory) as session:
+                pending = asyncio.create_task(
+                    session.call_tool(
+                        "get_browser_info", {"include_version_page": True}
+                    )
+                )
+                try:
+                    await self.wait_file(directory / "version-created")
+                    pending.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await pending
+                    await self.wait_file(directory / "version-cancelled")
+                    (directory / "release-version").touch()
+                    await self.wait_file(directory / "version-finished")
+                    pages = await self.call(session, "list_pages")
+                    self.assertNotIn("chrome://version", pages)
+                    self.assertNotIn((directory / "version-created").read_text(), pages)
+                finally:
+                    (directory / "release-version").touch()
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
 
 
 @unittest.skipUnless(

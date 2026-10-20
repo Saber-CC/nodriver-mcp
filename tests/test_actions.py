@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import anyio
 from nodriver import cdp
 from nodriver_mcp.actions import ActionInterrupted, ActionWaiter
 
@@ -125,6 +126,27 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+        self.assertTrue(cleaned.is_set())
+        self.assertTrue(waiter.dialog.cancelled())
+        self.assertFalse(any(self.page.handlers.values()))
+
+    async def test_anyio_cancellation_does_not_interrupt_child_cleanup(self):
+        waiter = self.waiter(wait_for_stable=False)
+        entered, cleaned = asyncio.Event(), asyncio.Event()
+
+        async def action():
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                with anyio.move_on_after(0.5, shield=True):
+                    await asyncio.sleep(0.02)
+                    cleaned.set()
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(waiter.run, action)
+            await entered.wait()
+            tasks.cancel_scope.cancel()
         self.assertTrue(cleaned.is_set())
         self.assertTrue(waiter.dialog.cancelled())
         self.assertFalse(any(self.page.handlers.values()))

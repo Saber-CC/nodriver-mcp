@@ -1,9 +1,9 @@
 """Observe default frame worlds without enabling Runtime during page startup."""
 
-import asyncio
 import logging
 import weakref
 
+import anyio
 from nodriver import cdp
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,22 @@ class FrameContexts:
         if not enabled:
             self.reset(connection)
 
+    async def restore_runtime(self, connection):
+        """Reconcile a possibly applied command without discarding live worlds."""
+        state = self.state(connection)
+        if state is None:
+            return
+        enabled = self.has_runtime_consumers(connection)
+        with anyio.move_on_after(0.5, shield=True):
+            try:
+                await connection.send(
+                    cdp.runtime.enable() if enabled else cdp.runtime.disable()
+                )
+                if not enabled and self.state(connection) is state:
+                    state["contexts"].clear()
+            except Exception:
+                logger.debug("Runtime state recovery failed", exc_info=True)
+
     async def main_world(self, connection, frame_id):
         state = self.watch(connection)
         try:
@@ -101,13 +117,10 @@ class FrameContexts:
             return context.unique_id
         finally:
             if not self.has_runtime_consumers(connection):
-                self.reset(connection)
-                try:
-                    # Leave buffered logs available for the first explicit
-                    # console collector, including after cancelled discovery.
-                    await asyncio.wait_for(connection.send(cdp.runtime.disable()), 0.5)
-                except Exception:
-                    logger.debug("Temporary Runtime cleanup failed", exc_info=True)
+                # Leave buffered logs available for the first explicit console
+                # collector, including after cancelled discovery. Clear worlds
+                # only after Chrome confirms that Runtime is disabled.
+                await self.restore_runtime(connection)
 
     def forget(self, connection):
         state = self.watchers.pop(id(connection), None)

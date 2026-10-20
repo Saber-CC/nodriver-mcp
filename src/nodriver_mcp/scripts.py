@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from urllib.request import url2pathname
 from uuid import uuid4
 
+import anyio
 import nodriver as uc
 
 from .artifacts import artifact_path
@@ -75,34 +76,37 @@ async def _execution_command(tab, command, *, synchronous):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        busy = synchronous and not task.done()
-        if not synchronous and not task.done():
-            # An unresolved Promise need not be executing JS. Terminating an
-            # idle isolate can poison its next evaluation. Probe responsiveness
-            # before interrupting a continuation that may be running a loop.
-            try:
-                await asyncio.wait_for(
-                    tab.send(
-                        runtime.evaluate(
-                            "0", silent=True, timeout=runtime.TimeDelta(50)
-                        )
-                    ),
-                    0.1,
-                )
-            except TimeoutError:
-                busy = True
-            except Exception:
-                pass
-        if busy:
-            try:
-                await asyncio.wait_for(tab.send(runtime.terminate_execution()), 1)
-            except Exception:
-                logger.debug("Script interruption failed", exc_info=True)
+        # MCP cancels an AnyIO scope, so every cleanup await must be protected
+        # from repeated cancellation, while retaining its own finite deadline.
+        with anyio.move_on_after(1.5, shield=True):
+            busy = synchronous and not task.done()
+            if not synchronous and not task.done():
+                # An unresolved Promise need not be executing JS. Terminating
+                # an idle isolate can poison its next evaluation.
+                try:
+                    await asyncio.wait_for(
+                        tab.send(
+                            runtime.evaluate(
+                                "0", silent=True, timeout=runtime.TimeDelta(50)
+                            )
+                        ),
+                        0.1,
+                    )
+                except TimeoutError:
+                    busy = True
+                except Exception:
+                    pass
+            if busy:
+                try:
+                    await asyncio.wait_for(tab.send(runtime.terminate_execution()), 1)
+                except Exception:
+                    logger.debug("Script interruption failed", exc_info=True)
         raise
     finally:
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        with anyio.move_on_after(0.5, shield=True):
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def _execute_with_arguments(tab, source, objects, group):
@@ -230,10 +234,11 @@ async def execute_script(
             raise TimeoutError(f"Script execution exceeded {timeout}ms.") from exc
         raise
     finally:
-        try:
-            await asyncio.wait_for(tab.send(runtime.release_object_group(group)), 0.5)
-        except Exception:
-            logger.debug("Script object-group cleanup failed", exc_info=True)
+        with anyio.move_on_after(0.5, shield=True):
+            try:
+                await tab.send(runtime.release_object_group(group))
+            except Exception:
+                logger.debug("Script object-group cleanup failed", exc_info=True)
 
 
 async def script_result(

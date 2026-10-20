@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import anyio
 import nodriver as uc
 
 from .protocol import (
@@ -63,25 +64,30 @@ async def _browser_version_page(browser) -> dict[str, str]:
     except TimeoutError as exc:
         raise TimeoutError("Reading chrome://version timed out after 10000ms") from exc
     finally:
-        # Keep the creation reply even if the caller cancels while Chrome is
-        # opening the page, so the new target can still be closed.
-        if target_id is None:
-            target_id = await creation
         try:
-            async with asyncio.timeout(5):
+            # Retrieving a late creation reply and closing its target are one
+            # bounded cleanup operation, even inside a cancelled MCP scope.
+            with anyio.move_on_after(5, shield=True) as cleanup:
+                if target_id is None:
+                    target_id = await asyncio.shield(creation)
                 await browser.send(uc.cdp.target.close_target(target_id))
                 while any(
                     target.target_id == target_id
                     for target in await browser.send(uc.cdp.target.get_targets())
                 ):
                     await asyncio.sleep(0.05)
-        except TimeoutError as exc:
-            raise TimeoutError(
-                "Temporary chrome://version page did not close within 5000ms"
-            ) from exc
+            if cleanup.cancel_called:
+                raise TimeoutError(
+                    "Temporary chrome://version page did not close within 5000ms"
+                )
         finally:
+            if not creation.done():
+                creation.cancel()
+            with anyio.move_on_after(0.5, shield=True):
+                await asyncio.gather(creation, return_exceptions=True)
             if tab is not None:
-                await tab.aclose()
+                with anyio.move_on_after(0.5, shield=True):
+                    await tab.aclose()
 
 
 async def _extension_tab_target(browser, page):
@@ -166,12 +172,11 @@ async def _frame_xpath(connection, frame, expression, timeout, limit):
             if elements or asyncio.get_running_loop().time() >= deadline:
                 return elements
         finally:
-            try:
-                await asyncio.wait_for(
-                    connection.send(uc.cdp.runtime.release_object_group(group)), 0.5
-                )
-            except Exception:
-                pass
+            with anyio.move_on_after(0.5, shield=True):
+                try:
+                    await connection.send(uc.cdp.runtime.release_object_group(group))
+                except Exception:
+                    pass
         await asyncio.sleep(0.05)
 
 
@@ -353,7 +358,7 @@ def register_tools(mcp, s) -> None:
                 # Native xpath still passes the removed _is_update positional
                 # flag as _attach in 0.50.6. Reuse its native search primitive.
                 elements = await tab.find_all(xpath, timeout=timeout)
-        if frame_element is not None:
+        if frame_element is not None and not xpath:
             frame_nodes = uc.util.filter_recurse_all(
                 frame_element.content_document, lambda node: True
             )
@@ -538,15 +543,21 @@ def register_tools(mcp, s) -> None:
         async with lock if lock is not None else nullcontext():
             if runtime_switch:
                 s._check_collection_owner(target, lock)
-                if generator.gi_code.co_name == "disable":
-                    s._frame_contexts.request_runtime(target, False)
-            result = await s._await_with_timeout(
-                target.send(generator), timeout, f"{domain}.{command}"
-            )
+                s._frame_contexts.watch(target)
+                enabled = generator.gi_code.co_name == "enable"
+            try:
+                result = await s._await_with_timeout(
+                    target.send(generator), timeout, f"{domain}.{command}"
+                )
+            except BaseException:
+                if runtime_switch:
+                    # The command may have reached Chrome before its reply was
+                    # lost. Restore the prior consumers' state before unlocking.
+                    await s._frame_contexts.restore_runtime(target)
+                raise
             if runtime_switch:
                 s._check_collection_owner(target, lock)
-                if generator.gi_code.co_name == "enable":
-                    s._frame_contexts.request_runtime(target, True)
+                s._frame_contexts.request_runtime(target, enabled)
             return json_value(result)
 
     @mcp.tool()

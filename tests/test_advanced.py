@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import anyio
 import nodriver as uc
 
 from nodriver_mcp.advanced import _browser_version_page, _extension_tab_target
@@ -93,6 +94,56 @@ class VersionPageTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.assert_closed()
         self.tab.send.assert_not_awaited()
+
+    async def test_anyio_cancellation_waits_for_creation_before_closing(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        scopes = []
+
+        async def send(command):
+            packet = next(command)
+            self.commands.append(packet)
+            if packet["method"] == "Target.createTarget":
+                entered.set()
+                await release.wait()
+                return uc.cdp.target.TargetID("version")
+            return [] if packet["method"] == "Target.getTargets" else True
+
+        async def request():
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                await _browser_version_page(self.browser)
+
+        self.browser.send.side_effect = send
+        task = asyncio.create_task(request())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            scopes[0].cancel()
+            await asyncio.sleep(0.02)
+            release.set()
+            await asyncio.wait_for(task, 1)
+            self.assert_closed()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_creation_without_a_reply_has_bounded_cleanup(self):
+        entered, reaped = asyncio.Event(), asyncio.Event()
+
+        async def send(_command):
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                reaped.set()
+
+        self.browser.send.side_effect = send
+        task = asyncio.create_task(_browser_version_page(self.browser))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with self.assertRaisesRegex(TimeoutError, "did not close within 5000ms"):
+            await asyncio.wait_for(task, 7)
+        self.assertTrue(reaped.is_set())
 
 
 class ExtensionTargetTests(unittest.IsolatedAsyncioTestCase):
