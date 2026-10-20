@@ -4,7 +4,9 @@ import gc
 import unittest
 import weakref
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
+import anyio
 from nodriver import cdp
 
 from nodriver_mcp.contexts import FrameContexts
@@ -83,6 +85,33 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+        self.assertEqual(connection.commands[-1], "Runtime.disable")
+        self.assertFalse(contexts.state(connection)["contexts"])
+        connection.block = False
+        self.assertEqual(await contexts.main_world(connection, "child"), "world-A")
+
+    async def test_failed_temporary_disable_keeps_worlds_until_confirmed(self):
+        contexts, connection = FrameContexts(), Connection()
+        native_send = connection.send
+
+        async def send(command):
+            if command.gi_code.co_name == "disable":
+                raise TimeoutError("disable did not reach Chrome")
+            return await native_send(command)
+
+        with patch.object(connection, "send", send):
+            self.assertEqual(await contexts.main_world(connection, "child"), "world-A")
+            self.assertIn("child", contexts.state(connection)["contexts"])
+        await contexts.restore_runtime(connection)
+        self.assertFalse(contexts.state(connection)["contexts"])
+
+    async def test_anyio_cancellation_closes_temporary_runtime_before_retry(self):
+        contexts, connection = FrameContexts(), Connection()
+        connection.block = True
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(contexts.main_world, connection, "child")
+            await connection.entered.wait()
+            tasks.cancel_scope.cancel()
         self.assertEqual(connection.commands[-1], "Runtime.disable")
         self.assertFalse(contexts.state(connection)["contexts"])
         connection.block = False

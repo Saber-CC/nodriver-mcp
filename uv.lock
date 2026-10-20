@@ -327,9 +327,10 @@ wheels = [
 
 [[package]]
 name = "nodriver-mcp"
-version = "1.6.0"
+version = "1.6.1"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "mcp" },
     { name = "nodriver" },
     { name = "pillow" },
@@ -343,6 +344,7 @@ vision = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.5,<5" },
     { name = "mcp", specifier = "==2.3.0" },
     { name = "nodriver", specifier = "==0.50.6" },
     { name = "opencv-python", marker = "extra == 'vision'", specifier = ">=4.8" },

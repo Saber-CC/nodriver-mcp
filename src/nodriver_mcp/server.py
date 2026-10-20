@@ -1159,8 +1159,12 @@ async def _stop_console_collection(tab):
     finally:
         collector.remove()
     if not _frame_contexts.has_runtime_consumers(tab):
+        try:
+            await tab.send(uc.cdp.runtime.disable())
+        except BaseException:
+            await _frame_contexts.restore_runtime(tab)
+            raise
         _frame_contexts.reset(tab)
-        await tab.send(uc.cdp.runtime.disable())
     return True
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, patch
 
+import anyio
 import nodriver as uc
 from mcp.server.mcpserver import Image
 from mcp.server.mcpserver.exceptions import ToolError
@@ -3040,6 +3041,53 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             "84", await s.evaluate_script("frameAnswer()", wait_for_stable=False)
         )
 
+    async def test_same_process_iframe_xpath_wait_keeps_nodes_inserted_during_query(
+        self,
+    ):
+        from nodriver_mcp import advanced
+
+        page = await s._page_tab()
+        await page.send(
+            uc.cdp.runtime.evaluate(
+                "document.querySelector('iframe').contentDocument.body.innerHTML=''"
+            )
+        )
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        await self.tool("select_frame", frame_id=child["frame_id"])
+        native_xpath = advanced._frame_xpath
+
+        async def delayed_node(*args):
+            await page.send(
+                uc.cdp.runtime.evaluate(
+                    "setTimeout(()=>{const doc=document.querySelector('iframe').contentDocument;"
+                    "const input=doc.createElement('input');input.id='late-xpath';"
+                    "doc.body.append(input)},300)"
+                )
+            )
+            return await native_xpath(*args)
+
+        with patch.object(advanced, "_frame_xpath", delayed_node):
+            matches = await self.tool(
+                "find_elements", xpath="//input[@id='late-xpath']", timeout=2
+            )
+        self.assertEqual(len(matches), 1)
+        self.assertNotIn("Error", await s.fill(matches[0]["uid"], "dynamic-node"))
+        self.assertEqual(
+            (
+                await page.send(
+                    uc.cdp.runtime.evaluate(
+                        "document.querySelector('iframe').contentDocument.querySelector('input').value",
+                        return_by_value=True,
+                    )
+                )
+            )[0].value,
+            "dynamic-node",
+        )
+
     async def test_cross_process_nested_frames_route_scripts_and_elements(self):
         page = await s._page_tab()
         outer_url = f"http://localhost:{self.http.server_port}/nested-outer"
@@ -3313,3 +3361,67 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             "Status: completed",
             await s.evaluate_script("document.URL", wait_for_stable=False),
         )
+
+    async def test_failed_runtime_disable_recovers_same_process_iframe_world(self):
+        page = await s._page_tab()
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        await self.tool("select_frame", frame_id=child["frame_id"])
+        await s.enable_console_collection()
+        await s.evaluate_script(
+            "window.runtimeRecoveryMarker=42", format="script", wait_for_stable=False
+        )
+        for applied in (False, True):
+            for cancelled in (False, True):
+                with self.subTest(applied=applied, cancelled=cancelled):
+                    entered = asyncio.Event()
+                    scopes = []
+                    native_send = page.send
+
+                    async def send(command, *args, **kwargs):
+                        if command.gi_code.co_name == "disable":
+                            if applied:
+                                await native_send(command, *args, **kwargs)
+                            entered.set()
+                            await asyncio.Future()
+                        return await native_send(command, *args, **kwargs)
+
+                    async def request():
+                        with anyio.CancelScope() as scope:
+                            scopes.append(scope)
+                            await self.tool(
+                                "send_cdp_command",
+                                domain="Runtime",
+                                command="disable",
+                                timeout=0 if cancelled else 100,
+                            )
+
+                    with patch.object(page, "send", send):
+                        task = asyncio.create_task(request())
+                        try:
+                            await asyncio.wait_for(entered.wait(), 2)
+                            if cancelled:
+                                scopes[0].cancel()
+                                await asyncio.wait_for(task, 2)
+                            else:
+                                with self.assertRaises(TimeoutError):
+                                    await asyncio.wait_for(task, 2)
+                        finally:
+                            if not task.done():
+                                task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                    result = await s.evaluate_script(
+                        "[runtimeRecoveryMarker,document.URL]", wait_for_stable=False
+                    )
+                    self.assertIn("Status: completed", result)
+                    self.assertEqual(
+                        json.loads(result.splitlines()[1]), [42, self.url + "frame"]
+                    )
+                    marker = f"runtime-recovered-{applied}-{cancelled}"
+                    await s.evaluate_script(
+                        f"console.log({json.dumps(marker)})", wait_for_stable=False
+                    )
+                    self.assertIn(marker, await s.list_console_messages())

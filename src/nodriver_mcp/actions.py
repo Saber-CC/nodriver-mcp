@@ -8,6 +8,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+import anyio
 from nodriver import cdp
 
 from .dialogs import DialogInterrupted as ActionInterrupted, DialogRegistry
@@ -221,7 +222,10 @@ class ActionWaiter:
         finally:
             if not task.done():
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                # A cancelled MCP scope would cancel gather repeatedly and
+                # interrupt the child's own JavaScript termination cleanup.
+                with anyio.move_on_after(3, shield=True):
+                    await asyncio.gather(task, return_exceptions=True)
 
     async def stable_dom(self):
         key = json.dumps(self.observer_key)
