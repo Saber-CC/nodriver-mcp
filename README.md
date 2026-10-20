@@ -22,12 +22,6 @@ Version 1.5.20 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
-The [1.5.18 fixes](docs/regressions-1.5.18.md) cover script deadlines, concurrent
-trace cleanup, source-map ownership, iframe initialization and repeated email fills.
-The [1.5.19 fix](docs/regressions-1.5.19.md) restores source maps for logs Chrome
-replays when console collection is first enabled with `source_maps=true`.
-The [1.5.20 fix](docs/regressions-1.5.20.md) cleans up a pending Debugger enable
-when startup is cancelled, so retries can capture existing scripts again.
 
 For a source checkout:
 
@@ -365,7 +359,6 @@ engine into `~/.cache/nodriver-mcp/trace-engine`, verifies its pinned SHA-512 an
 reuses it on later calls. `NODRIVER_TRACE_ENGINE_CACHE_DIR` changes that directory;
 `NODRIVER_DEVTOOLS_PACKAGE` selects an existing published package for offline use.
 Browser automation and raw trace capture use the Python dependencies alone.
-See [performance analysis](docs/performance-analysis.md) for inputs and metrics.
 
 ### Website WebMCP tools
 
@@ -449,10 +442,6 @@ and verifies the installed server's MCP handshake and tool discovery.
 The stdio tests cover the legacy handshake and modern protocol, tool errors
 without disconnecting the client, PNG image responses, and persistent
 cookies/storage across MCP process restarts.
-See [the upgrade coverage and implementation notes](docs/nodriver-0.50.6.md)
-for the complete added-command inventory and native API decisions.
-See [the tool parity roadmap](docs/tool-parity-roadmap.md) for completed fixes,
-missing capabilities, priorities and acceptance criteria for the next iterations.
 
 ## License
 
