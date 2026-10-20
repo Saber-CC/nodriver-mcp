@@ -20,7 +20,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.6.4 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.6.5 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -279,6 +279,10 @@ related declarations and reads in one call, or use explicit `window` properties
 for state that must survive between calls. Ordinary non-strict global `var` and
 function declarations retain normal eval behavior. Do not enable Runtime just to
 work around this limitation; it carries the detection risk described below.
+The evaluator is verified using Chrome's native function metadata and retained
+for the entire call. If the page replaces or wraps `window.eval`, evaluation
+fails explicitly before passing any source to that function. A native evaluator
+from another window is also rejected; Runtime is never enabled as a fallback.
 
 `find_elements` uses native text, CSS or XPath search and returns actionable UIDs:
 

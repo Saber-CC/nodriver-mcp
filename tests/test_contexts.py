@@ -61,6 +61,12 @@ class Connection:
                 if self.object_id is not None
                 else None,
             )
+        if method == "Runtime.callFunctionOn" and not params.get("arguments"):
+            return cdp.runtime.RemoteObject(
+                type_="function",
+                description="function eval() { [native code] }",
+                object_id=cdp.runtime.RemoteObjectId("opaque-native-eval-handle"),
+            ), None
         if method in {"Runtime.evaluate", "Runtime.callFunctionOn"}:
             return cdp.runtime.RemoteObject(type_="number", value=42), None
         if method == "Runtime.releaseObjectGroup":

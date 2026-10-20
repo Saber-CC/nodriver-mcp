@@ -17,13 +17,53 @@ from .protocol import json_value
 
 logger = logging.getLogger(__name__)
 
-_DOCUMENT_EVALUATION = """function(source) {
+_DOCUMENT_GUARD = """
     const view = this.defaultView;
     if (!view || view.document !== this) {
         throw new Error('Selected frame document is no longer current; refresh frames and retry.');
     }
-    return view.eval(source);
+"""
+_DOCUMENT_EVALUATOR = "function() {" + _DOCUMENT_GUARD + "return view.eval;}"
+_DOCUMENT_EVALUATION = "function(source, evaluate) {" + _DOCUMENT_GUARD + """
+    if (evaluate('this') !== view) {
+        throw new Error('Selected frame native eval belongs to another window; script was not executed.');
+    }
+    return evaluate(source);
 }"""
+
+
+async def _document_evaluator(tab, document_object_id, group, timeout):
+    """Retain a browser-verified native evaluator before passing any source."""
+    runtime = uc.cdp.runtime
+    with anyio.fail_after(timeout / 1000 if timeout else None):
+        evaluator, error = await _execution_command(
+            tab,
+            runtime.call_function_on(
+                _DOCUMENT_EVALUATOR,
+                object_id=document_object_id,
+                object_group=group,
+                return_by_value=False,
+                await_promise=False,
+            ),
+            synchronous=True,
+        )
+    if error:
+        raise script_error(error)
+    # Chrome supplies this description without invoking the page's toString.
+    # JS wrappers cannot have this source, and native-looking Proxies/bound
+    # functions have distinct descriptions/types. Never send source to them.
+    if (
+        evaluator.object_id is None
+        or evaluator.type_ != "function"
+        or evaluator.subtype is not None
+        or evaluator.description != "function eval() { [native code] }"
+    ):
+        raise ValueError(
+            "Selected frame window.eval has been replaced or is unavailable; "
+            "script was not executed. Document-bound evaluation requires the "
+            "frame's original native eval."
+        )
+    return evaluator.object_id
 
 
 async def prepare_script_call(arguments):
@@ -166,6 +206,7 @@ async def _evaluate_expression(
     group,
     *,
     document_object_id,
+    evaluator_object_id,
     unique_context_id,
     timeout,
     await_promise=True,
@@ -195,7 +236,10 @@ async def _evaluate_expression(
             runtime.call_function_on(
                 _DOCUMENT_EVALUATION,
                 object_id=document_object_id,
-                arguments=[runtime.CallArgument(value=expression)],
+                arguments=[
+                    runtime.CallArgument(value=expression),
+                    runtime.CallArgument(object_id=evaluator_object_id),
+                ],
                 object_group=group,
                 return_by_value=False,
                 await_promise=False,
@@ -237,6 +281,11 @@ async def execute_script(
                         raise ValueError(
                             "Frame execution target is unavailable; refresh frames and retry."
                         )
+            evaluator_object_id = None
+            if document_object_id is not None:
+                evaluator_object_id = await _document_evaluator(
+                    tab, document_object_id, group, timeout
+                )
             expression = source
             if format in {"auto", "function"}:
                 candidate = source.rstrip().removesuffix(";")
@@ -250,32 +299,32 @@ async def execute_script(
                         + candidate
                         + "\n))"
                     )
-                    # compileScript requires Runtime.enable. A Function
-                    # constructor parses without running the source and works
-                    # under evaluate's explicit CSP bypass without enabling it.
-                    probe = (
-                        "(() => {try { (function(){}).constructor("
-                        + json.dumps("return (\n" + candidate + "\n);")
-                        + "); return true; } catch(error) { if(error.name === 'SyntaxError') return false; throw error; }})()"
-                    )
-                    parsed, parse_error = await _evaluate_expression(
+                    # Compile an uncalled arrow to check expression syntax.
+                    # This neither runs the source nor calls a page-replaceable
+                    # Function constructor, and does not require Runtime.enable.
+                    probe = "() => (\n" + candidate + "\n)"
+                    _, parse_error = await _evaluate_expression(
                         tab,
                         probe,
                         group,
                         document_object_id=document_object_id,
+                        evaluator_object_id=evaluator_object_id,
                         unique_context_id=unique_context_id,
                         timeout=timeout,
                         await_promise=False,
                     )
                     if parse_error is not None:
-                        raise script_error(parse_error)
-                    if parsed.value:
+                        exception = parse_error.exception
+                        if exception is None or exception.class_name != "SyntaxError":
+                            raise script_error(parse_error)
+                    else:
                         expression = wrapped
             result, error = await _evaluate_expression(
                 tab,
                 expression,
                 group,
                 document_object_id=document_object_id,
+                evaluator_object_id=evaluator_object_id,
                 unique_context_id=unique_context_id,
                 timeout=timeout,
                 await_promise=await_promise,

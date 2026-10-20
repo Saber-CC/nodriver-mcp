@@ -3052,6 +3052,165 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             "84", await s.evaluate_script("frameAnswer()", wait_for_stable=False)
         )
 
+    async def test_same_process_frame_replaced_eval_cannot_intercept_scripts(self):
+        page = await s._page_tab()
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        await self.tool("select_frame", frame_id=child["frame_id"])
+        await page.send(
+            uc.cdp.runtime.evaluate(
+                "window.originalFrameEval=document.querySelector('iframe').contentWindow.eval;"
+                "window.evalIntercepted=[];"
+            )
+        )
+        replacements = {
+            "blocked": "source=>{evalIntercepted.push(source);return 'blocked'}",
+            "forwarding": "source=>{evalIntercepted.push(source);return originalFrameEval(source)}",
+            "proxy": "new Proxy(originalFrameEval,{apply(target,receiver,args){evalIntercepted.push(args[0]);return 'blocked'}})",
+            "bound-wrapper": "(source=>{evalIntercepted.push(source);return 'blocked'}).bind(null)",
+            "spoofed-toString": "Object.assign(source=>{evalIntercepted.push(source);return 'blocked'}, {toString:()=> 'function eval() { [native code] }'})",
+            "missing": "undefined",
+            "other-realm-native": "window.eval",
+        }
+        for name, replacement in replacements.items():
+            with self.subTest(replacement=name):
+                await page.send(
+                    uc.cdp.runtime.evaluate(
+                        "document.querySelector('iframe').contentWindow.eval="
+                        + replacement
+                    )
+                )
+                for mode, source in (
+                    ("script", "window.testMarker=42;testMarker"),
+                    ("auto", "window.testMarker=42"),
+                    ("function", "() => {window.testMarker=42;return testMarker}"),
+                ):
+                    result = await s.evaluate_script(
+                        source, format=mode, wait_for_stable=False
+                    )
+                    self.assertIn("Status: failed", result)
+                    self.assertIn("script was not executed", result)
+                    self.assertNotIn("Status: completed", result)
+                with self.assertRaisesRegex(ValueError, "script was not executed"):
+                    await s._evaluate(page, "window.internalMarker=42")
+                state, error = await page.send(
+                    uc.cdp.runtime.evaluate(
+                        "[evalIntercepted,typeof window.testMarker,"
+                        "typeof document.querySelector('iframe').contentWindow.testMarker,"
+                        "typeof document.querySelector('iframe').contentWindow.internalMarker]",
+                        return_by_value=True,
+                    )
+                )
+                self.assertIsNone(error)
+                self.assertEqual(state.value, [[], "undefined", "undefined", "undefined"])
+
+        await page.send(
+            uc.cdp.runtime.evaluate(
+                "document.querySelector('iframe').contentWindow.eval=originalFrameEval"
+            )
+        )
+        restored = await s.evaluate_script(
+            "window.testMarker=42;testMarker", format="script", wait_for_stable=False
+        )
+        self.assertIn("Status: completed", restored)
+        self.assertEqual(json.loads(restored.splitlines()[1]), 42)
+
+    async def test_same_process_frame_keeps_native_eval_when_page_replaces_it_mid_call(
+        self,
+    ):
+        from nodriver_mcp.scripts import _DOCUMENT_EVALUATOR
+
+        page = await s._page_tab()
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        await self.tool("select_frame", frame_id=child["frame_id"])
+        native_send = page.send
+        captured = False
+        methods = []
+
+        async def send(command, *args, **kwargs):
+            nonlocal captured
+            packet = next(command)
+            methods.append(packet["method"])
+
+            def replay():
+                response = yield packet
+                try:
+                    command.send(response)
+                except StopIteration as stop:
+                    return stop.value
+
+            result = await native_send(replay(), *args, **kwargs)
+            if packet.get("params", {}).get("functionDeclaration") == _DOCUMENT_EVALUATOR:
+                captured = True
+                await native_send(
+                    uc.cdp.runtime.evaluate(
+                        "window.evalIntercepted=[];"
+                        "document.querySelector('iframe').contentWindow.eval=source=>{"
+                        "evalIntercepted.push(source);return 'blocked'}"
+                    )
+                )
+            return result
+
+        with patch.object(page, "send", send):
+            result = await s.evaluate_script(
+                "window.testMarker=42;testMarker", wait_for_stable=False
+            )
+        self.assertTrue(captured)
+        self.assertIn("Status: completed", result)
+        self.assertEqual(json.loads(result.splitlines()[1]), 42)
+        state, error = await page.send(
+            uc.cdp.runtime.evaluate(
+                "[evalIntercepted,document.querySelector('iframe').contentWindow.testMarker]",
+                return_by_value=True,
+            )
+        )
+        self.assertIsNone(error)
+        self.assertEqual(state.value, [[], 42])
+        self.assertNotIn("Runtime.enable", methods)
+        self.assertNotIn("Runtime.addBinding", methods)
+
+    async def test_script_auto_format_does_not_call_page_function_constructors(self):
+        page = await s._page_tab()
+        await page.send(
+            uc.cdp.runtime.evaluate("""(() => {
+                const frame = document.querySelector('iframe').contentWindow;
+                window.constructorIntercepted = [];
+                for (const view of [window, frame]) {
+                    view.Function.prototype.constructor = source => {
+                        constructorIntercepted.push(source);
+                        return () => 'blocked';
+                    };
+                }
+            })()""")
+        )
+        frames = await self.tool("list_frames")
+        child = next(frame for frame in frames if frame["name"] == "child")
+        for frame_id in ("", child["frame_id"]):
+            await self.tool("select_frame", frame_id=frame_id)
+            for source in (
+                "() => {window.constructorMarker=42;return constructorMarker}",
+                "window.constructorMarker=42;constructorMarker",
+            ):
+                result = await s.evaluate_script(source, wait_for_stable=False)
+                self.assertIn("Status: completed", result)
+                self.assertEqual(json.loads(result.splitlines()[1]), 42)
+        state, error = await page.send(
+            uc.cdp.runtime.evaluate(
+                "[constructorIntercepted,constructorMarker,"
+                "document.querySelector('iframe').contentWindow.constructorMarker]",
+                return_by_value=True,
+            )
+        )
+        self.assertIsNone(error)
+        self.assertEqual(state.value, [[], 42, 42])
+
     async def test_same_process_frame_actions_never_enable_runtime_or_leave_bindings(
         self,
     ):
@@ -3489,7 +3648,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                 expression = params.get("expression") or (
                     params.get("arguments", [{}])[0].get("value", "")
                 )
-                if armed and expression.startswith("(() => {try {"):
+                if armed and expression.startswith("() => (\n"):
                     armed = False
                     await replace_renderer()
                 return result
