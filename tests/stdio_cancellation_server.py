@@ -16,6 +16,8 @@ def main():
     native_send = uc.Browser.send
 
     async def execute(*args, **kwargs):
+        if len(args) > 1 and args[1].startswith("window.cancellationStarted="):
+            (directory / "frame-script-entered").touch()
         try:
             return await native_execute(*args, **kwargs)
         except asyncio.CancelledError:

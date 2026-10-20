@@ -257,7 +257,7 @@ class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
             while not path.exists():
                 await asyncio.sleep(0.01)
 
-    async def test_frame_evaluation_preserves_lexicals_without_runtime_console_serialization(
+    async def test_frame_document_evaluation_keeps_local_lexicals_without_runtime_serialization(
         self,
     ):
         with tempfile.TemporaryDirectory(
@@ -289,20 +289,23 @@ class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
                     if frame["name"] == "stdio-frame"
                 )
                 await self.call(session, "select_frame", frame_id=child["frame_id"])
-                await self.call(
+                initial = await self.call(
                     session,
                     "evaluate_script",
-                    function="let lexicalFrameProbe=21;const constFrameProbe=42;",
+                    function="let lexicalFrameProbe=21;const constFrameProbe=42;window.frameProbeState={sum:lexicalFrameProbe+constFrameProbe};[lexicalFrameProbe,constFrameProbe];",
                     format="script",
                     wait_for_stable=False,
                 )
+                self.assertEqual(json.loads(initial.splitlines()[1]), [21, 42])
                 value = await self.call(
                     session,
                     "evaluate_script",
-                    function="[lexicalFrameProbe,constFrameProbe]",
+                    function="[typeof lexicalFrameProbe,typeof constFrameProbe,frameProbeState.sum]",
                     wait_for_stable=False,
                 )
-                self.assertEqual(json.loads(value.splitlines()[1]), [21, 42])
+                self.assertEqual(
+                    json.loads(value.splitlines()[1]), ["undefined", "undefined", 63]
+                )
                 await self.call(
                     session, "wait_for", text=["frame marker"], timeout=2000
                 )
@@ -335,6 +338,129 @@ class StdioCancellationTests(unittest.IsolatedAsyncioTestCase):
                     wait_for_stable=False,
                 )
                 self.assertTrue(json.loads(flag.splitlines()[1]))
+
+    async def test_document_frame_request_cancellation_stops_busy_js_and_keeps_idle_promises(
+        self,
+    ):
+        with tempfile.TemporaryDirectory(
+            prefix="nodriver-mcp-frame-cancel-"
+        ) as temporary:
+            directory = Path(temporary)
+            async with self.session(directory) as session:
+                await self.call(
+                    session,
+                    "evaluate_script",
+                    function="new Promise(resolve=>{const f=document.createElement('iframe');f.name='cancel-frame';f.srcdoc='<p>cancel frame</p>';f.onload=()=>resolve(true);document.body.append(f)})",
+                    format="script",
+                    wait_for_stable=False,
+                )
+                frames = await session.call_tool("list_frames", {})
+                child = next(
+                    f
+                    for f in frames.structured_content["result"]
+                    if f["name"] == "cancel-frame"
+                )
+                await self.call(session, "select_frame", frame_id=child["frame_id"])
+                for busy in (True, False):
+                    with self.subTest(busy=busy):
+                        cancelled = directory / "script-cancelled"
+                        cancelled.unlink(missing_ok=True)
+                        entered = directory / "frame-script-entered"
+                        entered.unlink(missing_ok=True)
+                        marker = f"document-cancellation-{busy}"
+                        source = f"window.cancellationStarted={json.dumps(marker)};" + (
+                            "while(true){}" if busy else "new Promise(()=>{})"
+                        )
+                        pending = asyncio.create_task(
+                            session.call_tool(
+                                "evaluate_script",
+                                {
+                                    "function": source,
+                                    "format": "script",
+                                    "timeout": 0,
+                                    "wait_for_stable": False,
+                                },
+                            )
+                        )
+                        recovered = False
+                        try:
+                            # The barrier follows page/frame selection. Changing the
+                            # default now cannot retarget the in-flight call, and lets
+                            # readiness probes avoid frame discovery on a busy renderer.
+                            await self.wait_file(entered)
+                            await self.call(session, "select_frame", frame_id="")
+                            async with asyncio.timeout(5):
+                                while True:
+                                    if busy:
+                                        # A raw, bounded read confirms that synchronous JS is
+                                        # running without enabling Runtime console events.
+                                        probe = await session.call_tool(
+                                            "send_cdp_command",
+                                            {
+                                                "domain": "Runtime",
+                                                "command": "evaluate",
+                                                "parameters": {
+                                                    "expression": "0",
+                                                    "returnByValue": True,
+                                                },
+                                                "timeout": 100,
+                                            },
+                                        )
+                                        text = "".join(
+                                            getattr(c, "text", "")
+                                            for c in probe.content
+                                        )
+                                        if probe.is_error and "timed out" in text:
+                                            break
+                                    else:
+                                        value = await self.call(
+                                            session,
+                                            "evaluate_script",
+                                            function="document.querySelector('iframe').contentWindow.cancellationStarted",
+                                            format="script",
+                                            wait_for_stable=False,
+                                        )
+                                        if json.loads(value.splitlines()[1]) == marker:
+                                            break
+                                    await asyncio.sleep(0.01)
+                            pending.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await pending
+                            await self.wait_file(cancelled)
+                            await self.call(
+                                session, "select_frame", frame_id=child["frame_id"]
+                            )
+                            for _ in range(2):
+                                value = await self.call(
+                                    session,
+                                    "evaluate_script",
+                                    function="42",
+                                    format="script",
+                                    timeout=1000,
+                                    wait_for_stable=False,
+                                )
+                                self.assertEqual(json.loads(value.splitlines()[1]), 42)
+                            marker_value = await self.call(
+                                session,
+                                "evaluate_script",
+                                function="window.cancellationStarted",
+                                format="script",
+                                wait_for_stable=False,
+                            )
+                            self.assertEqual(
+                                json.loads(marker_value.splitlines()[1]), marker
+                            )
+                            recovered = True
+                        finally:
+                            pending.cancel()
+                            await asyncio.gather(pending, return_exceptions=True)
+                            if not recovered:
+                                await self.call(
+                                    session,
+                                    "send_cdp_command",
+                                    domain="Runtime",
+                                    command="terminateExecution",
+                                )
 
     async def test_real_request_cancellation_stops_busy_js_and_preserves_idle_promises(
         self,

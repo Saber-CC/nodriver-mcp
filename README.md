@@ -20,7 +20,7 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.6.3 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.6.4 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
@@ -266,9 +266,19 @@ their page/frame connection, so an old UID cannot silently operate on another pa
 Frame connections refresh when navigation changes their process ownership;
 elements from a replaced or removed frame document require new UIDs.
 
-Same-process frame scripts and action stability checks resolve the main world
-without `Runtime.enable` or page bindings. Page globals and native script/CSP
-behavior are preserved. Unsupported Chrome object identifiers fail explicitly.
+Same-process frame scripts and action stability checks use a reference to the
+selected Document without `Runtime.enable` or page bindings. The reference remains
+alive through execution; navigation fails instead of reusing a numeric context ID
+in a replacement renderer. Existing page globals and lexical bindings remain readable,
+and evaluation supports strict CSP pages. If explicitly enabled Runtime has already
+provided a unique context ID, that native identifier is used instead.
+
+Document-bound evaluation uses global `eval`: newly declared top-level `let`/`const`
+are local to that call, as are `var`/function declarations in strict eval. Keep
+related declarations and reads in one call, or use explicit `window` properties
+for state that must survive between calls. Ordinary non-strict global `var` and
+function declarations retain normal eval behavior. Do not enable Runtime just to
+work around this limitation; it carries the detection risk described below.
 
 `find_elements` uses native text, CSS or XPath search and returns actionable UIDs:
 

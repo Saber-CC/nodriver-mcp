@@ -3030,17 +3030,16 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await s.evaluate_script(
             "var frameCreated=21", format="script", wait_for_stable=False
         )
-        await s.evaluate_script(
-            "let frameCreatedLet=21;const frameCreatedConst=42;",
+        single_call = await s.evaluate_script(
+            "let frameCreatedLet=21;const frameCreatedConst=42;frameCreatedLet+frameCreatedConst;",
             format="script",
             wait_for_stable=False,
         )
-        self.assertIn(
-            "63",
-            await s.evaluate_script(
-                "frameCreatedLet+frameCreatedConst", wait_for_stable=False
-            ),
+        self.assertEqual(json.loads(single_call.splitlines()[1]), 63)
+        later = await s.evaluate_script(
+            "[typeof frameCreatedLet,typeof frameCreatedConst]", wait_for_stable=False
         )
+        self.assertEqual(json.loads(later.splitlines()[1]), ["undefined", "undefined"])
         self.assertIn(
             "42", await s.evaluate_script("frameCreated*2", wait_for_stable=False)
         )
@@ -3100,16 +3099,34 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             )
             await self.tool("select_frame", frame_id=child["frame_id"])
             first = await s.evaluate_script(
-                "let frameLexicalProbe=21;const frameConstProbe=42;var frameVarProbe=7;",
+                "let frameLexicalProbe=21;const frameConstProbe=42;var frameVarProbe=7;"
+                "window.frameProbeState={sum:frameLexicalProbe+frameConstProbe};"
+                "[frameLexicalProbe,frameConstProbe,frameVarProbe]",
                 format="script",
                 wait_for_stable=False,
             )
             self.assertIn("Status: completed", first)
+            self.assertEqual(json.loads(first.splitlines()[1]), [21, 42, 7])
             value = await s.evaluate_script(
-                "[frameLexicalProbe,frameConstProbe,frameVarProbe]",
+                "[typeof frameLexicalProbe,typeof frameConstProbe,frameVarProbe,frameProbeState.sum]",
                 wait_for_stable=False,
             )
-            self.assertEqual(json.loads(value.splitlines()[1]), [21, 42, 7])
+            self.assertEqual(
+                json.loads(value.splitlines()[1]), ["undefined", "undefined", 7, 63]
+            )
+            strict = await s.evaluate_script(
+                '"use strict";var strictFrameVar=1;function strictFrameFunction(){return this};strictFrameFunction()===undefined;',
+                format="script",
+                wait_for_stable=False,
+            )
+            self.assertTrue(json.loads(strict.splitlines()[1]))
+            strict_later = await s.evaluate_script(
+                "[typeof strictFrameVar,typeof strictFrameFunction]",
+                wait_for_stable=False,
+            )
+            self.assertEqual(
+                json.loads(strict_later.splitlines()[1]), ["undefined", "undefined"]
+            )
             field = (await self.tool("find_elements", selector="input"))[0]["uid"]
             self.assertNotIn("Error", await s.click(field))
             self.assertNotIn("Error", await s.fill(field, "without-runtime"))
@@ -3387,6 +3404,141 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             s._default_browser_context_id,
         )
 
+    async def _assert_frame_context_reuse_safe(
+        self, *, after_probe=False, internal=False
+    ):
+        page = await s._page_tab()
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        await self.tool("select_frame", frame_id=child["frame_id"])
+
+        async def resolve_document(frame_id):
+            owner, _ = await page.send(uc.cdp.dom.get_frame_owner(frame_id))
+            node = await page.send(
+                uc.cdp.dom.describe_node(backend_node_id=owner, depth=1, pierce=True)
+            )
+            return await page.send(
+                uc.cdp.dom.resolve_node(
+                    backend_node_id=node.content_document.backend_node_id,
+                    object_group="context-reuse-regression",
+                )
+            )
+
+        original_document = await resolve_document(
+            uc.cdp.page.FrameId(child["frame_id"])
+        )
+        old_isolate, old_id, _ = str(original_document.object_id).split(".")
+        original_lookup = s._frame_contexts.main_world
+        replacements = []
+
+        async def replace_renderer():
+            await page.get(self.url.replace("127.0.0.1", "localhost"))
+            for index in range(1, int(old_id) + 2):
+                await page.send(
+                    uc.cdp.runtime.evaluate(
+                        "new Promise(resolve=>{const frame=document.createElement('iframe');"
+                        f"frame.name='replacement-{index}';"
+                        "frame.onload=()=>resolve(true);document.body.append(frame)})",
+                        await_promise=True,
+                    )
+                )
+                tree = await page.get_frame_tree()
+                replacements[:] = [
+                    frame
+                    for frame in uc.util.flatten_frame_tree(tree)
+                    if frame.parent_id
+                ]
+                for frame in replacements:
+                    document = await resolve_document(frame.id_)
+                    new_isolate, new_id, _ = str(document.object_id).split(".")
+                    if new_id == old_id:
+                        self.assertNotEqual(new_isolate, old_isolate)
+                        return
+            self.fail("Chrome did not reuse the old numeric execution context ID")
+
+        async def replace_renderer_after_lookup(connection, frame_id, **options):
+            context = await original_lookup(connection, frame_id, **options)
+            await replace_renderer()
+            return context
+
+        source = (
+            "var wrongFrameVar='unexpected';"
+            "function wrongFrameFunction(){return 'unexpected'};"
+            "window.wrongFrameMarker='unexpected';"
+        )
+        if after_probe:
+            native_send = page.send
+            armed = True
+
+            async def send(command, *args, **kwargs):
+                nonlocal armed
+                packet = next(command)
+
+                def replay():
+                    response = yield packet
+                    try:
+                        command.send(response)
+                    except StopIteration as stop:
+                        return stop.value
+
+                result = await native_send(replay(), *args, **kwargs)
+                params = packet.get("params", {})
+                expression = params.get("expression") or (
+                    params.get("arguments", [{}])[0].get("value", "")
+                )
+                if armed and expression.startswith("(() => {try {"):
+                    armed = False
+                    await replace_renderer()
+                return result
+
+            with patch.object(page, "send", send):
+                result = await s.evaluate_script(source, wait_for_stable=False)
+            self.assertFalse(armed)
+        else:
+            with patch.object(
+                s._frame_contexts, "main_world", replace_renderer_after_lookup
+            ):
+                if internal:
+                    with self.assertRaises((uc.ProtocolException, ValueError)):
+                        await s._evaluate(page, source)
+                    result = "Status: failed"
+                else:
+                    result = await s.evaluate_script(
+                        source, format="script", wait_for_stable=False
+                    )
+        self.assertTrue(replacements)
+        for frame in replacements:
+            document = await resolve_document(frame.id_)
+            value, error = await page.send(
+                uc.cdp.runtime.call_function_on(
+                    "function(){return ['wrongFrameVar','wrongFrameFunction','wrongFrameMarker']"
+                    ".filter(name=>name in this.defaultView)}",
+                    object_id=document.object_id,
+                    return_by_value=True,
+                )
+            )
+            self.assertIsNone(error)
+            self.assertEqual(value.value, [], frame.name)
+        self.assertIn("Status: failed", result)
+
+    async def test_cross_process_frame_context_reuse_cannot_mutate_a_replacement_document(
+        self,
+    ):
+        await self._assert_frame_context_reuse_safe()
+
+    async def test_cross_process_frame_context_reuse_between_probe_and_execution_fails(
+        self,
+    ):
+        await self._assert_frame_context_reuse_safe(after_probe=True)
+
+    async def test_cross_process_frame_context_reuse_does_not_retarget_internal_checks(
+        self,
+    ):
+        await self._assert_frame_context_reuse_safe(internal=True)
+
     async def test_runtime_opt_in_preserves_websocket_events_without_console_serialization(
         self,
     ):
@@ -3511,9 +3663,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
 
                     result = await native_send(replay(), *args, **kwargs)
                     if packet["method"] == (
-                        "Runtime.disable"
-                        if console_shutdown
-                        else "Runtime.releaseObjectGroup"
+                        "Runtime.disable" if console_shutdown else "DOM.resolveNode"
                     ):
                         entered.set()
                         await released.wait()

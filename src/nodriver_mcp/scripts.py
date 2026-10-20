@@ -17,6 +17,14 @@ from .protocol import json_value
 
 logger = logging.getLogger(__name__)
 
+_DOCUMENT_EVALUATION = """function(source) {
+    const view = this.defaultView;
+    if (!view || view.document !== this) {
+        throw new Error('Selected frame document is no longer current; refresh frames and retry.');
+    }
+    return view.eval(source);
+}"""
+
 
 async def prepare_script_call(arguments):
     """Resolve exactly one source before selecting or launching any browser page."""
@@ -126,9 +134,14 @@ async def _execute_with_arguments(tab, source, objects, group):
         ),
         synchronous=True,
     )
+    return await _object_result(tab, result, error, group)
+
+
+async def _object_result(tab, result, error, group, *, await_promise=True):
+    runtime = uc.cdp.runtime
     if error or result.object_id is None or result.type_ in {"function", "symbol"}:
         return result, error
-    if result.subtype == "promise":
+    if result.subtype == "promise" and await_promise:
         return await _execution_command(
             tab,
             runtime.await_promise(result.object_id, return_by_value=True),
@@ -147,6 +160,54 @@ async def _execute_with_arguments(tab, source, objects, group):
     )
 
 
+async def _evaluate_expression(
+    tab,
+    expression,
+    group,
+    *,
+    document_object_id,
+    unique_context_id,
+    timeout,
+    await_promise=True,
+):
+    runtime = uc.cdp.runtime
+    if document_object_id is None:
+        return await _execution_command(
+            tab,
+            runtime.evaluate(
+                expression,
+                unique_context_id=unique_context_id,
+                object_group=group,
+                return_by_value=True,
+                await_promise=await_promise,
+                user_gesture=True,
+                timeout=runtime.TimeDelta(timeout) if timeout else None,
+                allow_unsafe_eval_blocked_by_csp=True,
+            ),
+            synchronous=False,
+        )
+    # callFunctionOn has no native deadline. Bound the synchronous evaluation
+    # separately from awaiting its Promise so cancellation can terminate busy JS
+    # without terminating an idle isolate. Both commands retain the Document.
+    with anyio.fail_after(timeout / 1000 if timeout else None):
+        result, error = await _execution_command(
+            tab,
+            runtime.call_function_on(
+                _DOCUMENT_EVALUATION,
+                object_id=document_object_id,
+                arguments=[runtime.CallArgument(value=expression)],
+                object_group=group,
+                return_by_value=False,
+                await_promise=False,
+                user_gesture=True,
+            ),
+            synchronous=True,
+        )
+        return await _object_result(
+            tab, result, error, group, await_promise=await_promise
+        )
+
+
 async def execute_script(
     tab,
     source,
@@ -154,9 +215,11 @@ async def execute_script(
     *,
     format="auto",
     timeout=0,
-    context_id=None,
+    document_object_id=None,
     unique_context_id=None,
+    resolve_context=None,
     resolve_uid=None,
+    await_promise=True,
 ):
     runtime = uc.cdp.runtime
     group = "nodriver-mcp-script-" + uuid4().hex
@@ -165,6 +228,15 @@ async def execute_script(
             objects = [await resolve_uid(uid, group) for uid in args]
             result, error = await _execute_with_arguments(tab, source, objects, group)
         else:
+            if resolve_context is not None:
+                context = await resolve_context(group)
+                if context is not None:
+                    document_object_id = context.get("document_object_id")
+                    unique_context_id = context.get("unique_context_id")
+                    if document_object_id is None and unique_context_id is None:
+                        raise ValueError(
+                            "Frame execution target is unavailable; refresh frames and retry."
+                        )
             expression = source
             if format in {"auto", "function"}:
                 candidate = source.rstrip().removesuffix(";")
@@ -186,37 +258,27 @@ async def execute_script(
                         + json.dumps("return (\n" + candidate + "\n);")
                         + "); return true; } catch(error) { if(error.name === 'SyntaxError') return false; throw error; }})()"
                     )
-                    parsed, parse_error = await _execution_command(
+                    parsed, parse_error = await _evaluate_expression(
                         tab,
-                        runtime.evaluate(
-                            probe,
-                            context_id=context_id,
-                            unique_context_id=unique_context_id,
-                            object_group=group,
-                            return_by_value=True,
-                            await_promise=False,
-                            timeout=runtime.TimeDelta(timeout) if timeout else None,
-                            allow_unsafe_eval_blocked_by_csp=True,
-                        ),
-                        synchronous=False,
+                        probe,
+                        group,
+                        document_object_id=document_object_id,
+                        unique_context_id=unique_context_id,
+                        timeout=timeout,
+                        await_promise=False,
                     )
                     if parse_error is not None:
                         raise script_error(parse_error)
                     if parsed.value:
                         expression = wrapped
-            result, error = await _execution_command(
+            result, error = await _evaluate_expression(
                 tab,
-                runtime.evaluate(
-                    expression,
-                    context_id=context_id,
-                    unique_context_id=unique_context_id,
-                    object_group=group,
-                    return_by_value=True,
-                    await_promise=True,
-                    user_gesture=True,
-                    timeout=runtime.TimeDelta(timeout) if timeout else None,
-                ),
-                synchronous=False,
+                expression,
+                group,
+                document_object_id=document_object_id,
+                unique_context_id=unique_context_id,
+                timeout=timeout,
+                await_promise=await_promise,
             )
         if error:
             if timeout and error.text.lower() in {
@@ -226,6 +288,10 @@ async def execute_script(
                 raise TimeoutError(f"Script execution exceeded {timeout}ms.")
             raise script_error(error)
         return script_value(result)
+    except TimeoutError as exc:
+        if timeout:
+            raise TimeoutError(f"Script execution exceeded {timeout}ms.") from exc
+        raise
     except uc.ProtocolException as exc:
         if timeout and any(
             text in str(exc).lower()

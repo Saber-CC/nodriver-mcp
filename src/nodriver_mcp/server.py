@@ -45,7 +45,6 @@ from .screenshots import screenshot_clip
 from .scripts import (
     execute_script,
     prepare_script_call,
-    script_error as _script_error,
     script_result,
 )
 from .source_maps import symbolize_message, symbolize_messages
@@ -620,24 +619,17 @@ async def _shutdown_browser() -> None:
 
 
 async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) -> Any:
-    context = await _frame_execution_context(tab)
-    # The high-level helper always requests deep serialization. MCP script
-    # results need ordinary JSON, including false/zero, rather than a deep graph.
-    result, error = await tab.send(
-        uc.cdp.runtime.evaluate(
-            expression,
-            **(context or {}),
-            await_promise=await_promise,
-            return_by_value=True,
-            user_gesture=True,
-        )
+    return await execute_script(
+        tab,
+        expression,
+        None,
+        format="script",
+        await_promise=await_promise,
+        resolve_context=lambda group: _frame_execution_context(tab, object_group=group),
     )
-    if error:
-        raise _script_error(error)
-    return result.value
 
 
-async def _frame_execution_context(tab):
+async def _frame_execution_context(tab, *, object_group):
     root_id = _page_key(tab)
     call = _page_call.get()
     frame_id = (
@@ -656,7 +648,9 @@ async def _frame_execution_context(tab):
     lock = _collection_lock(tab)
     async with lock:
         _check_collection_owner(tab, lock)
-        context = await _frame_contexts.main_world(tab, frame_id)
+        context = await _frame_contexts.main_world(
+            tab, frame_id, object_group=object_group
+        )
         _check_collection_owner(tab, lock)
         return context
 
@@ -1947,14 +1941,13 @@ async def emulate_device(
 async def _evaluate_script_value(
     tab, function: str, args: list[str] | None, *, format="auto", timeout=0
 ):
-    context = await _frame_execution_context(tab) if not args else None
     return await execute_script(
         tab,
         function,
         args,
         format=format,
         timeout=timeout,
-        **(context or {}),
+        resolve_context=lambda group: _frame_execution_context(tab, object_group=group),
         resolve_uid=lambda uid, group: _resolve_uid(tab, uid, object_group=group),
     )
 
@@ -1988,6 +1981,11 @@ async def evaluate_script(
     format=auto invokes a function result or evaluates an expression/script once;
     function/script choose explicitly. file_path saves complete JSON. Oversized
     inline output is saved automatically; max_output_chars bounds its preview.
+    Same-process iframes without explicit Runtime metadata use Document-bound
+    evaluation: top-level let/const do not persist between calls. Keep related
+    declarations in one call or store deliberate shared state on window. Strict
+    eval var/function declarations are also call-local. Do not enable Runtime as
+    a workaround; navigating away fails instead of evaluating in a replacement frame.
     """
     try:
         if dialog_action not in {"accept", "dismiss", "manual"}:
