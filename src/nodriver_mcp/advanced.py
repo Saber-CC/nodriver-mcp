@@ -34,6 +34,89 @@ _SERVICE_WORKER_ROUTER_NOTE = (
 )
 
 
+async def _browser_version_page(browser) -> dict[str, str]:
+    """Read a temporary version page without retaining DOM node handles."""
+    creation = asyncio.create_task(
+        browser.send(uc.cdp.target.create_target("chrome://version/", background=True))
+    )
+    target_id = None
+    tab = None
+    try:
+        async with asyncio.timeout(10):
+            target_id = await asyncio.shield(creation)
+            tab = uc.Tab(target=target_id, parent=browser, auto_attach=False)
+            while True:
+                result, error = await tab.send(
+                    uc.cdp.runtime.evaluate(
+                        """Object.fromEntries(Array.from(document.querySelectorAll('tr'))
+                            .filter(row => row.children.length >= 2)
+                            .map(row => [row.children[0].innerText.trim(),
+                                         row.children[1].innerText.trim()]))""",
+                        return_by_value=True,
+                    )
+                )
+                if error:
+                    raise script_error(error)
+                if result.value:
+                    return result.value
+                await asyncio.sleep(0.05)
+    except TimeoutError as exc:
+        raise TimeoutError("Reading chrome://version timed out after 10000ms") from exc
+    finally:
+        # Keep the creation reply even if the caller cancels while Chrome is
+        # opening the page, so the new target can still be closed.
+        if target_id is None:
+            target_id = await creation
+        try:
+            async with asyncio.timeout(5):
+                await browser.send(uc.cdp.target.close_target(target_id))
+                while any(
+                    target.target_id == target_id
+                    for target in await browser.send(uc.cdp.target.get_targets())
+                ):
+                    await asyncio.sleep(0.05)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                "Temporary chrome://version page did not close within 5000ms"
+            ) from exc
+        finally:
+            if tab is not None:
+                await tab.aclose()
+
+
+async def _extension_tab_target(browser, page):
+    """Resolve a renderer's owning tab without matching ambiguous URLs/titles."""
+    targets = await browser.send(
+        uc.cdp.target.get_targets(
+            filter_=uc.cdp.target.TargetFilter([{"type": "tab"}, {"exclude": True}])
+        )
+    )
+    for target in targets:
+        if target.browser_context_id != page.target.browser_context_id:
+            continue
+        guard = uc.Tab(target=target, parent=browser, auto_attach=False)
+        children = []
+        guard.add_handler(uc.cdp.target.AttachedToTarget, children.append)
+        try:
+            # Auto-attach replays the tab's existing renderers before replying.
+            # The separate connection leaves page/frame collectors untouched.
+            await guard.send(
+                uc.cdp.target.set_auto_attach(
+                    True,
+                    wait_for_debugger_on_start=False,
+                    flatten=True,
+                    filter_=uc.cdp.target.TargetFilter(
+                        [{"type": "page"}, {"exclude": True}]
+                    ),
+                )
+            )
+            if any(event.target_info.target_id == page.target_id for event in children):
+                return target.target_id
+        finally:
+            await guard.aclose()
+    raise ValueError("No owning tab target found for this page; use list_pages.")
+
+
 async def _frame_xpath(connection, frame, expression, timeout, limit):
     """Evaluate XPath against a same-process frame's own Document."""
     deadline = asyncio.get_running_loop().time() + timeout
@@ -98,6 +181,7 @@ def register_tools(mcp, s) -> None:
     subscription_ids = itertools.count(1)
     web_states: dict[int, dict] = {}
     recordings: dict[str, dict] = {}
+    extension_actions = asyncio.Lock()
 
     async def connection(scope: str = "page"):
         if scope == "browser":
@@ -153,7 +237,7 @@ def register_tools(mcp, s) -> None:
         result["nodriver_version"] = uc.__version__
         result["launch"] = s._browser_launch_info()
         if include_version_page:
-            result["version_page"] = await uc.util.get_browser_version_info(browser)
+            result["version_page"] = await _browser_version_page(browser)
         return result
 
     @s._page_tool(
@@ -718,22 +802,6 @@ def register_tools(mcp, s) -> None:
         return f"Cancellation requested for {invocation_id}."
 
     @s._page_tool()
-    async def find_in_page(
-        query: str = "", action: str = "first", *, page_id: int | str | None = None
-    ) -> str:
-        """Use native FindInPage search/highlighting: first, next, previous or stop."""
-        commands = {
-            "first": lambda: uc.cdp.find_in_page.find_first(query),
-            "next": uc.cdp.find_in_page.find_next,
-            "previous": uc.cdp.find_in_page.find_prev,
-            "stop": uc.cdp.find_in_page.stop,
-        }
-        if action not in commands or (action == "first" and not query):
-            raise ValueError("Supply a query for first, or action next/previous/stop.")
-        await (await s._active_tab()).send(commands[action]())
-        return f"Page search: {action}."
-
-    @s._page_tool()
     async def start_screen_recording(
         file_path: str,
         audio: bool = False,
@@ -832,13 +900,19 @@ def register_tools(mcp, s) -> None:
     async def trigger_extension_action(
         extension_id: str, *, page_id: int | str | None = None
     ) -> str:
-        """Trigger an extension's action for the selected page via official CDP."""
+        """Bring the requested page to front and trigger its extension action via CDP."""
         page = await s._page_tab()
-        await (await s._get_browser()).send(
-            uc.cdp.extensions.trigger_action(
-                id_=extension_id, target_id=page.target.target_id
+        browser = await s._get_browser()
+        target_id = await _extension_tab_target(browser, page)
+        async with extension_actions:
+            # Chrome invokes the toolbar action on the window's active tab,
+            # even when triggerAction names another tab in that window.
+            await page.activate()
+            await browser.send(
+                uc.cdp.extensions.trigger_action(
+                    id_=extension_id, target_id=str(target_id)
+                )
             )
-        )
         return "Extension action triggered."
 
     @s._page_tool()

@@ -426,6 +426,84 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                     return
                 await asyncio.sleep(0.05)
 
+    async def test_browser_version_details_do_not_leave_pages_or_change_selection(self):
+        await self.browser.update_targets()
+        before = {str(tab.target_id) for tab in self.browser.tabs}
+        selected = s._selected_target_id
+        for _ in range(2):
+            info = await self.tool("get_browser_info", include_version_page=True)
+            details = info["version_page"]
+            self.assertTrue(details)
+            version = info["product"].split("/", 1)[1]
+            self.assertTrue(any(version in value for value in details.values()))
+            self.assertTrue(
+                any("--remote-debugging-port=" in value for value in details.values())
+            )
+            await self.browser.update_targets()
+            self.assertEqual({str(tab.target_id) for tab in self.browser.tabs}, before)
+            self.assertEqual(s._selected_target_id, selected)
+            self.assertIn("Main input", await s.take_snapshot())
+
+    async def test_navigation_and_new_page_report_final_urls_after_redirects(self):
+        expected = self.url + "net-final"
+        opened = await s.new_page(self.url + "net-redirect")
+        page_id = s._selected_target_id
+        self.assertEqual(
+            opened.splitlines()[0],
+            f"Opened new page: {expected} (page_id={page_id})",
+        )
+        for options, destination in (
+            ({"url": self.url + "interaction"}, self.url + "interaction"),
+            ({"type": "back"}, expected),
+            ({"type": "forward"}, self.url + "interaction"),
+            ({"type": "reload"}, self.url + "interaction"),
+            ({"url": self.url + "net-redirect"}, expected),
+        ):
+            with self.subTest(options=options):
+                result = await s.navigate_page(**options, page_id=page_id)
+                self.assertEqual(result.splitlines()[0], f"Navigated to {destination}")
+        background = await s.new_page(self.url + "net-redirect", background=True)
+        self.assertTrue(
+            background.splitlines()[0].startswith(f"Opened new page: {expected} ")
+        )
+        self.assertEqual(s._selected_target_id, page_id)
+
+    async def test_browser_version_page_cleanup_after_read_failure_and_cancellation(
+        self,
+    ):
+        await self.browser.update_targets()
+        before = {str(tab.target_id) for tab in self.browser.tabs}
+        selected = s._selected_target_id
+        evaluate = uc.cdp.runtime.evaluate
+        with patch.object(
+            uc.cdp.runtime, "evaluate", side_effect=ValueError("Version read failed")
+        ):
+            with self.assertRaisesRegex(ValueError, "Version read failed"):
+                await self.tool("get_browser_info", include_version_page=True)
+        await self.browser.update_targets()
+        self.assertEqual({str(tab.target_id) for tab in self.browser.tabs}, before)
+
+        entered = asyncio.Event()
+
+        def pending(*_args, **_kwargs):
+            entered.set()
+            return evaluate("new Promise(() => {})", await_promise=True)
+
+        with patch.object(uc.cdp.runtime, "evaluate", side_effect=pending):
+            task = asyncio.create_task(
+                self.tool("get_browser_info", include_version_page=True)
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        await self.browser.update_targets()
+        self.assertEqual({str(tab.target_id) for tab in self.browser.tabs}, before)
+        self.assertEqual(s._selected_target_id, selected)
+        self.assertIn("Main input", await s.take_snapshot())
+
     async def test_click_focuses_input_and_emits_trusted_mouse_events(self):
         await s.new_page(self.url + "interaction")
         snapshot = await s.take_snapshot()
@@ -1566,6 +1644,87 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
                             tab, "JSON.parse(sessionStorage.getItem('batchEvents'))"
                         ),
                     )
+
+    async def test_extension_service_worker_action_targets_duplicate_urls(self):
+        extension = Path(self.directory.name) / "action-extension"
+        extension.mkdir()
+        (extension / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "manifest_version": 3,
+                    "name": "Action integration",
+                    "version": "1.0",
+                    "permissions": ["activeTab", "scripting"],
+                    "host_permissions": ["http://127.0.0.1/*"],
+                    "action": {"default_title": "Mark target page"},
+                    "background": {"service_worker": "sw.js"},
+                }
+            )
+        )
+        (extension / "sw.js").write_text(
+            "chrome.action.onClicked.addListener(tab => "
+            "chrome.scripting.executeScript({target:{tabId:tab.id},func:()=>{"
+            "document.body.dataset.extensionAction='clicked';}}));"
+        )
+        extension_id = await self.browser.send(
+            uc.cdp.extensions.load_unpacked(str(extension))
+        )
+        try:
+            first = await s._page_tab()
+            await s.new_page(self.url)
+            second = await s._page_tab()
+            self.assertNotEqual(first.target_id, second.target_id)
+            self.assertEqual(first.target.url, second.target.url)
+            selected = s._selected_target_id
+            for target, untouched in ((first, second), (second, None)):
+                result = await self.tool(
+                    "trigger_extension_action",
+                    extension_id=extension_id,
+                    page_id=str(target.target_id),
+                )
+                self.assertEqual(result, "Extension action triggered.")
+                async with asyncio.timeout(5):
+                    while (
+                        await s._evaluate(
+                            target, "document.body.dataset.extensionAction"
+                        )
+                        != "clicked"
+                    ):
+                        await asyncio.sleep(0.05)
+                if untouched is not None:
+                    self.assertIsNone(
+                        await s._evaluate(
+                            untouched, "document.body.dataset.extensionAction"
+                        )
+                    )
+                self.assertEqual(s._selected_target_id, selected)
+                self.assertIn("Main input", await s.take_snapshot())
+            for target in (first, second):
+                await s._evaluate(
+                    target, "delete document.body.dataset.extensionAction"
+                )
+            await asyncio.gather(
+                *(
+                    self.tool(
+                        "trigger_extension_action",
+                        extension_id=extension_id,
+                        page_id=str(target.target_id),
+                    )
+                    for target in (first, second)
+                )
+            )
+            for target in (first, second):
+                async with asyncio.timeout(5):
+                    while (
+                        await s._evaluate(
+                            target, "document.body.dataset.extensionAction"
+                        )
+                        != "clicked"
+                    ):
+                        await asyncio.sleep(0.05)
+            self.assertEqual(s._selected_target_id, selected)
+        finally:
+            await self.browser.send(uc.cdp.extensions.uninstall(extension_id))
 
     async def test_extension_service_worker_discovery_scripts_logs_and_retirement(self):
         extension = Path(self.directory.name) / "test-extension"
