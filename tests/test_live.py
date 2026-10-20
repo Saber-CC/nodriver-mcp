@@ -149,6 +149,19 @@ class Handler(BaseHTTPRequestHandler):
                 b'<input aria-label="Frame input"><button>Frame button</button>',
                 "text/html",
             )
+        elif self.path.startswith("/nested-outer"):
+            data, content_type = (
+                b"<script>window.frameLevel='outer'</script>"
+                b"<iframe name='nested-child' src='/nested-inner'></iframe>",
+                "text/html",
+            )
+        elif self.path.startswith("/nested-inner"):
+            data, content_type = (
+                b"<script>window.frameLevel='inner';let frameLexical=42;</script>"
+                b"<button>Nested inner marker</button>"
+                b"<input aria-label='Nested input'>",
+                "text/html",
+            )
         elif self.path.startswith("/interaction"):
             data, content_type = (
                 b"""<title>Interaction regression</title>
@@ -354,6 +367,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         logging.getLogger().setLevel(logging.ERROR)
+        s._browser_lock = asyncio.Lock()
         self.directory = tempfile.TemporaryDirectory(prefix="nodriver-mcp-integration-")
         self.env = patch.dict(
             os.environ,
@@ -2812,3 +2826,331 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         result = await self.tool("create_browser_context", name="native-created")
         self.assertIn("Created", result)
         self.assertIsNotNone((await s._page_tab()).target.browser_context_id)
+
+    async def test_same_process_frame_scripts_use_main_world_and_preserve_logs(self):
+        page = await s._page_tab()
+
+        async def load_frame(value):
+            html = (
+                '<meta http-equiv="Content-Security-Policy" content="script-src \'nonce-fixture\'">'
+                '<script nonce="fixture">'
+                f"let frameLexical={value};window.frameApp={{answer:{value}}};"
+                "function frameAnswer(){return frameLexical};"
+                'console.log("before-frame-world");</script>'
+                '<input aria-label="World field">'
+            )
+            await page.send(
+                uc.cdp.runtime.evaluate(
+                    "new Promise(resolve=>{const frame=document.querySelector('iframe');"
+                    "frame.onload=()=>resolve(true);frame.srcdoc="
+                    + json.dumps(html)
+                    + ";})",
+                    await_promise=True,
+                )
+            )
+
+        await load_frame(42)
+        frames = await self.tool("list_frames")
+        frame = next(frame for frame in frames if frame["name"] == "child")
+        self.assertFalse(frame["separate_connection"])
+        await self.tool("select_frame", frame_id=frame["frame_id"])
+        for value in (42, 84):
+            if value == 84:
+                await load_frame(value)
+            result = await s.evaluate_script(
+                "() => [window.frameApp.answer,frameLexical,frameAnswer()]",
+                wait_for_stable=False,
+            )
+            self.assertIn("Status: completed", result)
+            self.assertEqual(json.loads(result.splitlines()[1]), [value] * 3)
+            self.assertEqual(
+                await s._evaluate(await s._active_tab(), "frameAnswer()"), value
+            )
+        await s.evaluate_script(
+            "var frameCreated=21", format="script", wait_for_stable=False
+        )
+        self.assertIn(
+            "42", await s.evaluate_script("frameCreated*2", wait_for_stable=False)
+        )
+        await s.enable_console_collection(source_maps=True)
+        self.assertTrue(
+            any(m["text"] == "before-frame-world" for m in s._console_messages)
+        )
+        await s.disable_console_collection()
+        self.assertIn(
+            "84", await s.evaluate_script("frameAnswer()", wait_for_stable=False)
+        )
+
+    async def test_cross_process_nested_frames_route_scripts_and_elements(self):
+        page = await s._page_tab()
+        outer_url = f"http://localhost:{self.http.server_port}/nested-outer"
+        await page.send(
+            uc.cdp.runtime.evaluate(
+                "new Promise(resolve=>{const frame=document.querySelector('iframe');"
+                "frame.onload=()=>resolve(true);frame.src="
+                + json.dumps(outer_url)
+                + ";})",
+                await_promise=True,
+            )
+        )
+        frames = await self.tool("list_frames")
+        outer = next(frame for frame in frames if frame["url"] == outer_url)
+        inner = next(
+            frame for frame in frames if frame["url"].endswith("/nested-inner")
+        )
+        self.assertTrue(inner["separate_connection"])
+        self.assertEqual(inner["parent_id"], outer["frame_id"])
+        self.assertIn("Nested inner marker", await s.take_snapshot(include_frames=True))
+        await self.tool("select_frame", frame_id=inner["frame_id"])
+        connection = await s._active_tab()
+        self.assertEqual(str(connection.target_id), outer["frame_id"])
+        result = await s.evaluate_script(
+            "() => [frameLevel,frameLexical]", wait_for_stable=False
+        )
+        self.assertIn("Status: completed", result)
+        self.assertEqual(json.loads(result.splitlines()[1]), ["inner", 42])
+        self.assertEqual(await s._evaluate(connection, "frameLevel"), "inner")
+        self.assertIn("Nested inner marker", await s.take_snapshot())
+        for query in (
+            {"selector": "input"},
+            {"text": "Nested inner marker"},
+            {"xpath": "//input", "timeout": 0},
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(await self.tool("find_elements", **query))
+        field = (await self.tool("find_elements", selector="input"))[0]["uid"]
+        self.assertNotIn("Error", await s.click(field))
+        self.assertEqual(
+            await s._evaluate(connection, "document.activeElement.tagName"), "INPUT"
+        )
+        self.assertNotIn("Error", await s.fill(field, "nested-value"))
+        self.assertIn(
+            "nested-value",
+            await s.evaluate_script(
+                "document.querySelector('input').value", wait_for_stable=False
+            ),
+        )
+
+    async def test_concurrent_console_enable_is_idempotent_and_disable_stops_logs(self):
+        page = await s._page_tab()
+        page_id = str(page.target_id)
+        await asyncio.gather(
+            *(s.enable_console_collection(page_id=page_id) for _ in range(3))
+        )
+        self.assertEqual(len(page.handlers[uc.cdp.runtime.ConsoleAPICalled]), 1)
+        await s.evaluate_script(
+            "console.log('single-concurrent-log')", wait_for_stable=False
+        )
+        self.assertEqual(
+            sum(m["text"] == "single-concurrent-log" for m in s._console_messages), 1
+        )
+        await s.disable_console_collection(page_id=page_id)
+        self.assertFalse(page.handlers[uc.cdp.runtime.ConsoleAPICalled])
+        await s.evaluate_script(
+            "console.log('after-concurrent-disable')", wait_for_stable=False
+        )
+        self.assertFalse(
+            any(m["text"] == "after-concurrent-disable" for m in s._console_messages)
+        )
+
+    async def test_native_script_cancellation_restores_page_for_busy_and_idle_calls(
+        self,
+    ):
+        page = await s._page_tab()
+        for source, format in (
+            ("while(true){}", "script"),
+            ("() => {while(true){}}", "function"),
+            ("async () => {await Promise.resolve();while(true){}}", "auto"),
+            ("new Promise(() => {})", "script"),
+        ):
+            with self.subTest(source=source):
+                task = asyncio.create_task(
+                    s.evaluate_script(
+                        source, format=format, timeout=0, wait_for_stable=False
+                    )
+                )
+                await asyncio.sleep(0.15)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                responsive = False
+                try:
+                    result = await asyncio.wait_for(
+                        s.evaluate_script("42", wait_for_stable=False), 2
+                    )
+                    self.assertIn("Status: completed", result)
+                    self.assertEqual(json.loads(result.splitlines()[1]), 42)
+                    responsive = True
+                finally:
+                    if not responsive:
+                        await asyncio.wait_for(
+                            page.send(uc.cdp.runtime.terminate_execution()), 1
+                        )
+
+    async def test_concurrent_named_context_pages_share_cookies_and_close_together(
+        self,
+    ):
+        browser = await s._get_browser()
+        results = await asyncio.gather(
+            *(
+                s.new_page(self.url, background=True, isolated_context="shared-review")
+                for _ in range(2)
+            )
+        )
+        ids = [
+            re.search(r"page_id=([^)]*)", result.splitlines()[0]).group(1)
+            for result in results
+        ]
+        pages = [
+            next(tab for tab in browser.tabs if str(tab.target_id) == page_id)
+            for page_id in ids
+        ]
+        self.assertEqual(
+            pages[0].target.browser_context_id, pages[1].target.browser_context_id
+        )
+        self.assertEqual(
+            pages[0].target.browser_context_id,
+            s._named_browser_contexts["shared-review"],
+        )
+        await s.set_cookie("shared-review-cookie", "yes", "127.0.0.1", page_id=ids[0])
+        self.assertIn("shared-review-cookie", await s.get_cookies(page_id=ids[1]))
+        await self.tool("close_browser_context", name="shared-review")
+        await browser.update_targets()
+        self.assertFalse(any(str(tab.target_id) in ids for tab in browser.tabs))
+        self.assertNotIn("shared-review", s._named_browser_contexts)
+
+    async def test_concurrent_explicit_context_creation_rejects_duplicate_name(self):
+        results = await asyncio.gather(
+            *(
+                self.tool("create_browser_context", name="explicit-review")
+                for _ in range(2)
+            ),
+            return_exceptions=True,
+        )
+        self.assertEqual(sum(isinstance(result, ValueError) for result in results), 1)
+        self.assertEqual(
+            sum(isinstance(result, str) and "Created" in result for result in results),
+            1,
+        )
+        browser = await s._get_browser()
+        contexts, _ = await browser.send(uc.cdp.target.get_browser_contexts())
+        self.assertEqual(
+            [str(context) for context in contexts],
+            [str(s._named_browser_contexts["explicit-review"])],
+        )
+        await self.tool("close_browser_context", name="explicit-review")
+
+    async def test_start_browser_reuses_actual_default_context_and_selected_page(self):
+        browser = await s._get_browser()
+        await browser.update_targets()
+        count = len(browser.tabs)
+        selected = str((await s._page_tab()).target_id)
+        for url in (self.url + "interaction", ""):
+            result = await s.start_browser(url=url)
+            self.assertEqual(result["status"], "reused")
+            self.assertEqual(result["page_id"], selected)
+            self.assertEqual(result["url"], self.url + "interaction")
+            self.assertEqual(len(browser.tabs), count)
+        await self.tool("create_browser_context", name="isolated-review")
+        result = await s.start_browser()
+        self.assertEqual(
+            result["page_id"],
+            selected if count == 1 else str(browser.main_tab.target_id),
+        )
+        self.assertEqual(
+            (await s._page_tab()).target.browser_context_id,
+            s._default_browser_context_id,
+        )
+
+    async def test_frame_runtime_cleanup_serializes_new_event_subscriptions(self):
+        page = await s._page_tab()
+        frames = await self.tool("list_frames")
+        child = next(frame for frame in frames if frame["name"] == "child")
+        await self.tool("select_frame", frame_id=child["frame_id"])
+        for console_shutdown in (False, True):
+            with self.subTest(console_shutdown=console_shutdown):
+                if console_shutdown:
+                    await s.enable_console_collection()
+                entered, released = asyncio.Event(), asyncio.Event()
+                native_send = page.send
+
+                async def send(command, *args, **kwargs):
+                    packet = next(command)
+
+                    def replay():
+                        response = yield packet
+                        try:
+                            command.send(response)
+                        except StopIteration as stop:
+                            return stop.value
+
+                    result = await native_send(replay(), *args, **kwargs)
+                    if packet["method"] == "Runtime.disable":
+                        entered.set()
+                        await released.wait()
+                    return result
+
+                pending = []
+                with patch.object(page, "send", send):
+                    operation = asyncio.create_task(
+                        s.disable_console_collection()
+                        if console_shutdown
+                        else s.evaluate_script("document.URL", wait_for_stable=False)
+                    )
+                    pending.append(operation)
+                    try:
+                        await asyncio.wait_for(entered.wait(), 2)
+                        subscription = asyncio.create_task(
+                            self.tool(
+                                "subscribe_cdp_events",
+                                events=["Runtime.ConsoleAPICalled"],
+                            )
+                        )
+                        pending.append(subscription)
+                        await asyncio.sleep(0.03)
+                        self.assertFalse(subscription.done())
+                        released.set()
+                        outcome, identifier = await asyncio.gather(
+                            operation, subscription
+                        )
+                        self.assertNotIn("Error", outcome)
+                    finally:
+                        released.set()
+                        for task in pending:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                result = await s.evaluate_script("document.URL", wait_for_stable=False)
+                self.assertIn("Status: completed", result)
+                marker = "subscription-after-cleanup-" + str(console_shutdown)
+                await s.evaluate_script(
+                    f"console.log({json.dumps(marker)})", wait_for_stable=False
+                )
+                events = await self.tool("get_cdp_events", subscription_id=identifier)
+                self.assertTrue(any(marker in json.dumps(event) for event in events))
+                await self.tool("unsubscribe_cdp_events", subscription_id=identifier)
+
+    async def test_frame_lookup_preserves_explicit_runtime_domain_ownership(self):
+        page = await s._page_tab()
+        await self.tool("send_cdp_command", domain="Runtime", command="enable")
+        self.assertTrue(s._frame_contexts.state(page)["runtime_requested"])
+        child = next(
+            frame
+            for frame in await self.tool("list_frames")
+            if frame["name"] == "child"
+        )
+        await self.tool("select_frame", frame_id=child["frame_id"])
+        for _ in range(2):
+            result = await s.evaluate_script("document.URL", wait_for_stable=False)
+            self.assertIn("Status: completed", result)
+            self.assertTrue(s._frame_contexts.state(page)["contexts"])
+        await s.enable_console_collection()
+        await s.disable_console_collection()
+        self.assertTrue(s._frame_contexts.state(page)["contexts"])
+        await self.tool("send_cdp_command", domain="Runtime", command="disable")
+        self.assertFalse(s._frame_contexts.state(page)["runtime_requested"])
+        self.assertFalse(s._frame_contexts.state(page)["contexts"])
+        self.assertIn(
+            "Status: completed",
+            await s.evaluate_script("document.URL", wait_for_stable=False),
+        )

@@ -6,8 +6,10 @@ import asyncio
 import inspect
 import itertools
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import nodriver as uc
 
@@ -19,6 +21,7 @@ from .protocol import (
     json_value,
     resolve_event,
 )
+from .scripts import script_error
 
 
 _SERVICE_WORKER_ROUTER_NOTE = (
@@ -29,6 +32,64 @@ _SERVICE_WORKER_ROUTER_NOTE = (
     "match. Do not infer a website's cache/network routing solely from these "
     "records; check actual request behavior. Chrome's own routing is unaffected."
 )
+
+
+async def _frame_xpath(connection, frame, expression, timeout, limit):
+    """Evaluate XPath against a same-process frame's own Document."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        group = "nodriver-mcp-xpath-" + uuid4().hex
+        try:
+            document = await connection.send(
+                uc.cdp.dom.resolve_node(
+                    backend_node_id=frame.content_document.backend_node_id,
+                    object_group=group,
+                )
+            )
+            result, error = await connection.send(
+                uc.cdp.runtime.call_function_on(
+                    """function(expression, limit) {
+                        const result = this.evaluate(expression, this, null, 7, null);
+                        const nodes = [];
+                        for (let i=0; i<result.snapshotLength && nodes.length<limit; i++) {
+                            const item = result.snapshotItem(i);
+                            const node = item.nodeType === 1 ? item : item.parentElement || item.ownerElement;
+                            if (node) nodes.push(node);
+                        }
+                        return nodes;
+                    }""",
+                    object_id=document.object_id,
+                    arguments=[
+                        uc.cdp.runtime.CallArgument(value=expression),
+                        uc.cdp.runtime.CallArgument(value=limit),
+                    ],
+                    object_group=group,
+                )
+            )
+            if error:
+                raise script_error(error)
+            properties, *_ = await connection.send(
+                uc.cdp.runtime.get_properties(result.object_id, own_properties=True)
+            )
+            elements = []
+            for prop in properties:
+                if prop.name.isdecimal() and prop.value and prop.value.object_id:
+                    node = await connection.send(
+                        uc.cdp.dom.describe_node(
+                            object_id=prop.value.object_id, depth=-1, pierce=True
+                        )
+                    )
+                    elements.append(uc.Element(node, connection))
+            if elements or asyncio.get_running_loop().time() >= deadline:
+                return elements
+        finally:
+            try:
+                await asyncio.wait_for(
+                    connection.send(uc.cdp.runtime.release_object_group(group)), 0.5
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
 
 
 def register_tools(mcp, s) -> None:
@@ -177,7 +238,9 @@ def register_tools(mcp, s) -> None:
         page = await s._page_tab()
         frame_id = s._selected_frame_id(page)
         frame_element = (
-            await s._frame_element(page, frame_id) if frame_id and tab is page else None
+            await s._frame_element(tab, frame_id)
+            if frame_id and frame_id != str(tab.target_id)
+            else None
         )
         if text:
             if best_match and frame_element is None:
@@ -195,6 +258,8 @@ def register_tools(mcp, s) -> None:
                     if elements or asyncio.get_running_loop().time() >= deadline:
                         break
                     await asyncio.sleep(0.05)
+        elif frame_element is not None:
+            elements = await _frame_xpath(tab, frame_element, xpath, timeout, limit)
         else:
             try:
                 elements = await tab.xpath(xpath, timeout=timeout)
@@ -250,41 +315,45 @@ def register_tools(mcp, s) -> None:
         name: str, proxy_server: str = "", proxy_bypass_list: list[str] | None = None
     ) -> str:
         """Use native Browser.create_context, including authenticated HTTP/SOCKS proxies."""
-        if not name or name in s._named_browser_contexts:
+        if not name:
             raise ValueError("Supply a new, nonempty context name.")
-        browser = await s._get_browser()
-        tab = await browser.create_context(
-            url="about:blank",
-            new_tab=False,
-            new_window=True,
-            proxy_server=proxy_server or None,
-            proxy_bypass_list=",".join(proxy_bypass_list)
-            if proxy_bypass_list
-            else None,
-        )
-        s._named_browser_contexts[name] = tab.target.browser_context_id
-        s._selected_target_id = str(tab.target_id)
-        await s._prepare_page(tab)
-        await s._auto_enable_network_collection(tab)
+        async with s._browser_lock:
+            browser = await s._ensure_browser()
+            if name in s._named_browser_contexts:
+                raise ValueError("Supply a new, nonempty context name.")
+            tab = await browser.create_context(
+                url="about:blank",
+                new_tab=False,
+                new_window=True,
+                proxy_server=proxy_server or None,
+                proxy_bypass_list=",".join(proxy_bypass_list)
+                if proxy_bypass_list
+                else None,
+            )
+            s._named_browser_contexts[name] = tab.target.browser_context_id
+            s._selected_target_id = str(tab.target_id)
+            await s._prepare_page(tab)
+            await s._auto_enable_network_collection(tab)
         return f"Created and selected context '{name}'." + await s._format_pages()
 
     @mcp.tool()
     async def close_browser_context(name: str) -> str:
         """Dispose a named isolated context and its pages through official CDP."""
-        context = s._named_browser_contexts.get(name)
-        if context is None:
-            raise ValueError("Unknown context name.")
-        browser = await s._get_browser()
-        await browser.update_targets()
-        pages = [
-            tab for tab in browser.tabs if tab.target.browser_context_id == context
-        ]
-        await browser.send(uc.cdp.target.dispose_browser_context(context))
-        for page in pages:
-            await s._forget_page_state(page)
-            await page.aclose()
-        del s._named_browser_contexts[name]
-        await browser.update_targets()
+        async with s._browser_lock:
+            browser = await s._ensure_browser()
+            context = s._named_browser_contexts.get(name)
+            if context is None:
+                raise ValueError("Unknown context name.")
+            await browser.update_targets()
+            pages = [
+                tab for tab in browser.tabs if tab.target.browser_context_id == context
+            ]
+            await browser.send(uc.cdp.target.dispose_browser_context(context))
+            for page in pages:
+                await s._forget_page_state(page)
+                await page.aclose()
+            del s._named_browser_contexts[name]
+            await browser.update_targets()
         return f"Closed context '{name}'." + await s._format_pages()
 
     @s._page_tool()
@@ -378,11 +447,23 @@ def register_tools(mcp, s) -> None:
         """
         generator = build_command(domain, command, parameters)
         target = await connection(scope)
-        return json_value(
-            await s._await_with_timeout(
+        runtime_switch = domain_module(
+            domain
+        ) is uc.cdp.runtime and generator.gi_code.co_name in {"enable", "disable"}
+        lock = s._collection_lock(target) if runtime_switch else None
+        async with lock if lock is not None else nullcontext():
+            if runtime_switch:
+                s._check_collection_owner(target, lock)
+                if generator.gi_code.co_name == "disable":
+                    s._frame_contexts.request_runtime(target, False)
+            result = await s._await_with_timeout(
                 target.send(generator), timeout, f"{domain}.{command}"
             )
-        )
+            if runtime_switch:
+                s._check_collection_owner(target, lock)
+                if generator.gi_code.co_name == "enable":
+                    s._frame_contexts.request_runtime(target, True)
+            return json_value(result)
 
     @mcp.tool()
     async def list_cdp_events(domain: str = "") -> list[dict]:
@@ -422,6 +503,16 @@ def register_tools(mcp, s) -> None:
             raise ValueError("Supply events and a buffer_size between 1 and 10000.")
         parsed = [resolve_event(name) for name in events]
         target = await connection(scope)
+        lock = s._collection_lock(target)
+        async with lock:
+            s._check_collection_owner(target, lock)
+            return await start_subscription(
+                parsed, target, scope, enable_domain, buffer_size, lock
+            )
+
+    async def start_subscription(
+        parsed, target, scope, enable_domain, buffer_size, lock
+    ):
         entry = {
             "connection": target,
             "page_id": s._page_key(target) if scope == "page" else None,
@@ -461,9 +552,11 @@ def register_tools(mcp, s) -> None:
                                 f"Enable {domain} with send_cdp_command first."
                             ) from exc
                         await target.send(enable())
+            s._check_collection_owner(target, lock)
         except BaseException:
             for cls, callback in entry["callbacks"]:
-                target.remove_handler(cls, callback)
+                if callback in target.handlers.get(cls, []):
+                    target.remove_handler(cls, callback)
             raise
         identifier = str(next(subscription_ids))
         subscriptions[identifier] = entry
@@ -507,9 +600,14 @@ def register_tools(mcp, s) -> None:
             raise ValueError(
                 "Subscription belongs to a different page_id or browser scope."
             )
-        del subscriptions[subscription_id]
-        for cls, callback in entry["callbacks"]:
-            entry["connection"].remove_handler(cls, callback)
+        target = entry["connection"]
+        lock = s._collection_lock(target)
+        async with lock:
+            s._check_collection_owner(target, lock)
+            if subscriptions.pop(subscription_id, None) is not entry:
+                raise ValueError("Unknown subscription_id.")
+            for cls, callback in entry["callbacks"]:
+                target.remove_handler(cls, callback)
         return "Subscription removed."
 
     async def web_state():

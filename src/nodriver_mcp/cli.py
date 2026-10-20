@@ -12,7 +12,6 @@ Usage:
 """
 
 import argparse
-import sys
 
 from .installer import (
     list_available_clients,
@@ -45,7 +44,9 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command")
 
-    install_parser = subparsers.add_parser("install", help="Install MCP server to clients")
+    install_parser = subparsers.add_parser(
+        "install", help="Install MCP server to clients"
+    )
     install_parser.add_argument(
         "targets",
         nargs="?",
@@ -53,13 +54,23 @@ def main():
         help="Comma-separated client list, e.g. claude,cursor,kiro. Leave empty for interactive mode",
     )
 
-    uninstall_parser = subparsers.add_parser("uninstall", help="Uninstall MCP server from clients")
+    uninstall_parser = subparsers.add_parser(
+        "uninstall", help="Uninstall MCP server from clients"
+    )
     uninstall_parser.add_argument(
         "targets",
         nargs="?",
         default="",
         help="Comma-separated client list",
     )
+
+    for command_parser in (install_parser, uninstall_parser):
+        command_parser.add_argument(
+            "--scope",
+            choices=["global", "project"],
+            default=argparse.SUPPRESS,
+            help="Installation scope: global (user-level) or project (current directory)",
+        )
 
     args = parser.parse_args()
 
@@ -89,4 +100,5 @@ def main():
 
     # Default: run the MCP server
     from .server import main as server_main
+
     server_main()

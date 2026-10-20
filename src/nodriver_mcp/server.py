@@ -17,7 +17,7 @@ import os
 import sys
 import time
 import weakref
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 from importlib.metadata import version as package_version
@@ -32,6 +32,7 @@ from pydantic import StrictBool, ValidationError
 
 from .actions import ActionResult, ActionWaiter
 from .console import ConsoleCollector, format_message, format_stack
+from .contexts import FrameContexts
 from .dialogs import DialogInterrupted, DialogRegistry
 from .emulation import EmulationOverrides, FrameOverrides, http_headers, media_updates
 from .forms import control_state, fill_text, fill_toggle
@@ -64,6 +65,7 @@ _browser: uc.Browser | None = None
 _browser_lock = asyncio.Lock()
 _launch_options: LaunchOptions | None = None
 _profile_lease: ProfileLease | None = None
+_default_browser_context_id = None
 _file_uploads = FileUploads()
 _dialog_state = DialogRegistry()
 
@@ -79,6 +81,7 @@ async def _ensure_browser(
 ) -> uc.Browser:
     """Start/reconfigure the browser while the caller owns _browser_lock."""
     global _browser, _selected_target_id, _launch_options, _profile_lease
+    global _default_browser_context_id
     options = options or _launch_options or LaunchOptions.resolve()
     if (
         _browser is not None
@@ -101,6 +104,7 @@ async def _ensure_browser(
         for extension in options.extensions:
             config.add_extension(extension)
         await _browser.start()
+        _default_browser_context_id = _browser.main_tab.target.browser_context_id
         _selected_target_id = str(_browser.main_tab.target_id)
         await _prepare_page(_browser.main_tab)
         await _auto_enable_network_collection(_browser.main_tab)
@@ -390,6 +394,7 @@ _frame_loaders: dict[tuple[str, str], str] = {}
 _frame_discovery_locks: dict[str, asyncio.Lock] = {}
 _console_callbacks: dict[int, ConsoleCollector] = {}
 _network_callbacks: dict[int, NetworkCollector] = {}
+_collection_locks: dict[int, tuple[Any, asyncio.Lock]] = {}
 _uid_owners: dict[str, tuple[str, uc.Tab, str]] = {}
 _request_ids = itertools.count()
 _message_ids = itertools.count()
@@ -404,6 +409,7 @@ _emulation_overrides = EmulationOverrides(
     lambda tab: _auto_enable_network_collection(tab)
 )
 _frame_overrides = FrameOverrides(_emulation_overrides)
+_frame_contexts = FrameContexts()
 
 
 async def _prepare_page(tab: uc.Tab) -> None:
@@ -412,6 +418,7 @@ async def _prepare_page(tab: uc.Tab) -> None:
     if reference is not None and reference() is tab:
         return
     await tab.send(uc.cdp.emulation.set_focus_emulation_enabled(True))
+    _frame_contexts.watch(tab)
     _dialog_state.watch(tab, str(tab.target_id))
 
     def retired(reference):
@@ -439,6 +446,8 @@ def _tab_key(tab: uc.Tab) -> int:
 def _clear_collection_state(tab: uc.Tab) -> None:
     """Remove this connection's collectors before retiring its transport."""
     key = _tab_key(tab)
+    _collection_locks.pop(key, None)
+    _frame_contexts.forget(tab)
     _focused_pages.pop(key, None)
     _emulation_overrides.retire(tab)
     _dialog_state.forget(tab)
@@ -493,6 +502,7 @@ async def _forget_page_state(tab: uc.Tab) -> None:
 async def _shutdown_browser() -> None:
     global _browser, _selected_target_id, _tracing_active, _trace_tab, _trace_stopping
     global _launch_options, _profile_lease, _trace_metadata
+    global _default_browser_context_id
     for callback in _shutdown_callbacks:
         try:
             await callback()
@@ -502,6 +512,7 @@ async def _shutdown_browser() -> None:
     browser, _browser = _browser, None
     lease, _profile_lease = _profile_lease, None
     _launch_options = None
+    _default_browser_context_id = None
     connections = list(_frame_connections.values()) + list(
         _worker_targets.connections.values()
     )
@@ -553,6 +564,7 @@ async def _shutdown_browser() -> None:
         _frame_discovery_locks,
         _console_callbacks,
         _network_callbacks,
+        _collection_locks,
         _focused_pages,
         _uid_owners,
         _uid_to_backend_node_id,
@@ -565,6 +577,7 @@ async def _shutdown_browser() -> None:
         state.clear()
     _selected_target_id = None
     _dialog_state.clear()
+    _frame_contexts.clear()
     _emulation_overrides.clear()
     _worker_targets.clear()
     _tracing_active = False
@@ -574,29 +587,13 @@ async def _shutdown_browser() -> None:
 
 
 async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) -> Any:
-    frame_id = _selected_frame_id(tab)
-    if frame_id and str(tab.target_id) == _page_key(tab):
-        context = await tab.send(
-            uc.cdp.page.create_isolated_world(
-                uc.cdp.page.FrameId(frame_id), world_name="nodriver-mcp"
-            )
-        )
-        result, error = await tab.send(
-            uc.cdp.runtime.evaluate(
-                expression,
-                context_id=context,
-                await_promise=await_promise,
-                return_by_value=True,
-            )
-        )
-        if error:
-            raise _script_error(error)
-        return result.value
+    context = await _frame_execution_context(tab)
     # The high-level helper always requests deep serialization. MCP script
     # results need ordinary JSON, including false/zero, rather than a deep graph.
     result, error = await tab.send(
         uc.cdp.runtime.evaluate(
             expression,
+            unique_context_id=context,
             await_promise=await_promise,
             return_by_value=True,
             user_gesture=True,
@@ -605,6 +602,30 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
     if error:
         raise _script_error(error)
     return result.value
+
+
+async def _frame_execution_context(tab):
+    root_id = _page_key(tab)
+    call = _page_call.get()
+    frame_id = (
+        call.frame_id
+        if call is not None
+        and call.page is not None
+        and str(call.page.target_id) == root_id
+        else _selected_frames.get(root_id)
+    )
+    if (
+        not frame_id
+        or frame_id == str(tab.target_id)
+        or _frame_connections.get((root_id, frame_id)) is not tab
+    ):
+        return None
+    lock = _collection_lock(tab)
+    async with lock:
+        _check_collection_owner(tab, lock)
+        context = await _frame_contexts.main_world(tab, frame_id)
+        _check_collection_owner(tab, lock)
+        return context
 
 
 async def _tab_for_uid(uid: str, *, refresh: bool = True) -> uc.Tab:
@@ -682,6 +703,7 @@ async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
         discovered = {
             str(frame.id_): (frame, page) for frame in uc.util.flatten_frame_tree(tree)
         }
+        owners = {str(tree.frame.id_): page}
         for native in await page.get_frames():
             frame_id = str(native.target_id)
             cached = _frame_connections.get((root_id, frame_id))
@@ -709,7 +731,27 @@ async def _discover_frames(page: uc.Tab) -> list[tuple[Any, uc.Tab]]:
                 frame = dataclasses.replace(
                     frame, parent_id=native.target.parent_frame_id
                 )
-            discovered[str(frame.id_)] = (frame, connection)
+            _frame_contexts.watch(connection)
+            subtree = dataclasses.replace(subtree, frame=frame)
+            for child in uc.util.flatten_frame_tree(subtree):
+                discovered[str(child.id_)] = (child, page)
+            owners[str(frame.id_)] = connection
+
+        def frame_connection(frame_id):
+            if frame_id in owners:
+                return owners[frame_id]
+            frame = discovered[frame_id][0]
+            parent_id = str(frame.parent_id) if frame.parent_id else None
+            connection = (
+                frame_connection(parent_id) if parent_id in discovered else page
+            )
+            owners[frame_id] = connection
+            return connection
+
+        discovered = {
+            frame_id: (frame, frame_connection(frame_id))
+            for frame_id, (frame, _) in discovered.items()
+        }
 
         retired = {}
         for frame_id, (frame, connection) in discovered.items():
@@ -963,13 +1005,48 @@ def _preserve_on_navigation(tab: uc.Tab) -> None:
 # ---------------------------------------------------------------------------
 # Auto-collection for network (console collection is explicit)
 # ---------------------------------------------------------------------------
+def _collection_lock(tab):
+    key = _tab_key(tab)
+    entry = _collection_locks.get(key)
+    if entry is not None and entry[0]() is tab:
+        return entry[1]
+
+    def retired(reference):
+        current = _collection_locks.get(key)
+        if current is not None and current[0] is reference:
+            _collection_locks.pop(key, None)
+
+    lock = asyncio.Lock()
+    _collection_locks[key] = (weakref.ref(tab, retired), lock)
+    return lock
+
+
+def _owns_collection(tab, lock):
+    entry = _collection_locks.get(_tab_key(tab))
+    return entry is not None and entry[0]() is tab and entry[1] is lock
+
+
+def _check_collection_owner(tab, lock):
+    if not _owns_collection(tab, lock):
+        raise ValueError("Connection was retired during collection initialization.")
+
+
 async def _auto_enable_network_collection(tab: uc.Tab) -> None:
     """Collect typed network events on their originating connection."""
+    lock = _collection_lock(tab)
+    async with lock:
+        _check_collection_owner(tab, lock)
+        await _start_network_collection(tab, lock)
+
+
+async def _start_network_collection(tab, lock):
     key = _tab_key(tab)
     if key in _network_collection_enabled_tabs:
         return
 
     def collect(record):
+        if not _owns_collection(tab, lock):
+            return
         record.update(reqid=next(_request_ids), page_id=_page_key(tab), connection=tab)
         _network_requests.append(record)
         own = [r for r in _network_requests if r["page_id"] == record["page_id"]]
@@ -980,7 +1057,12 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             ]
 
     collector = NetworkCollector(tab, collect)
-    await collector.enable()
+    try:
+        await collector.enable()
+        _check_collection_owner(tab, lock)
+    except BaseException:
+        collector.remove()
+        raise
     _network_callbacks[key] = collector
     _network_collection_enabled_tabs.add(key)
 
@@ -988,6 +1070,13 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
 async def _enable_console_collection(
     tab: uc.Tab, source_maps: bool | None = None
 ) -> bool:
+    lock = _collection_lock(tab)
+    async with lock:
+        _check_collection_owner(tab, lock)
+        return await _start_console_collection(tab, source_maps, lock)
+
+
+async def _start_console_collection(tab, source_maps, lock):
     key = _tab_key(tab)
     if key in _console_collection_enabled_tabs:
         collector = _console_callbacks[key]
@@ -995,9 +1084,12 @@ async def _enable_console_collection(
             await collector.source_maps.enable()
         elif source_maps is False:
             await collector.source_maps.disable()
+        _check_collection_owner(tab, lock)
         return False
 
     def collect(record):
+        if not _owns_collection(tab, lock):
+            return
         record.update(msgid=next(_message_ids), page_id=_page_key(tab), connection=tab)
         if getattr(tab.target, "type_", None) == "service_worker":
             record.update({k: v for k, v in worker_info(tab).items() if k != "url"})
@@ -1010,13 +1102,25 @@ async def _enable_console_collection(
         ] + _console_messages
 
     collector = ConsoleCollector(tab, collect, records)
-    await collector.enable(source_maps=bool(source_maps))
+    try:
+        await collector.enable(source_maps=bool(source_maps))
+        _check_collection_owner(tab, lock)
+    except BaseException:
+        collector.remove()
+        raise
     _console_callbacks[key] = collector
     _console_collection_enabled_tabs.add(key)
     return True
 
 
 async def _disable_console_collection(tab: uc.Tab) -> bool:
+    lock = _collection_lock(tab)
+    async with lock:
+        _check_collection_owner(tab, lock)
+        return await _stop_console_collection(tab)
+
+
+async def _stop_console_collection(tab):
     key = _tab_key(tab)
     collector = _console_callbacks.pop(key, None)
     if collector is None:
@@ -1026,11 +1130,8 @@ async def _disable_console_collection(tab: uc.Tab) -> bool:
         await collector.source_maps.disable()
     finally:
         collector.remove()
-    if not any(
-        callbacks
-        for event, callbacks in tab.handlers.items()
-        if event.__module__ == uc.cdp.runtime.__name__
-    ):
+    if not _frame_contexts.has_runtime_consumers(tab):
+        _frame_contexts.reset(tab)
         await tab.send(uc.cdp.runtime.disable())
     return True
 
@@ -1449,22 +1550,27 @@ async def _open_new_tab(
         return await _await_with_timeout(
             browser.get(url, new_tab=True), timeout, "Open page"
         )
-    ctx = _named_browser_contexts.get(isolated_context) if isolated_context else None
-    if isolated_context and ctx is None:
-        ctx = await browser.send(
-            uc.cdp.target.create_browser_context(dispose_on_detach=True)
+    # Context names and their pages share the browser lifecycle lock with
+    # explicit context creation/disposal and browser restarts.
+    async with _browser_lock if isolated_context else nullcontext():
+        ctx = (
+            _named_browser_contexts.get(isolated_context) if isolated_context else None
         )
-        _named_browser_contexts[isolated_context] = ctx
-    target = await _await_with_timeout(
-        browser.send(
-            uc.cdp.target.create_target(
-                url=url, browser_context_id=ctx, background=background
+        if isolated_context and ctx is None:
+            ctx = await browser.send(
+                uc.cdp.target.create_browser_context(dispose_on_detach=True)
             )
-        ),
-        timeout,
-        "Create page",
-    )
-    return await _wait_for_target(browser, target, timeout)
+            _named_browser_contexts[isolated_context] = ctx
+        target = await _await_with_timeout(
+            browser.send(
+                uc.cdp.target.create_target(
+                    url=url, browser_context_id=ctx, background=background
+                )
+            ),
+            timeout,
+            "Create page",
+        )
+        return await _wait_for_target(browser, target, timeout)
 
 
 async def _format_pages() -> str:
@@ -1520,7 +1626,11 @@ async def start_browser(
         browser = await _ensure_browser(options, restart=restart)
         # Launch-level persistence belongs to Chrome's default context, not an
         # isolated/incognito context that happened to be selected previously.
-        pages = [tab for tab in browser.tabs if tab.target.browser_context_id is None]
+        pages = [
+            tab
+            for tab in browser.tabs
+            if tab.target.browser_context_id == _default_browser_context_id
+        ]
         if not pages:
             tab = await _open_new_tab(
                 browser,
@@ -1800,22 +1910,14 @@ async def emulate_device(
 async def _evaluate_script_value(
     tab, function: str, args: list[str] | None, *, format="auto", timeout=0
 ):
-    context = None
-    frame_id = _selected_frame_id(tab)
-    if not args and frame_id and str(tab.target_id) == _page_key(tab):
-        context = await tab.send(
-            uc.cdp.page.create_isolated_world(
-                uc.cdp.page.FrameId(frame_id),
-                world_name="nodriver-mcp",
-            )
-        )
+    context = await _frame_execution_context(tab) if not args else None
     return await execute_script(
         tab,
         function,
         args,
         format=format,
         timeout=timeout,
-        context_id=context,
+        unique_context_id=context,
         resolve_uid=lambda uid, group: _resolve_uid(tab, uid, object_group=group),
     )
 

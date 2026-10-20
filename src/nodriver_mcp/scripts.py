@@ -68,7 +68,7 @@ def script_value(result):
     return result.value
 
 
-async def _argument_command(tab, command, *, synchronous):
+async def _execution_command(tab, command, *, synchronous):
     """Keep an in-flight command alive until cancellation can stop its JS."""
     runtime = uc.cdp.runtime
     task = asyncio.create_task(tab.send(command))
@@ -109,7 +109,7 @@ async def _execute_with_arguments(tab, source, objects, group):
     runtime = uc.cdp.runtime
     # Do not await a returned Promise in callFunctionOn: its pending command
     # otherwise cannot distinguish an idle Promise from synchronous busy JS.
-    result, error = await _argument_command(
+    result, error = await _execution_command(
         tab,
         runtime.call_function_on(
             function_declaration=source,
@@ -125,12 +125,12 @@ async def _execute_with_arguments(tab, source, objects, group):
     if error or result.object_id is None or result.type_ in {"function", "symbol"}:
         return result, error
     if result.subtype == "promise":
-        return await _argument_command(
+        return await _execution_command(
             tab,
             runtime.await_promise(result.object_id, return_by_value=True),
             synchronous=False,
         )
-    return await _argument_command(
+    return await _execution_command(
         tab,
         runtime.call_function_on(
             "function(){return this}",
@@ -144,7 +144,15 @@ async def _execute_with_arguments(tab, source, objects, group):
 
 
 async def execute_script(
-    tab, source, args, *, format="auto", timeout=0, context_id=None, resolve_uid=None
+    tab,
+    source,
+    args,
+    *,
+    format="auto",
+    timeout=0,
+    context_id=None,
+    unique_context_id=None,
+    resolve_uid=None,
 ):
     runtime = uc.cdp.runtime
     group = "nodriver-mcp-script-" + uuid4().hex
@@ -174,31 +182,37 @@ async def execute_script(
                         + json.dumps("return (\n" + candidate + "\n);")
                         + "); return true; } catch(error) { if(error.name === 'SyntaxError') return false; throw error; }})()"
                     )
-                    parsed, parse_error = await tab.send(
+                    parsed, parse_error = await _execution_command(
+                        tab,
                         runtime.evaluate(
                             probe,
                             context_id=context_id,
+                            unique_context_id=unique_context_id,
                             object_group=group,
                             return_by_value=True,
                             await_promise=False,
                             timeout=runtime.TimeDelta(timeout) if timeout else None,
                             allow_unsafe_eval_blocked_by_csp=True,
-                        )
+                        ),
+                        synchronous=False,
                     )
                     if parse_error is not None:
                         raise script_error(parse_error)
                     if parsed.value:
                         expression = wrapped
-            result, error = await tab.send(
+            result, error = await _execution_command(
+                tab,
                 runtime.evaluate(
                     expression,
                     context_id=context_id,
+                    unique_context_id=unique_context_id,
                     object_group=group,
                     return_by_value=True,
                     await_promise=True,
                     user_gesture=True,
                     timeout=runtime.TimeDelta(timeout) if timeout else None,
-                )
+                ),
+                synchronous=False,
             )
         if error:
             if timeout and error.text.lower() in {
