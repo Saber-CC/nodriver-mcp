@@ -1696,6 +1696,54 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("source-A", old)
         self.assertNotIn("/B.ts", old)
 
+    async def test_cross_process_source_maps_map_logs_emitted_before_collection(self):
+        tab = await s._page_tab()
+        origin = f"http://source-a.localhost:{self.http.server_port}"
+        await s.navigate_page(url=origin + "/identity-page?name=Replay")
+        await s.evaluate_script(
+            "new Promise(resolve=>{const script=document.createElement('script');"
+            "script.src='/identity-script?name=Pending';script.onload=()=>resolve(true);"
+            "document.head.append(script);})",
+            wait_for_stable=False,
+        )
+        self.assertNotIn(s._tab_key(tab), s._console_collection_enabled_tabs)
+        self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))
+        await s.enable_console_collection(source_maps=True)
+        async with asyncio.timeout(5):
+            while not any(m["text"] == "identity-Replay" for m in s._console_messages):
+                await asyncio.sleep(0.01)
+        replay = next(m for m in s._console_messages if m["text"] == "identity-Replay")
+        detail = await s.get_console_message(replay["msgid"])
+        self.assertIn("/Replay.ts:1:1", detail)
+        self.assertIn("source-Replay", detail)
+        # Leave this second map uncached until Debugger has been re-enabled.
+        pending = next(
+            m for m in s._console_messages if m["text"] == "identity-Pending"
+        )
+        await s.enable_console_collection(source_maps=False)
+        await s.enable_console_collection(source_maps=True)
+        detail = await s.get_console_message(pending["msgid"])
+        self.assertIn("/Pending.ts:1:1", detail)
+        self.assertIn("source-Pending", detail)
+        listed = await s.list_console_messages(include_stack_traces=True)
+        self.assertIn("/Replay.ts:1:1", listed)
+
+        other = f"http://source-b.localhost:{self.http.server_port}"
+        await s.navigate_page(url=other + "/identity-page?name=After")
+        async with asyncio.timeout(5):
+            while not any(m["text"] == "identity-After" for m in s._console_messages):
+                await asyncio.sleep(0.01)
+        current = next(m for m in s._console_messages if m["text"] == "identity-After")
+        self.assertEqual(
+            replay["location"]["script_id"], current["location"]["script_id"]
+        )
+        detail = await s.get_console_message(current["msgid"])
+        self.assertIn("/After.ts:1:1", detail)
+        self.assertIn("source-After", detail)
+        old = await s.get_console_message(replay["msgid"])
+        self.assertIn("/Replay.ts:1:1", old)
+        self.assertNotIn("/After.ts", old)
+
     async def test_source_maps_use_browser_credentials_and_symbolize_async_stacks(self):
         tab = await s._active_tab()
         self.assertFalse(tab.handlers.get(uc.cdp.debugger.ScriptParsed))

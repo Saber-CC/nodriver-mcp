@@ -18,12 +18,14 @@ longer required for Chrome 146's removed `sameParty` and renamed
 `localNetworkAccessRequestPolicy` fields. Installing with pip inside a dedicated
 virtual environment also provides isolation.
 
-Version 1.5.18 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
+Version 1.5.19 uses the official MCP Python SDK 2.3.0 and its `MCPServer` API.
 The dependency is pinned to `mcp==2.3.0` so fresh installs and tool upgrades use
 the tested SDK version. Input validation and timeout failures retain their
 actionable messages through the SDK's `ToolError` API.
 The [1.5.18 fixes](docs/regressions-1.5.18.md) cover script deadlines, concurrent
 trace cleanup, source-map ownership, iframe initialization and repeated email fills.
+The [1.5.19 fix](docs/regressions-1.5.19.md) restores source maps for logs Chrome
+replays when console collection is first enabled with `source_maps=true`.
 
 For a source checkout:
 
@@ -280,7 +282,9 @@ default. Disabling or retiring a connection removes all managed console/error
 callbacks. Use `enable_console_collection(source_maps=true)` to opt into Debugger
 metadata and async stacks. Console details and requested list stacks then resolve
 source-map v3 original functions/locations/source lines while retaining generated
-positions. External maps load through Chrome with its proxy and cookies; inline
+positions. On initial startup with source maps enabled, script metadata is captured
+before Runtime replays buffered logs, so those logs can also map to original sources.
+External maps load through Chrome with its proxy and cookies; inline
 and indexed maps are supported. Failed or slow maps retain raw positions and a
 diagnostic. `resolve_source_maps=false` skips resolution; `source_maps=false`
 disables owned Debugger collection. Ordinary browsing keeps these domains disabled.

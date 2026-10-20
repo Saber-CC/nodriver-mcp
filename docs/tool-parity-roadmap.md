@@ -313,3 +313,7 @@ navigator.modelContext API 跳过。构建、锁文件、Python 检查及 Node �
 1.5.18 修复脚本超时、trace 并发清理、source map 身份复用、iframe 初始设置和重复
 邮箱填充的回归；验证增至 170 项（169 通过，1 项因上述 Chrome API 缺失跳过）。
 复现、修复和验证记录见 [regressions-1.5.18.md](regressions-1.5.18.md)。
+
+1.5.19 修复首次开启 source map 时 Runtime 回放的历史日志无法映射的问题，并覆盖
+关闭再开启采集与跨站导航；全量 174 项，173 通过，1 跳过。详见
+[regressions-1.5.19.md](regressions-1.5.19.md)。
