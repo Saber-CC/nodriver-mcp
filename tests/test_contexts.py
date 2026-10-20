@@ -9,6 +9,7 @@ import anyio
 from nodriver import cdp
 
 from nodriver_mcp.contexts import FrameContexts
+from nodriver_mcp.scripts import execute_script
 
 
 def document(backend):
@@ -32,10 +33,7 @@ class Connection:
         self.release = asyncio.Event()
         self.groups = set()
         self.child = document(30)
-        self.object_id = "1234.7.1"
-        self.checked_object_id = "1234.7.2"
-        self.isolate = "4d2"
-        self.current_backend = 30
+        self.object_id = "opaque-document-handle"
 
     def add_handler(self, event, callback):
         if callback not in self.handlers[event]:
@@ -51,8 +49,6 @@ class Connection:
         if method == "DOM.getFrameOwner":
             return cdp.dom.BackendNodeId(20), None
         if method == "DOM.describeNode":
-            if "objectId" in params:
-                return NS(backend_node_id=cdp.dom.BackendNodeId(self.current_backend))
             return NS(content_document=self.child)
         if method == "DOM.resolveNode":
             self.groups.add(params["objectGroup"])
@@ -60,15 +56,13 @@ class Connection:
             if self.block:
                 await self.release.wait()
             return cdp.runtime.RemoteObject(
-                type_="object", object_id=cdp.runtime.RemoteObjectId(self.object_id)
-            )
-        if method == "Runtime.getIsolateId":
-            return self.isolate
-        if method == "Runtime.evaluate":
-            return cdp.runtime.RemoteObject(
                 type_="object",
-                object_id=cdp.runtime.RemoteObjectId(self.checked_object_id),
-            ), None
+                object_id=cdp.runtime.RemoteObjectId(self.object_id)
+                if self.object_id is not None
+                else None,
+            )
+        if method in {"Runtime.evaluate", "Runtime.callFunctionOn"}:
+            return cdp.runtime.RemoteObject(type_="number", value=42), None
         if method == "Runtime.releaseObjectGroup":
             await asyncio.sleep(0.01)
             self.groups.discard(params["objectGroup"])
@@ -92,7 +86,7 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(connection.handlers[cdp.runtime.BindingCalled])
         self.assertIn("Runtime.releaseObjectGroup", connection.commands)
 
-    async def test_lookup_never_enables_runtime_and_validates_document_identity(
+    async def test_lookup_uses_opaque_document_reference_in_callers_object_group(
         self,
     ):
         contexts, connection = FrameContexts(), Connection()
@@ -103,13 +97,30 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
             len(connection.handlers[cdp.runtime.ExecutionContextCreated]), 1
         )
         self.assertEqual(
-            await contexts.main_world(connection, "child"), {"context_id": 7}
+            await contexts.main_world(connection, "child", object_group="caller"),
+            {"document_object_id": "opaque-document-handle"},
+        )
+        self.assertEqual(connection.groups, {"caller"})
+        self.assertEqual(
+            connection.commands,
+            ["DOM.getFrameOwner", "DOM.describeNode", "DOM.resolveNode"],
         )
         self.assertNotIn("Runtime.enable", connection.commands)
         self.assertNotIn("Runtime.disable", connection.commands)
+        self.assertNotIn("Runtime.releaseObjectGroup", connection.commands)
+        await connection.send(cdp.runtime.release_object_group("caller"))
         self.assert_clean(connection)
         self.assertEqual(
-            await contexts.main_world(connection, "child"), {"context_id": 7}
+            await execute_script(
+                connection,
+                "42",
+                None,
+                format="script",
+                resolve_context=lambda group: contexts.main_world(
+                    connection, "child", object_group=group
+                ),
+            ),
+            42,
         )
         self.assert_clean(connection)
 
@@ -120,7 +131,7 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
         contexts.request_runtime(connection, True)
         before = list(connection.commands)
         self.assertEqual(
-            await contexts.main_world(connection, "child"),
+            await contexts.main_world(connection, "child", object_group="caller"),
             {"unique_context_id": "world-A"},
         )
         self.assertEqual(connection.commands, before)
@@ -128,8 +139,10 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
         contexts.request_runtime(connection, False)
         self.assertFalse(contexts.state(connection)["contexts"])
         self.assertEqual(
-            await contexts.main_world(connection, "child"), {"context_id": 7}
+            await contexts.main_world(connection, "child", object_group="caller"),
+            {"document_object_id": "opaque-document-handle"},
         )
+        await connection.send(cdp.runtime.release_object_group("caller"))
         self.assert_clean(connection)
 
     async def test_cancellation_during_document_resolution_releases_object_group(
@@ -137,7 +150,19 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
     ):
         contexts, connection = FrameContexts(), Connection()
         connection.block = True
-        task = asyncio.create_task(contexts.main_world(connection, "child"))
+
+        async def run():
+            return await execute_script(
+                connection,
+                "42",
+                None,
+                format="script",
+                resolve_context=lambda group: contexts.main_world(
+                    connection, "child", object_group=group
+                ),
+            )
+
+        task = asyncio.create_task(run())
         await asyncio.wait_for(connection.entered.wait(), 1)
         task.cancel()
         connection.release.set()
@@ -147,8 +172,10 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Runtime.enable", connection.commands)
         connection.block = False
         self.assertEqual(
-            await contexts.main_world(connection, "child"), {"context_id": 7}
+            await run(),
+            42,
         )
+        self.assert_clean(connection)
 
     async def test_anyio_cancellation_releases_frame_handles(self):
         contexts, connection = FrameContexts(), Connection()
@@ -158,7 +185,15 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
         async def request():
             with anyio.CancelScope() as scope:
                 scopes.append(scope)
-                await contexts.main_world(connection, "child")
+                await execute_script(
+                    connection,
+                    "42",
+                    None,
+                    format="script",
+                    resolve_context=lambda group: contexts.main_world(
+                        connection, "child", object_group=group
+                    ),
+                )
 
         task = asyncio.create_task(request())
         try:
@@ -174,31 +209,52 @@ class FrameContextTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def test_unknown_or_changed_chrome_objects_never_enable_runtime_as_a_fallback(
+    async def test_missing_documents_and_handles_fail_without_enabling_runtime(
         self,
     ):
         for changes in (
-            {"object_id": "opaque"},
-            {"isolate": "abcd"},
-            {"current_backend": 31},
-            {"checked_object_id": "2345.7.2"},
+            {"child": None},
+            {"object_id": None},
         ):
             with self.subTest(changes=changes):
                 contexts, connection = FrameContexts(), Connection()
                 for key, value in changes.items():
                     setattr(connection, key, value)
                 with self.assertRaises(ValueError):
-                    await contexts.main_world(connection, "child")
+                    await execute_script(
+                        connection,
+                        "42",
+                        None,
+                        format="script",
+                        resolve_context=lambda group: contexts.main_world(
+                            connection, "child", object_group=group
+                        ),
+                    )
                 self.assert_clean(connection)
                 self.assertNotIn("Runtime.enable", connection.commands)
 
-    async def test_signed_object_identifiers_match_unsigned_native_isolate_ids(self):
+    async def test_document_is_retained_through_execution_before_group_cleanup(self):
         contexts, connection = FrameContexts(), Connection()
-        connection.object_id = "-1.7.1"
-        connection.checked_object_id = "-1.7.2"
-        connection.isolate = "ffffffffffffffff"
+        send = connection.send
+
+        async def check(command):
+            if command.gi_code.co_name == "call_function_on":
+                self.assertTrue(connection.groups)
+                self.assertNotIn("Runtime.releaseObjectGroup", connection.commands)
+            return await send(command)
+
+        connection.send = check
         self.assertEqual(
-            await contexts.main_world(connection, "child"), {"context_id": 7}
+            await execute_script(
+                connection,
+                "42",
+                None,
+                format="script",
+                resolve_context=lambda group: contexts.main_world(
+                    connection, "child", object_group=group
+                ),
+            ),
+            42,
         )
         self.assert_clean(connection)
 

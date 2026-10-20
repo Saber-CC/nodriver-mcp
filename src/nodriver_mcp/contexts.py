@@ -2,12 +2,9 @@
 
 import logging
 import weakref
-from uuid import uuid4
 
 import anyio
 from nodriver import cdp
-
-from .scripts import script_error
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +103,8 @@ class FrameContexts:
             except Exception:
                 logger.debug("Runtime state recovery failed", exc_info=True)
 
-    async def main_world(self, connection, frame_id):
+    async def main_world(self, connection, frame_id, *, object_group):
+        """Resolve a world using handles retained by the caller's object group."""
         state = self.watch(connection)
         context = state["contexts"].get(frame_id)
         if context is not None:
@@ -122,57 +120,18 @@ class FrameContexts:
             raise ValueError(
                 "This frame needs a separate connection; refresh list_frames."
             )
-        backend_id = node.content_document.backend_node_id
-        group = "nodriver-mcp-context-" + uuid4().hex
-        try:
-            document = await connection.send(
-                cdp.dom.resolve_node(backend_node_id=backend_id, object_group=group)
+        document = await connection.send(
+            cdp.dom.resolve_node(
+                backend_node_id=node.content_document.backend_node_id,
+                object_group=object_group,
             )
-            # Chrome's V8 RemoteObjectId currently carries isolate.context.object.
-            # This format is opaque in CDP, so validate it against both the live
-            # isolate and the selected Document; never fall back to Runtime.enable
-            # or install a binding in the page if Chrome changes the format.
-            parts = str(document.object_id).split(".")
-            if (
-                len(parts) != 3
-                or not parts[0].removeprefix("-").isdecimal()
-                or not all(part.isdecimal() for part in parts[1:])
-                or int(parts[1]) <= 0
-            ):
-                raise ValueError(
-                    "Chrome returned an unsupported frame object identifier; cannot resolve its execution context without enabling Runtime."
-                )
-            isolate = await connection.send(cdp.runtime.get_isolate_id())
-            if int(parts[0]) & ((1 << 64) - 1) != int(isolate, 16):
-                raise ValueError(
-                    "Frame execution context changed during discovery; refresh frames and retry."
-                )
-            context_id = cdp.runtime.ExecutionContextId(int(parts[1]))
-            checked, error = await connection.send(
-                cdp.runtime.evaluate(
-                    "document", context_id=context_id, object_group=group
-                )
-            )
-            if error:
-                raise script_error(error)
-            if str(checked.object_id).rsplit(".", 1)[0] != ".".join(parts[:2]):
-                raise ValueError(
-                    "Frame execution context changed during discovery; refresh frames and retry."
-                )
-            current = await connection.send(
-                cdp.dom.describe_node(object_id=checked.object_id, depth=0)
-            )
-            if current.backend_node_id != backend_id:
-                raise ValueError(
-                    "Execution context does not belong to the selected frame; refresh frames and retry."
-                )
-            return {"context_id": context_id}
-        finally:
-            with anyio.move_on_after(0.5, shield=True):
-                try:
-                    await connection.send(cdp.runtime.release_object_group(group))
-                except Exception:
-                    logger.debug("Frame context object cleanup failed", exc_info=True)
+        )
+        if document.object_id is None:
+            raise ValueError("Frame document is unavailable; refresh frames and retry.")
+        # RemoteObjectId is opaque and Chrome validates its owning isolate and
+        # context during callFunctionOn. Keep it alive until execution finishes;
+        # a numeric contextId could be reused by a different renderer meanwhile.
+        return {"document_object_id": document.object_id}
 
     def forget(self, connection):
         state = self.watchers.pop(id(connection), None)

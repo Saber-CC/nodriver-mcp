@@ -18,6 +18,90 @@ from nodriver_mcp.scripts import (
 
 
 class ScriptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_document_evaluation_keeps_the_reference_through_probe_and_execution(
+        self,
+    ):
+        commands = []
+        group = None
+
+        async def context(owner):
+            nonlocal group
+            group = owner
+            return {
+                "document_object_id": uc.cdp.runtime.RemoteObjectId("opaque-document")
+            }
+
+        async def send(command):
+            packet = next(command)
+            commands.append(packet)
+            if packet["method"] == "Runtime.callFunctionOn":
+                self.assertEqual(packet["params"]["objectId"], "opaque-document")
+                self.assertEqual(packet["params"]["objectGroup"], group)
+                self.assertNotIn("executionContextId", packet["params"])
+                return uc.cdp.runtime.RemoteObject(type_="boolean", value=True), None
+
+        value = await execute_script(
+            SimpleNamespace(send=send),
+            "() => true",
+            None,
+            resolve_context=context,
+        )
+        self.assertTrue(value)
+        self.assertEqual(
+            [c["method"] for c in commands],
+            [
+                "Runtime.callFunctionOn",
+                "Runtime.callFunctionOn",
+                "Runtime.releaseObjectGroup",
+            ],
+        )
+        self.assertEqual(commands[-1]["params"]["objectGroup"], group)
+
+    async def test_unrecognized_frame_context_never_falls_back_to_the_main_page(self):
+        commands = []
+
+        async def send(command):
+            commands.append(next(command))
+
+        with self.assertRaisesRegex(
+            ValueError, "Frame execution target is unavailable"
+        ):
+            await execute_script(
+                SimpleNamespace(send=send),
+                "window.marker=1",
+                None,
+                resolve_context=AsyncMock(return_value={"context_id": 3}),
+            )
+        self.assertEqual(
+            [c["method"] for c in commands], ["Runtime.releaseObjectGroup"]
+        )
+
+    async def test_document_deadline_and_outer_timeout_preserve_cancellation_cleanup(
+        self,
+    ):
+        commands = []
+
+        async def send(command):
+            packet = next(command)
+            commands.append(packet)
+            if packet["method"] == "Runtime.callFunctionOn":
+                await asyncio.Future()
+
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(
+                execute_script(
+                    SimpleNamespace(send=send),
+                    "while(true){}",
+                    None,
+                    format="script",
+                    document_object_id=uc.cdp.runtime.RemoteObjectId("opaque-document"),
+                    timeout=50,
+                ),
+                0.05,
+            )
+        self.assertIn("Runtime.terminateExecution", [c["method"] for c in commands])
+        self.assertEqual(commands[-1]["method"], "Runtime.releaseObjectGroup")
+
     async def test_anyio_request_cancellation_interrupts_busy_js_and_releases_handles(
         self,
     ):
