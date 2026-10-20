@@ -17,11 +17,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client import Client
 from mcp.client.stdio import stdio_client
 
+from nodriver_mcp.tool_groups import ENABLED_GROUPS_ENV, TOOL_GROUP_BY_NAME
+
 
 class StdioTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_client_discovers_and_calls_official_binding_tools(self):
         parameters = StdioServerParameters(
-            command=sys.executable, args=["-m", "nodriver_mcp"]
+            command=sys.executable,
+            args=["-m", "nodriver_mcp"],
+            env={**os.environ, ENABLED_GROUPS_ENV: ""},
         )
         async with stdio_client(parameters) as (reader, writer):
             async with ClientSession(reader, writer) as session:
@@ -31,11 +35,12 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
                 self.assertNotIn("find_in_page", names)
+                self.assertEqual(len(names), 60)
+                self.assertTrue(names.isdisjoint(TOOL_GROUP_BY_NAME))
                 self.assertTrue(
                     {
                         "take_screenshot",
                         "set_cookies",
-                        "call_webmcp_tool",
                         "send_cdp_command",
                         "subscribe_cdp_events",
                         "start_browser",
@@ -63,21 +68,72 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                     "invoke_tool",
                     "".join(getattr(c, "text", "") for c in response.content),
                 )
+                disabled = await session.call_tool("list_webmcp_tools", {})
+                self.assertTrue(disabled.is_error)
+                self.assertIn(
+                    "disabled",
+                    "".join(getattr(c, "text", "") for c in disabled.content),
+                )
 
     async def test_modern_client_discovers_and_calls_tools(self):
         parameters = StdioServerParameters(
-            command=sys.executable, args=["-m", "nodriver_mcp"]
+            command=sys.executable,
+            args=["-m", "nodriver_mcp"],
+            env={**os.environ, ENABLED_GROUPS_ENV: ""},
         )
         async with Client(parameters, mode="2026-07-28") as client:
             self.assertEqual(client.protocol_version, "2026-07-28")
             tools = await client.list_tools()
-            self.assertIn("start_browser", {tool.name for tool in tools.tools})
+            names = {tool.name for tool in tools.tools}
+            self.assertEqual(len(names), 60)
+            self.assertIn("start_browser", names)
+            self.assertTrue(names.isdisjoint(TOOL_GROUP_BY_NAME))
             response = await client.call_tool(
                 "list_cdp_commands", {"domain": "ServiceWorker"}
             )
             self.assertFalse(response.is_error, str(response))
             self.assertIn(
                 "enable", "".join(getattr(c, "text", "") for c in response.content)
+            )
+
+    async def test_all_optional_groups_can_be_restored_after_restart(self):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "nodriver_mcp"],
+            env={**os.environ, ENABLED_GROUPS_ENV: "all"},
+        )
+        async with stdio_client(parameters) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                names = {tool.name for tool in (await session.list_tools()).tools}
+                self.assertEqual(len(names), 75)
+                self.assertTrue(TOOL_GROUP_BY_NAME.keys() <= names)
+                response = await session.call_tool(
+                    "performance_analyze_trace",
+                    {"trace_path": "/nonexistent-optional-group-trace.json"},
+                )
+                self.assertTrue(response.is_error)
+                self.assertIn(
+                    "Trace file does not exist",
+                    "".join(getattr(c, "text", "") for c in response.content),
+                )
+
+    async def test_modern_client_can_enable_only_one_optional_group(self):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "nodriver_mcp"],
+            env={**os.environ, ENABLED_GROUPS_ENV: "diagnostics"},
+        )
+        async with Client(parameters, mode="2026-07-28") as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+            self.assertEqual(len(names), 64)
+            self.assertIn("get_connection_history", names)
+            self.assertNotIn("performance_start_trace", names)
+            self.assertNotIn("call_webmcp_tool", names)
+            response = await client.call_tool("list_webmcp_tools", {})
+            self.assertTrue(response.is_error)
+            self.assertIn(
+                "disabled", "".join(getattr(c, "text", "") for c in response.content)
             )
 
 
@@ -116,6 +172,7 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
                 "NODRIVER_PROXY": "",
                 "NODRIVER_EXTENSIONS": "[]",
                 "NODRIVER_BROWSER_ARGS": '["--enable-unsafe-extension-debugging"]',
+                ENABLED_GROUPS_ENV: "performance",
             },
         )
 

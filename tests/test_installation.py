@@ -30,6 +30,8 @@ class InstallationTests(unittest.IsolatedAsyncioTestCase):
                     shutil.which("uv"),
                     "tool",
                     "install",
+                    "--refresh-package",
+                    "nodriver-mcp",
                     "--python",
                     sys.executable,
                     str(project),
@@ -51,7 +53,19 @@ class InstallationTests(unittest.IsolatedAsyncioTestCase):
                 / "bin"
                 / ("nodriver-mcp.exe" if os.name == "nt" else "nodriver-mcp")
             )
-            async with stdio_client(StdioServerParameters(command=str(executable))) as (
+            performance_enabled = (
+                os.environ.get("NODRIVER_MCP_PERFORMANCE_TESTS") == "1"
+            )
+            parameters = StdioServerParameters(
+                command=str(executable),
+                env={
+                    **os.environ,
+                    "NODRIVER_ENABLED_TOOL_GROUPS": "performance"
+                    if performance_enabled
+                    else "",
+                },
+            )
+            async with stdio_client(parameters) as (
                 reader,
                 writer,
             ):
@@ -63,17 +77,18 @@ class InstallationTests(unittest.IsolatedAsyncioTestCase):
                             "start_browser",
                             "close_browser",
                             "take_snapshot",
-                            "performance_analyze_trace",
-                            "performance_analyze_insight",
                         }
                         <= names
                     )
+                    self.assertEqual(len(names), 67 if performance_enabled else 60)
+                    self.assertNotIn("call_webmcp_tool", names)
+                    self.assertNotIn("get_ad_info", names)
                     result = await session.call_tool(
                         "list_cdp_commands", {"domain": "ServiceWorker"}
                     )
                     self.assertFalse(result.is_error, str(result))
 
-                    if os.environ.get("NODRIVER_MCP_PERFORMANCE_TESTS") == "1":
+                    if performance_enabled:
                         output = root / "installed-analysis.json"
                         result = await session.call_tool(
                             "performance_analyze_trace",
