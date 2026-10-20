@@ -98,6 +98,36 @@ class SourceMapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("retired", result["source_map_errors"][0])
         tab.send.assert_not_awaited()
 
+    def test_runtime_context_replay_completes_only_live_script_identities(self):
+        maps = SourceMaps(NS(handlers=defaultdict(list)))
+        self.parsed(maps, "A")
+        script = maps.scripts["3"]
+        maps.context_created(NS(context=NS(id_=1, unique_id="world-A")))
+        self.assertEqual(script["context_unique_id"], "world-A")
+        self.parsed(maps, "A")
+        self.assertIs(maps.scripts["3"], script)
+        self.assertFalse(script.get("retired"))
+
+        maps.context_destroyed(
+            NS(execution_context_id=1, execution_context_unique_id="world-A")
+        )
+        maps.context_created(NS(context=NS(id_=1, unique_id="world-B")))
+        self.assertEqual(script["context_unique_id"], "world-A")
+        self.parsed(maps, "A")
+        self.assertIsNot(maps.scripts["3"], script)
+        self.assertTrue(script["retired"])
+        self.assertEqual(maps.scripts["3"]["context_unique_id"], "world-B")
+
+        maps = SourceMaps(NS(handlers=defaultdict(list)))
+        self.parsed(maps, "A")
+        retired = maps.scripts["3"]
+        maps.context_destroyed(
+            NS(execution_context_id=1, execution_context_unique_id="unknown-old")
+        )
+        maps.context_created(NS(context=NS(id_=1, unique_id="new-world")))
+        self.assertIsNone(retired["context_unique_id"])
+        self.assertTrue(retired["retired"])
+
     async def test_inflight_old_map_load_cannot_populate_reused_script_cache(self):
         maps = SourceMaps(NS(handlers=defaultdict(list)))
         maps.active = maps.ever_enabled = True

@@ -193,7 +193,17 @@ class SourceMaps:
 
     def context_created(self, event):
         context = event.context
-        self.contexts[int(context.id_)] = context.unique_id
+        context_id = int(context.id_)
+        self.contexts[context_id] = context.unique_id
+        # Debugger may describe existing scripts before Runtime replays their
+        # contexts. Complete that identity before the next Debugger enable.
+        for script in self.scripts.values():
+            if (
+                script.get("context_id") == context_id
+                and script.get("context_unique_id") is None
+                and not script.get("retired")
+            ):
+                script["context_unique_id"] = context.unique_id
 
     def context_destroyed(self, event):
         context_id = int(event.execution_context_id)

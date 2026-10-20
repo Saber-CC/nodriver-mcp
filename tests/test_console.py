@@ -1,4 +1,5 @@
 import collections
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -17,6 +18,7 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
 
         connection = SimpleNamespace(
             send=AsyncMock(),
+            handlers=handlers,
             add_handler=lambda kind, callback: handlers[kind].append(callback),
             remove_handler=remove,
         )
@@ -32,6 +34,101 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
             handlers,
             records,
         )
+
+    async def test_replayed_console_binds_script_metadata_before_runtime_enable(self):
+        collector, connection, _, records = self.fixture()
+
+        async def send(command):
+            method = next(command)["method"]
+            if method == "Debugger.enable":
+                collector.source_maps.parsed(
+                    SimpleNamespace(
+                        script_id="10",
+                        execution_context_id=2,
+                        hash_="compiled",
+                        execution_context_aux_data={"frameId": "page"},
+                        url="https://page/app.js",
+                        start_line=0,
+                        start_column=0,
+                        source_map_url="data:application/json,"
+                        + json.dumps(
+                            {
+                                "version": 3,
+                                "sources": ["original.ts"],
+                                "names": [],
+                                "mappings": "AAAA",
+                                "sourcesContent": ["original line"],
+                            }
+                        ),
+                    )
+                )
+            elif method == "Runtime.enable":
+                collector.console(
+                    cdp.runtime.ConsoleAPICalled.from_json(
+                        {
+                            "type": "log",
+                            "executionContextId": 2,
+                            "timestamp": 1,
+                            "args": [{"type": "string", "value": "buffered log"}],
+                            "stackTrace": {
+                                "callFrames": [
+                                    {
+                                        "scriptId": "10",
+                                        "functionName": "minified",
+                                        "url": "https://page/app.js",
+                                        "lineNumber": 0,
+                                        "columnNumber": 0,
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                )
+
+        connection.send.side_effect = send
+        await collector.enable(source_maps=True)
+        self.assertEqual(len(records), 1)
+        detail = await collector.source_maps.symbolize(records[0])
+        self.assertEqual(detail["mapped_location"]["url"], "https://page/original.ts")
+        self.assertEqual(detail["mapped_location"]["sourceLine"], "original line")
+        await collector.source_maps.disable()
+        collector.remove()
+
+    async def test_source_map_startup_failure_disables_debugger_and_allows_retry(self):
+        for failing in ("Runtime.enable", "Debugger.setSkipAllPauses"):
+            with self.subTest(failing=failing):
+                collector, connection, handlers, _ = self.fixture()
+                external = lambda event: None
+                connection.add_handler(cdp.runtime.ExceptionThrown, external)
+                commands = []
+                error = RuntimeError("startup failed")
+
+                async def send(command):
+                    method = next(command)["method"]
+                    commands.append(method)
+                    if method == failing:
+                        raise error
+
+                connection.send.side_effect = send
+                with self.assertRaises(RuntimeError) as raised:
+                    await collector.enable(source_maps=True)
+                self.assertIs(raised.exception, error)
+                self.assertFalse(collector.source_maps.active)
+                self.assertFalse(collector.source_maps.watching)
+                self.assertEqual(commands[-1], "Debugger.disable")
+                self.assertEqual(handlers[cdp.runtime.ExceptionThrown], [external])
+                self.assertFalse(
+                    any(
+                        callbacks
+                        for kind, callbacks in handlers.items()
+                        if kind is not cdp.runtime.ExceptionThrown
+                    )
+                )
+                connection.send.side_effect = None
+                await collector.enable(source_maps=True)
+                self.assertTrue(collector.source_maps.active)
+                await collector.source_maps.disable()
+                collector.remove()
 
     async def test_console_and_uncaught_exception_keep_native_locations_and_stacks(
         self,

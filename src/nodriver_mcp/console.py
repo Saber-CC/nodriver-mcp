@@ -1,11 +1,15 @@
 """Explicit console/exception collection with native stack metadata."""
 
+import asyncio
 import json
+import logging
 
 from nodriver import cdp
 
 from .protocol import json_value
 from .source_maps import SourceMaps
+
+logger = logging.getLogger(__name__)
 
 
 def stack_location(stack):
@@ -86,13 +90,22 @@ class ConsoleCollector:
             (cdp.runtime.ExceptionRevoked, self.revoked),
         ]
 
-    async def enable(self):
-        for event, callback in self.callbacks:
-            self.connection.add_handler(event, callback)
+    async def enable(self, *, source_maps=False):
         try:
+            # Runtime.enable replays buffered logs immediately. Their script
+            # ownership must be known before bind() captures those messages.
+            if source_maps:
+                await self.source_maps.enable()
+            for event, callback in self.callbacks:
+                self.connection.add_handler(event, callback)
             await self.connection.send(cdp.runtime.enable())
         except BaseException:
-            self.remove()
+            try:
+                await asyncio.wait_for(self.source_maps.disable(), 0.5)
+            except Exception:
+                logger.debug("Source-map startup cleanup failed", exc_info=True)
+            finally:
+                self.remove()
             raise
 
     def remove(self):

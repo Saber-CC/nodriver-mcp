@@ -1010,11 +1010,9 @@ async def _enable_console_collection(
         ] + _console_messages
 
     collector = ConsoleCollector(tab, collect, records)
-    await collector.enable()
+    await collector.enable(source_maps=bool(source_maps))
     _console_callbacks[key] = collector
     _console_collection_enabled_tabs.add(key)
-    if source_maps:
-        await collector.source_maps.enable()
     return True
 
 
