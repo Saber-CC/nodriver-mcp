@@ -140,12 +140,13 @@ async def fill_text(element, value: str, state):
                 selection.removeAllRanges(); selection.addRange(range);
             } else if (el.type === 'number') {
                 if (!%s) Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value').set.call(el,'');
-            } else if (%s) {
+            } else if (%s && (el.tagName === 'TEXTAREA' ||
+                ['text','search','url','tel','password'].includes(el.type))) {
                 el.setSelectionRange(el.value.length,el.value.length);
-            } else el.select();
+            } else if (!%s) el.select();
             return true;
         }"""
-            % (json.dumps(same), json.dumps(same), json.dumps(same))
+            % ((json.dumps(same),) * 4)
         )
         if not focused:
             raise ValueError(

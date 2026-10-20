@@ -1,7 +1,12 @@
 import unittest
-from unittest.mock import AsyncMock
+import asyncio
+from collections import defaultdict
+from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock, patch
 
-from nodriver_mcp.emulation import EmulationOverrides, http_headers
+from nodriver import cdp
+
+from nodriver_mcp.emulation import EmulationOverrides, FrameOverrides, http_headers
 
 
 class Connection:
@@ -15,6 +20,58 @@ class Connection:
 
 
 class EmulationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_frame_guard_configures_native_child_session_before_resume_and_releases_it(
+        self,
+    ):
+        for failing in (False, True):
+            commands, handlers = [], defaultdict(list)
+            enable_collection = AsyncMock()
+            manager = EmulationOverrides(enable_collection)
+            manager.states["a"] = {
+                "media": {"prefers-reduced-motion": "reduce"},
+                "headers": {"X-Review": "first"},
+            }
+
+            async def send(command, **routing):
+                packet = next(command)
+                commands.append(dict(packet, **routing))
+                if failing and packet["method"] == "Network.setExtraHTTPHeaders":
+                    raise ValueError("detached during setup")
+
+            guard = NS(
+                send=send,
+                aclose=AsyncMock(),
+                add_handler=lambda event, callback: handlers[event].append(callback),
+            )
+            frames = FrameOverrides(manager)
+            with patch("nodriver_mcp.emulation.Tab", return_value=guard):
+                await frames.watch(NS(target_id="a", target=NS()))
+            handlers[cdp.target.AttachedToTarget][0](
+                NS(session_id="child-session", target_info=NS(type_="iframe"))
+            )
+            await asyncio.gather(*frames.pages["a"]["tasks"])
+            child = [p for p in commands if p.get("sessionId") == "child-session"]
+            methods = [p["method"] for p in child]
+            self.assertLess(
+                methods.index("Network.setExtraHTTPHeaders"),
+                methods.index("Runtime.runIfWaitingForDebugger"),
+            )
+            self.assertEqual(methods[-1], "Runtime.runIfWaitingForDebugger")
+            self.assertNotIn("Runtime.enable", methods)
+            enable_collection.assert_not_awaited()
+            if not failing:
+                await manager.update(
+                    "a", frames.connections("a"), headers={"X-Review": "next"}
+                )
+                self.assertEqual(
+                    commands[-1]["params"]["headers"], {"X-Review": "next"}
+                )
+                enable_collection.assert_not_awaited()
+            await frames.close_all()
+            guard.aclose.assert_awaited_once()
+            self.assertFalse(frames.pages)
+            self.assertFalse(manager.applied)
+
     async def test_media_merge_reset_and_new_frame_sync_are_isolated_and_retryable(
         self,
     ):

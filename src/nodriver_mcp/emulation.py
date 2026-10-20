@@ -1,11 +1,14 @@
-"""Page-scoped media/header overrides, synchronized to discovered frame sessions."""
+"""Page-scoped media/header overrides, applied before new OOP frames execute."""
 
 import asyncio
 import json
+import logging
 import re
 import weakref
 
-from nodriver import cdp
+from nodriver import Tab, cdp
+
+logger = logging.getLogger(__name__)
 
 MEDIA_VALUES = {
     "prefers-color-scheme": {"light", "dark"},
@@ -66,7 +69,7 @@ class EmulationOverrides:
         self.enable_network = enable_network
         self.states, self.locks, self.applied = {}, {}, {}
 
-    async def sync_locked(self, tab, page_id):
+    async def sync_locked(self, tab, page_id, *, collect_network=True):
         state = self.states.get(page_id)
         if state is None:
             return
@@ -83,7 +86,11 @@ class EmulationOverrides:
                 )
             )
         if "headers" in state:
-            if self.enable_network is not None:
+            if (
+                collect_network
+                and not isinstance(tab, FrameSession)
+                and self.enable_network is not None
+            ):
                 await self.enable_network(tab)
             else:
                 await tab.send(cdp.network.enable())
@@ -136,3 +143,140 @@ class EmulationOverrides:
         self.states.clear()
         self.locks.clear()
         self.applied.clear()
+
+
+def attach_frames(enabled=True):
+    return cdp.target.set_auto_attach(
+        enabled,
+        wait_for_debugger_on_start=enabled,
+        flatten=True,
+        filter_=cdp.target.TargetFilter([{"type": "iframe"}, {"exclude": True}]),
+    )
+
+
+class FrameSession:
+    """Use nodriver's native session routing on a dedicated guard connection."""
+
+    def __init__(self, guard, event):
+        self.guard = guard
+        self.session_id = event.session_id
+        self.active = True
+
+    async def send(self, command):
+        if not self.active:
+            command.close()
+            raise ConnectionError("Frame override session was detached.")
+        return await self.guard.send(command, sessionId=str(self.session_id))
+
+
+class FrameOverrides:
+    """Configure OOP frames before their first scripts and subresources run."""
+
+    def __init__(self, overrides):
+        self.overrides = overrides
+        self.pages = {}
+
+    async def watch(self, page):
+        page_id = str(page.target_id)
+        if page_id in self.pages:
+            state = self.pages[page_id]
+            await state["ready"].wait()
+            if state.get("error") is not None:
+                raise state["error"]
+            return
+        # Child Network events must not be mistaken for the page's events by
+        # nodriver's target-wide handlers. This native connection only guards
+        # startup; normal frame connections retain their own collectors.
+        guard = Tab(target=page.target, parent=page)
+        state = {
+            "guard": guard,
+            "sessions": {},
+            "tasks": set(),
+            "closing": False,
+            "ready": asyncio.Event(),
+        }
+        self.pages[page_id] = state
+
+        def attached(event):
+            if event.target_info.type_ != "iframe" or state["closing"]:
+                return
+            session = FrameSession(guard, event)
+            state["sessions"][str(event.session_id)] = session
+            task = asyncio.create_task(self.initialize(session, page_id))
+            state["tasks"].add(task)
+            task.add_done_callback(state["tasks"].discard)
+
+        def detached(event):
+            session = state["sessions"].pop(str(event.session_id), None)
+            if session is not None:
+                session.active = False
+                self.overrides.retire(session)
+
+        guard.add_handler(cdp.target.AttachedToTarget, attached)
+        guard.add_handler(cdp.target.DetachedFromTarget, detached)
+        try:
+            await asyncio.wait_for(guard.send(attach_frames()), 5)
+        except BaseException as exc:
+            state["error"] = exc
+            await self.close(page_id)
+            raise
+        finally:
+            state["ready"].set()
+
+    async def initialize(self, session, page_id):
+        try:
+            async with asyncio.timeout(10):
+                async with self.overrides.locks.setdefault(page_id, asyncio.Lock()):
+                    await self.overrides.sync_locked(
+                        session, page_id, collect_network=False
+                    )
+                await session.send(attach_frames())
+        except Exception:
+            logger.debug("Frame override initialization failed", exc_info=True)
+        finally:
+            try:
+                await asyncio.wait_for(
+                    session.send(cdp.runtime.run_if_waiting_for_debugger()), 3
+                )
+            except Exception:
+                # Detaching also releases a target paused for this session.
+                try:
+                    await asyncio.wait_for(
+                        session.guard.send(
+                            cdp.target.detach_from_target(session_id=session.session_id)
+                        ),
+                        1,
+                    )
+                except Exception:
+                    logger.debug("Frame override resume failed", exc_info=True)
+
+    def connections(self, page_id):
+        state = self.pages.get(page_id)
+        return list(state["sessions"].values()) if state else []
+
+    async def close(self, page_id):
+        state = self.pages.pop(page_id, None)
+        if state is None:
+            return
+        state["closing"] = True
+        guard = state["guard"]
+        try:
+            await asyncio.wait_for(guard.send(attach_frames(False)), 3)
+        except Exception:
+            logger.debug("Frame override detach failed", exc_info=True)
+        tasks = list(state["tasks"])
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for session in state["sessions"].values():
+            session.active = False
+            self.overrides.retire(session)
+        try:
+            await guard.aclose()
+        except Exception:
+            logger.debug("Frame override connection cleanup failed", exc_info=True)
+
+    async def close_all(self):
+        for page_id in list(self.pages):
+            await self.close(page_id)

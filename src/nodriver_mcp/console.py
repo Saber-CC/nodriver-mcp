@@ -101,7 +101,7 @@ class ConsoleCollector:
             self.connection.remove_handler(event, callback)
 
     def emit(self, message):
-        message["_source_maps"] = self.source_maps
+        self.source_maps.bind(message)
         self.collect(message)
 
     def console(self, event):

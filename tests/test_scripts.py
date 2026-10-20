@@ -1,4 +1,5 @@
 import json
+import asyncio
 import os
 import tempfile
 import unittest
@@ -16,6 +17,52 @@ from nodriver_mcp.scripts import (
 
 
 class ScriptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_argument_cancellation_stops_synchronous_js_but_not_idle_promises(
+        self,
+    ):
+        for promise in (False, True):
+            commands = []
+            entered = asyncio.Event()
+
+            async def send(command):
+                packet = next(command)
+                commands.append(packet)
+                method = packet["method"]
+                if method == "Runtime.callFunctionOn" and promise:
+                    return uc.cdp.runtime.RemoteObject(
+                        type_="object",
+                        subtype="promise",
+                        object_id=uc.cdp.runtime.RemoteObjectId("promise"),
+                    ), None
+                if method in {"Runtime.callFunctionOn", "Runtime.awaitPromise"}:
+                    entered.set()
+                    await asyncio.Future()
+                if method == "Runtime.evaluate":
+                    return uc.cdp.runtime.RemoteObject(type_="number", value=0), None
+
+            with self.subTest(promise=promise):
+                task = asyncio.create_task(
+                    execute_script(
+                        SimpleNamespace(send=send),
+                        "el => 1",
+                        ["uid"],
+                        resolve_uid=AsyncMock(
+                            return_value=SimpleNamespace(
+                                object_id=uc.cdp.runtime.RemoteObjectId("element")
+                            )
+                        ),
+                    )
+                )
+                await entered.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                methods = [p["method"] for p in commands]
+                self.assertEqual(
+                    methods.count("Runtime.terminateExecution"), int(not promise)
+                )
+                self.assertEqual(methods[-1], "Runtime.releaseObjectGroup")
+
     async def test_source_files_support_utf8_bom_file_urls_and_mutual_exclusion(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "脚本 文件.js"
