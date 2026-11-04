@@ -43,14 +43,41 @@ uv sync --extra vision
 ```bash
 nodriver-mcp install
 nodriver-mcp install claude,cursor,kiro
+nodriver-mcp install deepseek
 nodriver-mcp install --scope project
 nodriver-mcp uninstall claude
 nodriver-mcp --list-clients
 nodriver-mcp --config
 ```
 
-The installer supports JSON and TOML client configurations. `--list-clients`
-shows the available clients on the current platform.
+The installer supports JSON and TOML client configurations, plus the YAML patch
+layer DeepSeek Harness uses. `--list-clients` shows the available clients on the
+current platform.
+
+DeepSeek Harness stores MCP servers as loader patch rows, so `install deepseek`
+(aliases: `dsh`, `deepseek-harness`, `harness`) writes a single `mcp-nodriver` row
+for the built-in `@deepseek-ai/dsh-mcp-client` bridge into
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: mcp-nodriver
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: nodriver
+        transport: stdio
+        command: "/path/to/python"
+        args: ["-m", "nodriver_mcp"]
+```
+
+The profile is taken from `DSH_PROFILE` when the harness exports it, otherwise
+`desktop`, then `web`, then the first existing profile in name order is used.
+Only that row is edited, so comments, `!!js` expressions and unrelated rows stay
+untouched. The target is always a user profile, so `--scope project` does not
+apply to DeepSeek Harness.
+The harness hot-reloads the layer, so a running app exposes the server as
+`mcp__nodriver__*` tools without a restart; `uninstall deepseek` removes the row
+and keeps the file a valid patch list.
 
 ## Browser configuration
 

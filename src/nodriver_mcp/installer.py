@@ -15,6 +15,7 @@ except ImportError:
 import tomli_w
 
 from .installer_data import (
+    DSH_CLIENT_NAME,
     MCP_SERVER_NAME,
     GLOBAL_SPECIAL_JSON_STRUCTURES,
     PROJECT_SPECIAL_JSON_STRUCTURES,
@@ -22,6 +23,9 @@ from .installer_data import (
     get_project_configs,
     resolve_client_name,
 )
+from .installer_dsh import has_row as dsh_has_row
+from .installer_dsh import remove as dsh_remove
+from .installer_dsh import upsert as dsh_upsert
 from .installer_tui import interactive_select
 
 
@@ -135,6 +139,55 @@ def _write_config(path: str, config: dict, *, is_toml: bool):
         raise
 
 
+def _write_text(path: str, text: str):
+    config_dir = os.path.dirname(path)
+    if config_dir:
+        os.makedirs(config_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=config_dir or ".", prefix=".tmp_", suffix=".yml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        os.unlink(tmp)
+        raise
+
+
+def _install_dsh_profile(name: str, config_path: str, *, uninstall: bool) -> bool:
+    """Install or remove the nodriver row in a DeepSeek Harness patch layer.
+
+    DeepSeek Harness stores MCP servers as loader patch rows in a hand-edited
+    YAML file, so the row is edited in place (see `installer_dsh`) instead of
+    being serialized from a parsed document. A running harness hot-reloads this
+    layer, so the ``mcp__nodriver__*`` tools appear without restarting it.
+    """
+    action = "uninstall" if uninstall else "install"
+    text = ""
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"Skipping {name} {action}\n  Config: {config_path} (unreadable: {exc})")
+            return False
+
+    if uninstall:
+        if not dsh_has_row(text):
+            print(f"Skipping {name} uninstall\n  Config: {config_path} (not installed)")
+            return False
+        _write_text(config_path, dsh_remove(text))
+        print(f"Uninstalled {name} MCP server (restart client to apply)\n  Config: {config_path}")
+        return True
+
+    config = generate_mcp_config(client_name=name)
+    _write_text(
+        config_path,
+        dsh_upsert(text, config["command"], config.get("args") or ()),
+    )
+    print(f"Installed {name} MCP server (profile hot-reloads)\n  Config: {config_path}")
+    return True
+
+
 def _get_servers_view(
     config: dict,
     client_name: str,
@@ -176,7 +229,15 @@ def install_mcp_servers(
         for t in only:
             resolved = resolve_client_name(t, available)
             if resolved is None:
-                print(f"Unknown client: '{t}', use --list-clients to see available targets")
+                if project and resolve_client_name(
+                    t, list(get_global_configs())
+                ) == DSH_CLIENT_NAME:
+                    print(
+                        f"{DSH_CLIENT_NAME} installs into a user profile, not a project directory.\n"
+                        f"Run without --scope project: nodriver-mcp install {t}"
+                    )
+                else:
+                    print(f"Unknown client: '{t}', use --list-clients to see available targets")
             elif resolved not in filtered:
                 filtered[resolved] = configs[resolved]
         configs = filtered
@@ -196,6 +257,11 @@ def install_mcp_servers(
                 action = "uninstall" if uninstall else "install"
                 print(f"Skipping {name} {action}\n  Config: {config_path} (directory not found)")
                 continue
+
+        if name == DSH_CLIENT_NAME:
+            if _install_dsh_profile(name, config_path, uninstall=uninstall):
+                changed += 1
+            continue
 
         config = {}
         if os.path.exists(config_path):
@@ -247,6 +313,12 @@ def list_available_clients():
 def _is_installed(name: str, config_dir: str, config_file: str, special: dict, is_project: bool) -> bool:
     """Check if nodriver MCP server is already installed for a given client."""
     config_path = os.path.join(config_dir, config_file)
+    if name == DSH_CLIENT_NAME:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return dsh_has_row(f.read())
+        except (OSError, UnicodeDecodeError):
+            return False
     is_toml = config_file.endswith(".toml")
     if not os.path.exists(config_path):
         return False
