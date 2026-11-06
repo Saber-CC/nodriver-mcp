@@ -335,8 +335,13 @@ existing frame sessions; no `list_frames` call is needed to initialize them.
 `disable_console_collection`, `list_console_messages`, `get_console_message`,
 `get_browser_info`, `get_connection_history`.
 
-Use text snapshots for reading pages. Ordinary PNG/JPEG screenshots delegate to
-`Tab.save_screenshot(as_base64=True)` and return native MCP image content, or
+Use text snapshots for reading pages. `take_snapshot` waits up to two seconds for
+`document.readyState` to reach `complete`, then reads the accessibility tree. Use
+`wait_timeout=0` for an immediate snapshot or `wait_for(text=[...])` for content
+rendered after document load.
+
+Ordinary PNG/JPEG screenshots delegate to `Tab.save_screenshot(as_base64=True)`
+and return native MCP image content, or
 save a file when `file_path` is supplied. Element crops, WebP and explicit
 quality use the official generated CDP screenshot command because those
 arguments are not exposed by the native helper.

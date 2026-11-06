@@ -42,6 +42,26 @@ class FakeTab:
         self.handlers[event].remove(callback)
 
 
+def ax_tree(text=None):
+    ax = uc.cdp.accessibility
+    root = ax.AXNode(
+        node_id=ax.AXNodeId("root"),
+        ignored=False,
+        role=ax.AXValue(ax.AXValueType.ROLE, "RootWebArea"),
+        name=ax.AXValue(ax.AXValueType.COMPUTED_STRING, "Page title"),
+    )
+    if text is None:
+        return [root]
+    child = ax.AXNode(
+        node_id=ax.AXNodeId("content"),
+        ignored=False,
+        role=ax.AXValue(ax.AXValueType.ROLE, "heading"),
+        name=ax.AXValue(ax.AXValueType.COMPUTED_STRING, text),
+    )
+    root.child_ids = [child.node_id]
+    return [root, child]
+
+
 class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         s._dialog_state.clear()
@@ -102,6 +122,126 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         artifacts = patch.dict(os.environ, {"NODRIVER_ARTIFACTS_DIR": directory.name})
         artifacts.start()
         self.addCleanup(artifacts.stop)
+
+    async def test_snapshot_reads_ax_once_after_the_document_is_ready(self):
+        async def read_tree(command):
+            self.assertEqual(evaluate.await_count, 3)
+            self.assertEqual(next(command)["method"], "Accessibility.getFullAXTree")
+            return ax_tree("Commit details")
+
+        self.b.send.side_effect = read_tree
+        with (
+            patch.object(
+                s,
+                "_evaluate",
+                side_effect=["loading", "interactive", "complete"],
+            ) as evaluate,
+            patch.object(s, "_PAGE_READY_POLL_INTERVAL", 0),
+        ):
+            result = await s.take_snapshot(page_id="b")
+        self.assertIn('heading "Commit details"', result)
+        self.b.send.assert_awaited_once()
+        self.assertTrue(all(call.args[0] is self.b for call in evaluate.await_args_list))
+        self.a.send.assert_not_awaited()
+
+    async def test_page_ready_returns_the_last_state_if_a_probe_stalls(self):
+        probing_again = asyncio.Event()
+
+        async def probe(_tab, _expression, **_options):
+            if evaluate.await_count == 1:
+                return "interactive"
+            probing_again.set()
+            await asyncio.Future()
+
+        with (
+            patch.object(s, "_evaluate", side_effect=probe) as evaluate,
+            patch.object(s, "_PAGE_READY_POLL_INTERVAL", 0),
+        ):
+            state = await s._wait_for_page_ready(self.a, timeout=0.1)
+        self.assertTrue(probing_again.is_set())
+        self.assertEqual(state, "interactive")
+
+    async def test_sparse_snapshot_returns_text_guidance_and_keeps_existing_uids(self):
+        self.a.send.return_value = ax_tree()
+        s._uid_owners["previous"] = ("a", self.a, "")
+        s._uid_to_backend_node_id["previous"] = 12
+        with patch.object(s, "_evaluate", return_value="complete") as evaluate:
+            result = await s.take_snapshot(wait_timeout=30)
+        self.assertIn("No readable accessibility content", result)
+        self.assertIn("wait_for with expected text", result)
+        self.assertIn("only for visual inspection", result)
+        evaluate.assert_awaited_once()
+        self.a.send.assert_awaited_once()
+        self.assertEqual(s._uid_to_backend_node_id["previous"], 12)
+        self.assertEqual(s._uid_owners["previous"], ("a", self.a, ""))
+
+    async def test_snapshot_marks_readable_content_as_partial_when_load_takes_longer(self):
+        self.a.send.return_value = ax_tree("Already rendered")
+        with patch.object(s, "_evaluate", return_value="interactive"):
+            result = await s.take_snapshot(wait_timeout=30)
+        self.assertTrue(
+            result.startswith("Page readiness wait ended with readyState=interactive.")
+        )
+        self.assertIn("snapshot may be incomplete", result)
+        self.assertIn('heading "Already rendered"', result)
+        self.a.send.assert_awaited_once()
+
+    async def test_snapshot_can_read_ax_content_when_ready_state_is_unavailable(self):
+        self.a.send.return_value = ax_tree("Accessible without evaluation")
+        with patch.object(s, "_evaluate", side_effect=ValueError("eval unavailable")):
+            result = await s.take_snapshot(wait_timeout=30)
+        self.assertIn("readyState=unknown", result)
+        self.assertIn('heading "Accessible without evaluation"', result)
+        self.a.send.assert_awaited_once()
+
+    async def test_snapshot_saves_a_sparse_tree_and_reports_status_separately(self):
+        self.a.send.return_value = ax_tree()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(s, "_evaluate", return_value="complete"),
+        ):
+            path = Path(directory) / "snapshot.txt"
+            result = await s.take_snapshot(file_path=str(path))
+            saved = path.read_text(encoding="utf-8")
+        self.assertIn('RootWebArea "Page title"', saved)
+        self.assertNotIn("wait_for", saved)
+        self.assertIn("No readable accessibility content yet.", result)
+        self.assertIn("Snapshot saved to", result)
+        self.a.send.assert_awaited_once()
+
+    async def test_snapshot_zero_wait_timeout_captures_immediately(self):
+        self.a.send.return_value = ax_tree("Current content")
+        with patch.object(s, "_evaluate") as evaluate:
+            result = await s.take_snapshot(wait_timeout=0)
+        self.assertIn('heading "Current content"', result)
+        evaluate.assert_not_awaited()
+        self.a.send.assert_awaited_once()
+
+    async def test_wait_for_returns_a_snapshot_without_a_second_readiness_wait(self):
+        self.a.send.return_value = ax_tree("Target text")
+        with (
+            patch.object(
+                s, "_evaluate", side_effect=["PLACEHOLDER", "Target text"]
+            ) as evaluate,
+            patch.object(s.asyncio, "sleep", AsyncMock()),
+        ):
+            result = await s.wait_for(["Target text"])
+        self.assertIn('Found text "Target text"', result)
+        self.assertIn('heading "Target text"', result)
+        self.assertEqual(evaluate.await_count, 2)
+        self.a.send.assert_awaited_once()
+
+    async def test_snapshot_and_screenshot_descriptions_guide_agents_to_text_wait(self):
+        tools = {tool.name: tool for tool in await s.mcp.list_tools()}
+        snapshot = tools["take_snapshot"]
+        screenshot = tools["take_screenshot"]
+        self.assertEqual(
+            snapshot.input_schema["properties"]["wait_timeout"]["default"], 2000
+        )
+        self.assertIn("document.readyState", snapshot.description)
+        self.assertIn("wait_for with expected", snapshot.description)
+        self.assertIn("visual inspection", screenshot.description)
+        self.assertIn("wait_for", screenshot.description)
 
     async def test_worker_calls_never_resolve_a_page_and_reject_mixed_targets(self):
         worker = FakeTab("worker")

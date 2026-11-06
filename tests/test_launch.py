@@ -287,6 +287,62 @@ class LaunchReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.http.assert_called_with("127.0.0.1", 9222, timeout=0.5)
         self.assertEqual(self.created_pages, [])
 
+    async def test_start_browser_waits_for_document_and_returns_the_refreshed_url(self):
+        url = "https://example.test/first"
+        final_url = "https://example.test/final"
+        navigated = False
+
+        async def refresh():
+            s._browser._targets = [self.page]
+            if navigated:
+                self.assertEqual(evaluate.await_count, 3)
+                self.page.target.url = final_url
+
+        async def page_command(command):
+            nonlocal navigated
+            request = next(command)
+            if request["method"] == "Page.navigate":
+                self.assertEqual(request["params"]["url"], url)
+                navigated = True
+                return (None, None, None)
+            self.assertEqual(request["method"], "Page.enable")
+
+        async def probe(tab, expression, **_options):
+            self.assertTrue(navigated)
+            self.assertIs(tab, self.page)
+            self.assertEqual(expression, "document.readyState")
+            return next(states)
+
+        states = iter(("loading", "interactive", "complete"))
+        self.refresh.side_effect = refresh
+        self.page.send.side_effect = page_command
+        with (
+            patch.object(s, "_evaluate", side_effect=probe) as evaluate,
+            patch.object(s, "_PAGE_READY_POLL_INTERVAL", 0),
+        ):
+            result = await s.start_browser(url=url)
+        self.assertEqual(result["ready_state"], "complete")
+        self.assertEqual(result["url"], final_url)
+        self.assertEqual(result["page_id"], self.page.target_id)
+
+    async def test_start_browser_reports_incomplete_state_with_a_capped_wait(self):
+        async def refresh():
+            s._browser._targets = [self.page]
+
+        self.refresh.side_effect = refresh
+        self.page.send.return_value = (None, None, None)
+        with patch.object(s, "_wait_for_page_ready", return_value="interactive") as wait:
+            result = await s.start_browser(url="https://example.test/", timeout=0)
+            wait.assert_awaited_once_with(self.page, timeout=10.0)
+            self.assertEqual(result["ready_state"], "interactive")
+
+            wait.reset_mock()
+            result = await s.start_browser(url="https://example.test/", timeout=500)
+            self.assertEqual(result["ready_state"], "interactive")
+            self.assertEqual(wait.await_count, 1)
+            self.assertGreater(wait.await_args.kwargs["timeout"], 0)
+            self.assertLess(wait.await_args.kwargs["timeout"], 0.5)
+
     async def test_empty_inventory_creates_one_blank_page_and_waits_for_its_id(self):
         other = self._tab("unrelated")
 
@@ -301,6 +357,7 @@ class LaunchReadinessTests(unittest.IsolatedAsyncioTestCase):
             result = await s.start_browser()
         self.assertEqual(self.created_pages, ["about:blank"])
         self.assertEqual(result["page_id"], self.page.target_id)
+        self.assertEqual(result["ready_state"], "unknown")
         self.prepare_page.assert_awaited_with(self.page)
         self.collect_network.assert_awaited_once_with(self.page)
         self.spawn.assert_awaited_once()

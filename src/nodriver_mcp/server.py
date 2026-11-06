@@ -240,7 +240,9 @@ mcp = BrowserMCPServer(
         "do not need Runtime.enable. Console tools are optional; CDP/event tools "
         "require allow_runtime_enable=true to enable Runtime. "
         "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
-        "take_snapshot returns searchable HTML text and is much faster and smaller. "
+        "take_snapshot briefly waits for document.readyState to reach complete, then returns structured text. "
+        "For content rendered after document load, use wait_for with expected text. "
+        "If the page is still loading and the expected text is unknown, retry take_snapshot. "
         "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression. "
         "When the user requests a proxy or persistent session, call start_browser "
         "with the requested proxy/persistent/profile and URL BEFORE opening any website. "
@@ -666,6 +668,33 @@ async def _evaluate(tab: uc.Tab, expression: str, await_promise: bool = True) ->
         await_promise=await_promise,
         resolve_context=lambda group: _frame_execution_context(tab, object_group=group),
     )
+
+
+_PAGE_READY_POLL_INTERVAL = 0.1
+
+
+async def _wait_for_page_ready(tab: uc.Tab, timeout: float = 2.0) -> str:
+    """Wait for document.readyState or return the last observed state."""
+    last_state = "unknown"
+    if timeout <= 0:
+        return last_state
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                try:
+                    state = await _evaluate(
+                        tab, "document.readyState", await_promise=False
+                    )
+                except (ValueError, uc.ProtocolException):
+                    # Navigation can replace the execution context between probes.
+                    state = None
+                if state == "complete":
+                    return state
+                if state in ("loading", "interactive"):
+                    last_state = state
+                await asyncio.sleep(_PAGE_READY_POLL_INTERVAL)
+    except TimeoutError:
+        return last_state
 
 
 async def _frame_execution_context(tab, *, object_group):
@@ -1657,6 +1686,8 @@ async def _format_pages() -> str:
 # Tools (aligned with chrome-devtools-mcp interface)
 # ---------------------------------------------------------------------------
 
+_START_BROWSER_READY_TIMEOUT = 10.0
+
 
 @mcp.tool()
 async def start_browser(
@@ -1680,11 +1711,13 @@ async def start_browser(
         persistent: False (default) uses a fresh temporary profile per launch; true reuses cookies/storage across future launches and MCP restarts.
         profile: Persistent profile name. Use default when the user does not name one; use the same name on future launches. Requires persistent=true for other names.
         restart: Force a new browser, including a fresh profile for temporary sessions. Changed launch options automatically restart Chrome and close its current pages.
-        timeout: Navigation timeout in milliseconds; 0 disables the timeout.
+        timeout: Navigation budget in milliseconds. 0 leaves navigation unbounded.
+            The document readiness wait uses the remaining budget, capped at 10 seconds.
 
     Matching settings reuse the running browser. Subsequent tools keep using
     the chosen proxy and session. Persistent profiles retain unexpired persistent
     cookies and site storage; websites may still expire or revoke a login.
+    ready_state reports the last observed document.readyState, or unknown when unavailable.
     """
     global _selected_target_id
     if timeout < 0:
@@ -1716,13 +1749,19 @@ async def start_browser(
             )
         _selected_target_id = str(tab.target_id)
         await _prepare_page(tab)
+        ready_state = "unknown"
         if url:
             _preserve_on_navigation(tab)
             _selected_frames.pop(_selected_target_id, None)
             await tab.send(uc.cdp.page.enable())
             await _auto_enable_network_collection(tab)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout / 1000 if timeout else None
             await _await_with_timeout(_navigate_url(tab, url), timeout, "Navigation")
-            await _await_with_timeout(tab.wait(), timeout, "Wait for navigation")
+            ready_timeout = _START_BROWSER_READY_TIMEOUT
+            if deadline is not None:
+                ready_timeout = min(ready_timeout, max(0, deadline - loop.time()))
+            ready_state = await _wait_for_page_ready(tab, timeout=ready_timeout)
         await browser.update_targets()
         return {
             **_browser_launch_info(),
@@ -1732,6 +1771,7 @@ async def start_browser(
             if running
             else "started",
             "url": tab.target.url,
+            "ready_state": ready_state,
             "page_id": str(tab.target_id),
             "target_id": str(tab.target_id),
         }
@@ -3000,8 +3040,9 @@ async def take_screenshot(
     max_height: int | None = None,
     page_id: int | str | None = None,
 ) -> Any:
-    """Capture an MCP image or save a file. Ordinary PNG/JPEG uses native as_base64.
+    """Capture pixels for visual inspection, returning an MCP image or saving a file.
 
+    Use take_snapshot to read text and wait_for when expected content is still loading.
     Element crops, WebP and explicit quality use official CDP because the native
     screenshot helper does not expose those arguments. max_width/max_height bound
     physical output pixels proportionally, without upscaling.
@@ -3044,30 +3085,14 @@ async def take_screenshot(
     return Image(data=base64.b64decode(encoded), format=format)
 
 
-@_page_tool()
-async def take_snapshot(
-    verbose: bool = False,
-    file_path: str = "",
-    include_frames: bool = False,
-    *,
-    page_id: int | str | None = None,
-) -> str:
-    """Take a text snapshot of the currently selected page based on the a11y tree.
-    The snapshot lists page elements along with a unique identifier (uid).
-    Always use the latest snapshot. Prefer taking a snapshot over taking a
-    screenshot. The snapshot indicates searchable, structured text that is
-    much smaller than an image or raw HTML.
+_SNAPSHOT_DOCUMENT_ROLES = {"RootWebArea", "WebArea", "document"}
+_SNAPSHOT_RETRY_HINT = (
+    "Retry take_snapshot or use wait_for with expected text. "
+    "Use take_screenshot only for visual inspection."
+)
 
-    Args:
-        verbose: Whether to include all possible information available in the full a11y tree. Default is false.
-        file_path: Optional path to save the snapshot to instead of attaching it to the response.
-    """
-    global _snapshot_id
-    tab = await _active_tab()
-    page = await _page_tab()
-    page_id = str(page.target_id)
-    import nodriver.cdp.accessibility as cdp_a11y
 
+async def _snapshot_nodes(page: uc.Tab, tab: uc.Tab, include_frames: bool):
     selected_frame = _selected_frame_id(page)
     frames = (
         await _discover_frames(page) if include_frames and not selected_frame else []
@@ -3079,7 +3104,7 @@ async def take_snapshot(
     for frame, connection in frames:
         frame_id = str(frame.id_) if frame else selected_frame
         fetched = await connection.send(
-            cdp_a11y.get_full_ax_tree(
+            uc.cdp.accessibility.get_full_ax_tree(
                 frame_id=uc.cdp.page.FrameId(frame_id) if frame_id else None
             )
         )
@@ -3097,6 +3122,71 @@ async def take_snapshot(
             )
             nodes.append(copied)
             node_connections[node_id] = connection
+    return nodes, node_connections
+
+
+def _has_snapshot_content(nodes) -> bool:
+    for node in nodes:
+        role = node.role.value if node.role else ""
+        if node.ignored or role in _SNAPSHOT_DOCUMENT_ROLES or role in _SKIP_ROLES:
+            continue
+        if any(
+            attr is not None and attr.value is not None and str(attr.value).strip()
+            for attr in (node.name, node.value)
+        ):
+            return True
+        if any(
+            prop.name.value == "focusable" and prop.value.value is True
+            for prop in node.properties or ()
+        ):
+            return True
+    return False
+
+
+@_page_tool()
+async def take_snapshot(
+    verbose: bool = False,
+    file_path: str = "",
+    include_frames: bool = False,
+    *,
+    wait_timeout: int = 2000,
+    page_id: int | str | None = None,
+) -> str:
+    """Read the page as structured text from its accessibility tree.
+
+    Waits briefly for document.readyState to reach complete, then reads the tree.
+    Use wait_for with expected text for content rendered after document load.
+    Use the latest snapshot for element UIDs and take_screenshot for visual inspection.
+
+    Args:
+        verbose: Include additional accessibility nodes and properties.
+        file_path: Optional path to save the snapshot to instead of attaching it.
+        include_frames: Include child frames when no frame is selected.
+        wait_timeout: Maximum readiness wait in milliseconds. 0 captures immediately.
+    """
+    global _snapshot_id
+    if wait_timeout < 0:
+        raise ValueError("wait_timeout must be nonnegative.")
+    page = await _page_tab()
+    page_id = str(page.target_id)
+    tab = await _active_tab()
+    status = ""
+    if wait_timeout:
+        ready_state = await _wait_for_page_ready(tab, timeout=wait_timeout / 1000)
+        capture_tab = await _active_tab()
+        if capture_tab is not tab:
+            ready_state = "unknown"
+        tab = capture_tab
+        if ready_state != "complete":
+            status = (
+                f"Page readiness wait ended with readyState={ready_state}. "
+                "The snapshot may be incomplete."
+            )
+    nodes, node_connections = await _snapshot_nodes(page, tab, include_frames)
+    if not nodes or (wait_timeout and not verbose and not _has_snapshot_content(nodes)):
+        status = f"{status} No readable accessibility content yet.".strip()
+        if not file_path:
+            return f"{status} {_SNAPSHOT_RETRY_HINT}"
 
     # Build a lookup: node_id -> AXNode
     node_map: dict[str, Any] = {}
@@ -3268,12 +3358,13 @@ async def take_snapshot(
     if len(snapshot_text) > 200_000:
         snapshot_text = snapshot_text[:200_000] + "\n... (truncated)"
 
+    warning = f"{status} {_SNAPSHOT_RETRY_HINT}\n\n" if status else ""
     if file_path:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(snapshot_text)
-        return f"Snapshot saved to {file_path} ({len(snapshot_text)} chars)."
+        return warning + f"Snapshot saved to {file_path} ({len(snapshot_text)} chars)."
 
-    return snapshot_text
+    return warning + snapshot_text
 
 
 @_page_tool()
@@ -3367,7 +3458,7 @@ async def wait_for(
                 for t in text:
                     if t in page_text:
                         # Found — return with snapshot
-                        snapshot = await take_snapshot()
+                        snapshot = await take_snapshot(wait_timeout=0)
                         return f'Found text "{t}" on page.\n\n{snapshot}'
         except Exception:
             pass
