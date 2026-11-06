@@ -17,13 +17,14 @@ import os
 import sys
 import time
 import weakref
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from functools import wraps
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, Literal
 
+import anyio
 import nodriver as uc
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
@@ -36,7 +37,7 @@ from .contexts import FrameContexts
 from .dialogs import DialogInterrupted, DialogRegistry
 from .emulation import EmulationOverrides, FrameOverrides, http_headers, media_updates
 from .forms import control_state, fill_text, fill_toggle
-from .launch import LaunchOptions, ProfileLease
+from .launch import BrowserStartupError, LaunchOptions, ProfileLease, launch_chrome
 from .keyboard import dispatch_shortcut, parse_shortcut
 from .network import NetworkCollector, request_details
 from .performance import analyze_trace_file
@@ -71,6 +72,8 @@ _browser_lock = asyncio.Lock()
 _launch_options: LaunchOptions | None = None
 _profile_lease: ProfileLease | None = None
 _default_browser_context_id = None
+_INITIAL_PAGE_GRACE = 0.5
+_INITIAL_PAGE_TIMEOUT = 5
 _file_uploads = FileUploads()
 _dialog_state = DialogRegistry()
 
@@ -102,27 +105,59 @@ async def _ensure_browser(
             _profile_lease = ProfileLease(options.user_data_dir)
             _profile_lease.acquire()
         config = options.config()
-        # Keep the official Browser instance during start so partial launch
-        # failures can also stop their process and remove their temporary profile.
         _browser = uc.Browser(config)
         _launch_options = options
         for extension in options.extensions:
             config.add_extension(extension)
-        await _browser.start()
-        _default_browser_context_id = _browser.main_tab.target.browser_context_id
-        _selected_target_id = str(_browser.main_tab.target_id)
-        await _prepare_page(_browser.main_tab)
-        await _auto_enable_network_collection(_browser.main_tab)
+        page = await launch_chrome(_browser, _initialize_page)
+        _default_browser_context_id = page.target.browser_context_id
+        _selected_target_id = str(page.target_id)
         logger.info(
             "Browser started (headless=%s, persistent=%s, profile=%s)",
             options.headless,
             options.persistent,
             options.profile if options.persistent else "temporary",
         )
-    except BaseException:
-        await _shutdown_browser()
+    except BaseException as exc:
+        if isinstance(exc, BrowserStartupError):
+            logger.warning("Chrome startup failed", exc_info=True)
+        with anyio.CancelScope(shield=True):
+            try:
+                await _shutdown_browser()
+            except Exception:
+                logger.exception("Chrome startup cleanup failed")
         raise
     return _browser
+
+
+async def _initialize_page(browser: uc.Browser) -> uc.Tab:
+    """Reuse Chrome's first page, or create one when startup leaves no page."""
+    loop = asyncio.get_running_loop()
+    discovery_deadline = loop.time() + _INITIAL_PAGE_GRACE
+    try:
+        async with asyncio.timeout(_INITIAL_PAGE_TIMEOUT):
+            while True:
+                await browser.update_targets()
+                pages = browser.tabs
+                if pages:
+                    page = pages[0]
+                    break
+                if loop.time() >= discovery_deadline:
+                    target_id = await browser.send(
+                        uc.cdp.target.create_target("about:blank")
+                    )
+                    page = await _wait_for_target(browser, target_id, 0)
+                    break
+                await asyncio.sleep(0.05)
+            await _prepare_page(page)
+            await _auto_enable_network_collection(page)
+            return page
+    except TimeoutError as exc:
+        raise BrowserStartupError(
+            f"Timed out waiting for Chrome's initial page ({_INITIAL_PAGE_TIMEOUT:g}s)."
+        ) from exc
+    except (ConnectionError, uc.ProtocolException) as exc:
+        raise BrowserStartupError("Could not initialize Chrome's first page.") from exc
 
 
 def _browser_launch_info() -> dict:
@@ -178,7 +213,8 @@ class BrowserMCPServer(MCPServer):
         except UnexpectedToolError as exc:
             cause = exc.__cause__
             if isinstance(
-                cause, (ValueError, TimeoutError, uc.ProtocolException)
+                cause,
+                (BrowserStartupError, ValueError, TimeoutError, uc.ProtocolException),
             ) and not isinstance(cause, ValidationError):
                 raise ToolError(str(cause)) from cause
             raise
@@ -552,12 +588,15 @@ async def _shutdown_browser() -> None:
         if browser is not None:
             process = browser._process
             if process is not None and process.returncode is None:
-                try:
-                    # Flush Chrome's persistent cookies/storage before closing
-                    # transport; native stop() terminates the process directly.
-                    await asyncio.wait_for(browser.send(uc.cdp.browser.close()), 3)
-                except Exception:
-                    logger.debug("Graceful browser close did not reply", exc_info=True)
+                if browser.websocket_url:
+                    try:
+                        # Flush persistent state through CDP before closing the transport.
+                        await asyncio.wait_for(browser.send(uc.cdp.browser.close()), 3)
+                    except Exception:
+                        logger.debug("Graceful browser close did not reply", exc_info=True)
+                else:
+                    with suppress(ProcessLookupError):
+                        process.terminate()
                 try:
                     await asyncio.wait_for(process.wait(), 5)
                 except asyncio.TimeoutError:

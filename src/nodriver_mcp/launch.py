@@ -1,15 +1,125 @@
-"""Browser launch settings shared by lazy startup and explicit MCP startup."""
+"""Browser startup and settings shared by lazy startup and explicit MCP startup."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
+from contextlib import closing
+from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import anyio
 import nodriver as uc
+from nodriver.core._contradict import ContraDict
+from websockets.exceptions import WebSocketException
+
+
+logger = logging.getLogger("nodriver-mcp")
+_DEVTOOLS_STARTUP_TIMEOUT = 10
+_DEVTOOLS_PROBE_TIMEOUT = 0.5
+_DEVTOOLS_POLL_INTERVAL = 0.1
+
+
+class BrowserStartupError(RuntimeError):
+    """A Chrome startup failure safe to report to the MCP client."""
+
+
+def _read_devtools_version(host: str, port: int) -> dict:
+    with closing(HTTPConnection(host, port, timeout=_DEVTOOLS_PROBE_TIMEOUT)) as conn:
+        conn.request("GET", "/json/version")
+        with conn.getresponse() as response:
+            if response.status != 200:
+                raise ConnectionError(f"Chrome DevTools returned HTTP {response.status}")
+            info = json.load(response)
+    url = info.get("webSocketDebuggerUrl") if isinstance(info, dict) else None
+    if not isinstance(url, str) or not url:
+        raise ValueError("Chrome DevTools did not provide a WebSocket URL.")
+    return info
+
+
+async def _connect_devtools(browser: uc.Browser) -> None:
+    config = browser.config
+    last_probe_error = None
+    try:
+        async with asyncio.timeout(_DEVTOOLS_STARTUP_TIMEOUT):
+            while True:
+                try:
+                    info = await asyncio.to_thread(
+                        _read_devtools_version, config.host, config.port
+                    )
+                except (OSError, HTTPException, ValueError) as exc:
+                    last_probe_error = exc
+                    await asyncio.sleep(_DEVTOOLS_POLL_INTERVAL)
+                else:
+                    break
+            browser.info = ContraDict(info, silent=True)
+            browser.websocket_url = info["webSocketDebuggerUrl"]
+            last_probe_error = None
+            await browser.attach()
+    except TimeoutError as exc:
+        raise BrowserStartupError(
+            "Timed out waiting for the Chrome DevTools port "
+            f"({_DEVTOOLS_STARTUP_TIMEOUT:g}s)."
+        ) from (last_probe_error or exc)
+    except (OSError, WebSocketException, uc.ProtocolException) as exc:
+        raise BrowserStartupError("Could not connect to Chrome DevTools.") from exc
+
+
+async def launch_chrome(
+    browser: uc.Browser, initialize_page: Callable[[uc.Browser], Awaitable[uc.Tab]]
+) -> uc.Tab:
+    """Launch once and wait for the debugger and first page on that process."""
+    config = browser.config
+    executable = config.browser_executable_path
+    if not executable or not Path(executable).is_file():
+        raise FileNotFoundError(
+            "Chrome executable not found. Set NODRIVER_BROWSER_PATH to its location."
+        )
+    config.host = "127.0.0.1"
+    config.port = uc.util.free_port()
+    if config._extensions:
+        config.add_argument("--load-extension=" + ",".join(map(str, config._extensions)))
+
+    logger.info("Starting Chrome (DevTools port=%s)", config.port)
+    # Keep the process on the native Browser so the existing shutdown owns it.
+    # Chrome's stderr is inherited for diagnostics, separate from MCP stdout.
+    with anyio.CancelScope(shield=True):
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            *config(),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            close_fds=os.name == "posix",
+        )
+        browser._process = process
+        browser._process_pid = process.pid
+        uc.util.get_registered_instances().add(browser)
+
+    async def initialize() -> uc.Tab:
+        await _connect_devtools(browser)
+        return await initialize_page(browser)
+
+    ready = asyncio.create_task(initialize())
+    exited = asyncio.create_task(process.wait())
+    try:
+        await asyncio.wait((ready, exited), return_when=asyncio.FIRST_COMPLETED)
+        exit_code = exited.result() if exited.done() else process.returncode
+        if exit_code is not None:
+            raise BrowserStartupError(
+                f"Chrome exited during startup (exit code {exit_code})."
+            )
+        return ready.result()
+    finally:
+        ready.cancel()
+        exited.cancel()
+        with anyio.CancelScope(shield=True):
+            await asyncio.gather(ready, exited, return_exceptions=True)
 
 
 def _string_list(variable: str) -> tuple[str, ...]:

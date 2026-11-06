@@ -1,12 +1,17 @@
 import asyncio
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
+import anyio
 import nodriver as uc
+from mcp.server.mcpserver.exceptions import ToolError
 
+from nodriver_mcp import launch
 from nodriver_mcp import server as s
 from nodriver_mcp.launch import LaunchOptions, ProfileLease
 
@@ -173,3 +178,192 @@ class LaunchFailureTests(unittest.IsolatedAsyncioTestCase):
                     lease.acquire()
                 finally:
                     lease.release()
+
+
+class LaunchReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.enterContext(
+            patch.dict(os.environ, {**ENV, "NODRIVER_BROWSER_PATH": sys.executable})
+        )
+        self.enterContext(patch.object(s, "_browser_lock", asyncio.Lock()))
+        self.enterContext(patch.object(uc.util, "free_port", return_value=9222))
+        self.enterContext(patch.object(launch, "_DEVTOOLS_POLL_INTERVAL", 0))
+        self.exited = asyncio.Event()
+        self.process = Mock(pid=123, returncode=None)
+        self.process.wait = AsyncMock(side_effect=self._wait_for_exit)
+        self.process.terminate.side_effect = lambda: self._exit(-15)
+        self.spawn = self.enterContext(
+            patch.object(asyncio, "create_subprocess_exec", return_value=self.process)
+        )
+        self.http = self.enterContext(patch.object(launch, "HTTPConnection"))
+        connection = self.http.return_value
+        response = connection.getresponse.return_value.__enter__.return_value
+        response.status = 200
+        response.read.return_value = (
+            b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/test"}'
+        )
+        self.attach = self.enterContext(patch.object(uc.Browser, "attach"))
+        self.refresh = self.enterContext(patch.object(uc.Browser, "update_targets"))
+        self.enterContext(patch.object(uc.Browser, "send", side_effect=self._command))
+        self.prepare_page = self.enterContext(patch.object(s, "_prepare_page"))
+        self.collect_network = self.enterContext(
+            patch.object(s, "_auto_enable_network_collection")
+        )
+        self.created_pages = []
+        self.page = self._tab("initial")
+
+    async def asyncTearDown(self):
+        await s._shutdown_browser()
+
+    def _exit(self, code):
+        self.process.returncode = code
+        self.exited.set()
+
+    async def _wait_for_exit(self):
+        await self.exited.wait()
+        return self.process.returncode
+
+    async def _command(self, command):
+        request = next(command)
+        if request["method"] == "Browser.close":
+            self._exit(0)
+        elif request["method"] == "Target.createTarget":
+            self.created_pages.append(request["params"]["url"])
+            return self.page.target_id
+        else:
+            self.fail(f"Unexpected browser command: {request['method']}")
+
+    @staticmethod
+    def _tab(target_id):
+        return SimpleNamespace(
+            target_id=target_id,
+            target=SimpleNamespace(
+                type_="page", title="", url="about:blank", browser_context_id="default"
+            ),
+            parent=None,
+            send=AsyncMock(),
+            aclose=AsyncMock(),
+            add_handler=Mock(),
+            remove_handler=Mock(),
+            back=AsyncMock(),
+            forward=AsyncMock(),
+            reload=AsyncMock(),
+        )
+
+    async def test_first_navigation_waits_for_debugger_and_initial_page(self):
+        request = self.http.return_value.request
+        request.side_effect = [ConnectionRefusedError(), ConnectionRefusedError(), None]
+        url = "https://example.test/first"
+
+        async def refresh():
+            if self.refresh.await_count >= 2:
+                s._browser._targets = [self.page]
+
+        async def page_command(command):
+            payload = next(command)
+            if payload["method"] == "Page.navigate":
+                self.prepare_page.assert_any_await(self.page)
+                self.collect_network.assert_any_await(self.page)
+                self.assertEqual(payload["params"]["url"], url)
+                self.page.target.url = url
+                return (None, None, None)
+
+        async def run_action(_page, action, **_kwargs):
+            return await action()
+
+        self.refresh.side_effect = refresh
+        self.page.send.side_effect = page_command
+        with patch.object(s, "_perform_action", run_action):
+            result, browser = await asyncio.gather(
+                s.navigate_page(url=url), s._get_browser()
+            )
+        self.assertIn(f"Navigated to {url}", result)
+        self.assertIs(browser, s._browser)
+        self.assertEqual(s._selected_target_id, self.page.target_id)
+        self.spawn.assert_awaited_once()
+        self.attach.assert_awaited_once()
+        self.assertEqual(request.call_count, 3)
+        request.assert_called_with("GET", "/json/version")
+        self.http.assert_called_with("127.0.0.1", 9222, timeout=0.5)
+        self.assertEqual(self.created_pages, [])
+
+    async def test_empty_inventory_creates_one_blank_page_and_waits_for_its_id(self):
+        other = self._tab("unrelated")
+
+        async def refresh():
+            if self.created_pages:
+                s._browser._targets = [other]
+                if self.refresh.await_count >= 3:
+                    s._browser._targets.append(self.page)
+
+        self.refresh.side_effect = refresh
+        with patch.object(s, "_INITIAL_PAGE_GRACE", 0):
+            result = await s.start_browser()
+        self.assertEqual(self.created_pages, ["about:blank"])
+        self.assertEqual(result["page_id"], self.page.target_id)
+        self.prepare_page.assert_awaited_with(self.page)
+        self.collect_network.assert_awaited_once_with(self.page)
+        self.spawn.assert_awaited_once()
+
+    async def test_browser_exit_interrupts_pending_devtools_connection(self):
+        async def exit_during_attach():
+            self._exit(17)
+            await asyncio.Future()
+
+        self.attach.side_effect = exit_during_attach
+        with (
+            self.assertLogs("nodriver-mcp", "WARNING"),
+            self.assertRaisesRegex(ToolError, r"Chrome exited during startup .*17"),
+        ):
+            await s.mcp.call_tool("navigate_page", {"url": "https://example.test/"})
+        self.refresh.assert_not_awaited()
+        self.spawn.assert_awaited_once()
+        self.assertIsNone(s._browser)
+
+    async def test_devtools_timeout_retains_cause_and_cleans_up(self):
+        self.http.return_value.request.side_effect = ConnectionRefusedError(
+            "debugger not listening"
+        )
+        with (
+            patch.object(launch, "_DEVTOOLS_STARTUP_TIMEOUT", 0.1),
+            self.assertLogs("nodriver-mcp", "WARNING") as logs,
+            self.assertRaisesRegex(ToolError, "waiting for the Chrome DevTools port"),
+        ):
+            await s.mcp.call_tool("navigate_page", {"url": "https://example.test/"})
+        self.assertIn("ConnectionRefusedError: debugger not listening", logs.output[0])
+        self.attach.assert_not_awaited()
+        self.spawn.assert_awaited_once()
+        self.process.terminate.assert_called_once()
+        self.assertIsNone(s._browser)
+
+    async def test_initial_page_timeout_also_bounds_target_discovery(self):
+        async def stall_refresh():
+            await asyncio.Future()
+
+        self.refresh.side_effect = stall_refresh
+        with (
+            patch.object(s, "_INITIAL_PAGE_TIMEOUT", 0.05),
+            self.assertLogs("nodriver-mcp", "WARNING"),
+            self.assertRaisesRegex(ToolError, "waiting for Chrome's initial page"),
+        ):
+            await s.mcp.call_tool("navigate_page", {"url": "https://example.test/"})
+        self.attach.assert_awaited_once()
+        self.prepare_page.assert_not_awaited()
+        self.assertEqual(self.process.returncode, 0)
+        self.assertIsNone(s._browser)
+
+    async def test_cancelled_startup_cleans_up_inside_mcp_cancel_scope(self):
+        probing = asyncio.Event()
+
+        async def stall_probe(_browser):
+            probing.set()
+            await asyncio.Future()
+
+        with patch.object(launch, "_connect_devtools", side_effect=stall_probe):
+            async with anyio.create_task_group() as group:
+                group.start_soon(s._get_browser)
+                await probing.wait()
+                group.cancel_scope.cancel()
+        self.process.terminate.assert_called_once()
+        self.assertIsNone(s._browser)
+        self.assertFalse(s._browser_lock.locked())
