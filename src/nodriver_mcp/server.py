@@ -214,8 +214,18 @@ class BrowserMCPServer(MCPServer):
             cause = exc.__cause__
             if isinstance(
                 cause,
-                (BrowserStartupError, ValueError, TimeoutError, uc.ProtocolException),
+                (
+                    BrowserStartupError,
+                    ValueError,
+                    TimeoutError,
+                    OSError,
+                    uc.ProtocolException,
+                ),
             ) and not isinstance(cause, ValidationError):
+                # OSError covers environment failures the caller can act on,
+                # such as a missing Chrome executable, a permission error or a
+                # refused connection. TimeoutError is already an OSError; the
+                # explicit entry documents that both are reported verbatim.
                 raise ToolError(str(cause)) from cause
             raise
 

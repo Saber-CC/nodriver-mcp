@@ -331,6 +331,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 await s.mcp.call_tool("take_screenshot", {})
             self.assertNotIn("internal diagnostic", str(raised.exception))
 
+    async def test_expected_launch_os_errors_reach_the_client(self):
+        with patch.object(
+            s,
+            "_ensure_browser",
+            AsyncMock(side_effect=FileNotFoundError("Chrome executable not found.")),
+        ):
+            with self.assertRaisesRegex(ToolError, "Chrome executable not found"):
+                await s.mcp.call_tool("start_browser", {})
+
     async def test_invalid_tool_output_keeps_sdk_validation_failure(self):
         async def invalid_output() -> int:
             return {"unexpected": "output"}
